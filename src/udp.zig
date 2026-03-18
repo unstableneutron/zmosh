@@ -9,6 +9,16 @@ fn nanoNow() i64 {
     return @intCast(std.time.nanoTimestamp());
 }
 
+fn copySockaddrToAddress(src_addr: posix.sockaddr.storage, addr_len: posix.socklen_t) std.net.Address {
+    var addr: std.net.Address = std.mem.zeroes(std.net.Address);
+    const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
+    @memcpy(
+        std.mem.asBytes(&addr)[0..len],
+        std.mem.asBytes(&src_addr)[0..len],
+    );
+    return addr;
+}
+
 pub const Config = struct {
     heartbeat_interval_ms: u32 = 1000,
     heartbeat_timeout_ms: u32 = 5000,
@@ -33,6 +43,32 @@ pub const UdpSocket = struct {
         if (bindFamily(posix.AF.INET6, port_start, port_end, true)) |sock| return sock;
         if (bindFamily(posix.AF.INET, port_start, port_end, false)) |sock| return sock;
         return error.AddressInUse;
+    }
+
+    /// Bind a non-blocking UDP socket to an ephemeral port (port 0).
+    pub fn bindEphemeral(family: u32) !UdpSocket {
+        const fd = try posix.socket(
+            family,
+            posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+            0,
+        );
+        errdefer posix.close(fd);
+
+        if (family == posix.AF.INET6) {
+            const v6only: i32 = 0;
+            try posix.setsockopt(fd, posix.IPPROTO.IPV6, std.os.linux.IPV6.V6ONLY, std.mem.asBytes(&v6only));
+        }
+
+        const bind_addr = if (family == posix.AF.INET6)
+            std.net.Address.initIp6(.{0} ** 16, 0, 0, 0)
+        else
+            std.net.Address.initIp4(.{0} ** 4, 0);
+
+        try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
+
+        var sock = UdpSocket{ .fd = fd, .bound_port = 0 };
+        sock.bound_port = try sock.getLocalPort();
+        return sock;
     }
 
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {
@@ -72,6 +108,14 @@ pub const UdpSocket = struct {
         return self.fd;
     }
 
+    pub fn getLocalPort(self: *const UdpSocket) !u16 {
+        var src_addr: posix.sockaddr.storage = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        try posix.getsockname(self.fd, @ptrCast(&src_addr), &addr_len);
+        const addr = copySockaddrToAddress(src_addr, addr_len);
+        return addr.getPort();
+    }
+
     pub fn sendTo(self: *UdpSocket, data: []const u8, addr: std.net.Address) !void {
         _ = posix.sendto(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
@@ -80,23 +124,22 @@ pub const UdpSocket = struct {
     }
 
     pub fn recvFrom(self: *UdpSocket, buf: []u8) !struct { len: usize, addr: std.net.Address } {
+        const raw = try self.recvRaw(buf) orelse return error.WouldBlock;
+        return .{ .len = raw.data.len, .addr = raw.from };
+    }
+
+    pub fn recvRaw(self: *UdpSocket, buf: []u8) !?struct { data: []u8, from: std.net.Address } {
         var src_addr: posix.sockaddr.storage = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         const n = posix.recvfrom(self.fd, buf, 0, @ptrCast(&src_addr), &addr_len) catch |err| switch (err) {
-            error.WouldBlock => return error.WouldBlock,
+            error.WouldBlock => return null,
             else => return err,
         };
-        // Copy the full address returned by the kernel — not just the first
-        // sizeof(sockaddr) bytes — so IPv6 addresses (28 bytes) aren't truncated.
-        var addr: std.net.Address = std.mem.zeroes(std.net.Address);
-        const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
-        @memcpy(
-            std.mem.asBytes(&addr)[0..len],
-            std.mem.asBytes(&src_addr)[0..len],
-        );
+
+        const addr = copySockaddrToAddress(src_addr, addr_len);
         return .{
-            .len = n,
-            .addr = addr,
+            .data = buf[0..n],
+            .from = addr,
         };
     }
 
@@ -170,10 +213,15 @@ pub const Peer = struct {
     /// Returns null if no data available (EAGAIN) or decryption fails.
     pub fn recv(self: *Peer, sock: *UdpSocket, buf: []u8) !?struct { data: []u8, from: std.net.Address } {
         var raw: [9000]u8 = undefined;
-        const result = sock.recvFrom(&raw) catch |err| switch (err) {
-            error.WouldBlock => return null,
-            else => return err,
-        };
+        const result = try sock.recvRaw(&raw) orelse return null;
+
+        const plaintext = try self.decodeAndUpdate(result.data, result.from, buf) orelse return null;
+        return .{ .data = plaintext, .from = result.from };
+    }
+
+    /// Decode a previously received raw datagram and update anti-replay / roaming state.
+    /// Returns null for invalid or unauthenticated packets.
+    pub fn decodeAndUpdate(self: *Peer, raw: []const u8, from: std.net.Address, buf: []u8) !?[]u8 {
 
         // Determine expected direction: if we send to_server, we receive to_client
         const recv_direction: crypto.Direction = switch (self.direction) {
@@ -184,7 +232,7 @@ pub const Peer = struct {
         const decoded = crypto.decodeDatagram(
             self.key,
             recv_direction,
-            raw[0..result.len],
+            raw,
             buf,
         ) catch |err| {
             log.debug("decrypt failed: {s}", .{@errorName(err)});
@@ -196,7 +244,7 @@ pub const Peer = struct {
         // Anti-replay + roaming: only update state if seq > max_recv_seq.
         // Old or duplicate packets are dropped after authentication.
         if (decoded.seq > self.max_recv_seq) {
-            self.addr = result.addr;
+            self.addr = from;
             self.max_recv_seq = decoded.seq;
             self.last_recv_time = now;
 
@@ -210,7 +258,7 @@ pub const Peer = struct {
             }
         } else if (decoded.seq == 0 and self.max_recv_seq == 0) {
             // First packet (seq 0)
-            self.addr = result.addr;
+            self.addr = from;
             self.max_recv_seq = 0;
             self.last_recv_time = now;
         } else {
@@ -223,7 +271,7 @@ pub const Peer = struct {
             log.info("peer reconnected", .{});
         }
 
-        return .{ .data = decoded.plaintext, .from = result.addr };
+        return decoded.plaintext;
     }
 
     /// Check if a heartbeat should be sent.
