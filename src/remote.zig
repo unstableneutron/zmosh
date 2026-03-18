@@ -10,7 +10,7 @@ const builtin = @import("builtin");
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 4 * 1024 * 1024;
 const max_bootstrap_line = 4096;
-const max_probe_window_ns = 3 * std.time.ns_per_s;
+const default_probe_timeout_ms: u32 = 3000;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
@@ -36,6 +36,18 @@ const log = std.log.scoped(.remote);
 pub const SshBootstrap = struct {
     stdin_fd: i32,
     stdout_fd: i32,
+};
+
+pub const NatTraversalMode = enum {
+    auto,
+    off,
+};
+
+pub const RemoteAttachOptions = struct {
+    nat_traversal: NatTraversalMode = .auto,
+    stun_servers: []const []const u8 = &.{},
+    probe_timeout_ms: u32 = default_probe_timeout_ms,
+    connect_debug: bool = false,
 };
 
 pub const RemoteSession = struct {
@@ -173,6 +185,15 @@ fn setNonBlocking(fd: i32) !void {
     _ = try posix.fcntl(fd, posix.F.SETFL, flags | posix.SOCK.NONBLOCK);
 }
 
+fn clampProbeTimeoutMs(ms: u32) u32 {
+    return std.math.clamp(ms, @as(u32, 500), @as(u32, 30_000));
+}
+
+fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
+    if (!enabled) return;
+    std.debug.print("zmx debug: " ++ fmt ++ "\n", args);
+}
+
 fn writeAllFd(fd: i32, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -238,25 +259,19 @@ fn resolveHostAddress(alloc: std.mem.Allocator, host: []const u8, port: u16) !st
     };
 }
 
-fn resolveStunServer(alloc: std.mem.Allocator, socket_family: u16) ?std.net.Address {
-    const list = std.net.getAddressList(alloc, "stun.cloudflare.com", 3478) catch return null;
-    defer list.deinit();
-
-    for (list.addrs) |addr| {
-        if (nat.shouldUseCandidate(socket_family, addr)) return addr;
-    }
-    return null;
-}
-
 fn gatherLocalCandidates(
     alloc: std.mem.Allocator,
     sock: *udp_mod.UdpSocket,
     socket_family: u16,
+    stun_servers: []const []const u8,
 ) !std.ArrayList(nat.Candidate) {
     var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, 8);
     errdefer candidates.deinit(alloc);
 
-    if (resolveStunServer(alloc, socket_family)) |stun_addr| {
+    var stun_addrs = try nat.resolveStunServers(alloc, socket_family, stun_servers);
+    defer stun_addrs.deinit(alloc);
+
+    for (stun_addrs.items) |stun_addr| {
         var stun_state = nat.StunState.init(stun_addr);
         stun_state.sendRequest(sock) catch {};
         const deadline = @as(i64, @intCast(std.time.nanoTimestamp())) + 4 * std.time.ns_per_s;
@@ -285,6 +300,7 @@ fn gatherLocalCandidates(
 
         if (stun_state.result) |srflx| {
             try appendUniqueCandidate(&candidates, alloc, srflx, 8);
+            break;
         }
     }
 
@@ -333,6 +349,7 @@ const ProbeDecision = enum {
 fn probeAndSelectTransport(
     alloc: std.mem.Allocator,
     session: *RemoteSession,
+    options: RemoteAttachOptions,
     fallback_addr: std.net.Address,
     udp_sock: *udp_mod.UdpSocket,
     peer: *udp_mod.Peer,
@@ -345,7 +362,7 @@ fn probeAndSelectTransport(
 
     const pipes = session.ssh.?;
 
-    var local_candidates = try gatherLocalCandidates(alloc, udp_sock, fallback_addr.any.family);
+    var local_candidates = try gatherLocalCandidates(alloc, udp_sock, fallback_addr.any.family, options.stun_servers);
     defer local_candidates.deinit(alloc);
 
     try appendUniqueCandidate(&local_candidates, alloc, .{
@@ -375,7 +392,8 @@ fn probeAndSelectTransport(
 
     var probe = nat.ProbeState{ .candidates = remote_candidates.items };
     var next_probe_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const deadline = next_probe_ns + max_probe_window_ns;
+    const probe_timeout_ns = @as(i64, clampProbeTimeoutMs(options.probe_timeout_ms)) * std.time.ns_per_ms;
+    const deadline = next_probe_ns + probe_timeout_ns;
 
     while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and !probe.isComplete()) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
@@ -421,9 +439,10 @@ fn probeAndSelectTransport(
 /// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
 /// Prepends common user bin dirs to PATH since SSH non-interactive sessions
 /// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
-pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8) !RemoteSession {
+pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8, options: RemoteAttachOptions) !RemoteSession {
     if (!isValidSessionName(session)) return error.InvalidSessionName;
 
+    const probe_timeout_ms = clampProbeTimeoutMs(options.probe_timeout_ms);
     const term = posix.getenv("TERM") orelse "xterm-256color";
     const colorterm = posix.getenv("COLORTERM");
     const term_q = try shellQuoteAlloc(alloc, term);
@@ -431,20 +450,55 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
     const session_q = try shellQuoteAlloc(alloc, session);
     defer alloc.free(session_q);
 
+    const stun_servers_joined = if (options.stun_servers.len > 0)
+        try std.mem.join(alloc, ",", options.stun_servers)
+    else
+        null;
+    defer if (stun_servers_joined) |joined| alloc.free(joined);
+
+    const stun_servers_q = if (stun_servers_joined) |joined|
+        try shellQuoteAlloc(alloc, joined)
+    else
+        null;
+    defer if (stun_servers_q) |quoted| alloc.free(quoted);
+
+    const bootstrap_env = if (options.nat_traversal == .auto) "ZMX_BOOTSTRAP=2 " else "ZMX_BOOTSTRAP=0 ";
+    const debug_env = if (options.connect_debug) "ZMX_CONNECT_DEBUG=1 " else "";
+    const probe_env = if (options.nat_traversal == .auto and probe_timeout_ms != default_probe_timeout_ms)
+        try std.fmt.allocPrint(alloc, "ZMX_PROBE_TIMEOUT_MS={d} ", .{probe_timeout_ms})
+    else
+        null;
+    defer if (probe_env) |v| alloc.free(v);
+
+    const stun_env = if (options.nat_traversal == .auto and stun_servers_q != null)
+        try std.fmt.allocPrint(alloc, "ZMX_STUN_SERVERS={s} ", .{stun_servers_q.?})
+    else
+        null;
+    defer if (stun_env) |v| alloc.free(v);
+
+    const probe_env_s = probe_env orelse "";
+    const stun_env_s = stun_env orelse "";
+
     const remote_cmd = if (colorterm) |ct| blk: {
         const ct_q = try shellQuoteAlloc(alloc, ct);
         defer alloc.free(ct_q);
         break :blk try std.fmt.allocPrint(
             alloc,
-            "ZMX_BOOTSTRAP=2 TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ term_q, ct_q, session_q },
+            "{s}{s}{s}{s}TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
+            .{ bootstrap_env, debug_env, probe_env_s, stun_env_s, term_q, ct_q, session_q },
         );
     } else try std.fmt.allocPrint(
         alloc,
-        "ZMX_BOOTSTRAP=2 TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-        .{ term_q, session_q },
+        "{s}{s}{s}{s}TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
+        .{ bootstrap_env, debug_env, probe_env_s, stun_env_s, term_q, session_q },
     );
     defer alloc.free(remote_cmd);
+
+    connectDebug(options.connect_debug, "bootstrap mode={s} probe_timeout_ms={d} stun_servers={d}", .{
+        if (options.nat_traversal == .auto) "auto" else "off",
+        probe_timeout_ms,
+        options.stun_servers.len,
+    });
 
     const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
     var child = std.process.Child.init(&argv, alloc);
@@ -476,6 +530,7 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
 
     const line_end = std.mem.indexOfScalar(u8, buf[0..total], '\n') orelse total;
     const line = buf[0..line_end];
+    connectDebug(options.connect_debug, "bootstrap line={s}", .{line});
 
     if (std.mem.startsWith(u8, line, "ZMX_CONNECT2 ")) {
         const parsed = parseConnect2Line(alloc, line) catch |err| {
@@ -649,7 +704,7 @@ fn flushWriteBuffer(fd: i32, write_buf: *std.ArrayList(u8), alloc: std.mem.Alloc
 }
 
 /// Remote attach: connect to a remote zmx session via UDP or SSH fallback.
-pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession) !void {
+pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options: RemoteAttachOptions) !void {
     var session = session_in;
     defer session.deinit(alloc);
 
@@ -700,16 +755,18 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession) !void {
     var transport_mode: RemoteTransport = .{ .udp = .{ .sock = &udp_sock, .peer = &peer } };
     defer transport_mode.deinit(alloc);
 
-    const decision = try probeAndSelectTransport(alloc, &session, fallback_addr, &udp_sock, &peer, &reliable_recv);
+    const decision = try probeAndSelectTransport(alloc, &session, options, fallback_addr, &udp_sock, &peer, &reliable_recv);
     if (decision == .udp and session.ssh != null) {
         try sendUse(session.ssh.?.stdin_fd, "udp");
         posix.close(session.ssh.?.stdin_fd);
         posix.close(session.ssh.?.stdout_fd);
         session.ssh = null;
+        connectDebug(options.connect_debug, "selected UDP transport", .{});
     } else if (decision == .ssh) {
         if (session.ssh == null) return error.MissingSshPipes;
         try sendUse(session.ssh.?.stdin_fd, "ssh");
         _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: using SSH tunnel (no UDP connectivity)\r\n") catch {};
+        connectDebug(options.connect_debug, "selected SSH transport", .{});
 
         transport_mode = .{ .ssh = .{
             .read_fd = session.ssh.?.stdout_fd,

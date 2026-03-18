@@ -15,7 +15,7 @@ const max_control_line = 4096;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 const stun_keepalive_ns = 25 * std.time.ns_per_s;
-const probe_window_ns = 3 * std.time.ns_per_s;
+const default_probe_timeout_ms: u32 = 3000;
 
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -84,6 +84,15 @@ fn setNonBlocking(fd: i32) !void {
     _ = try posix.fcntl(fd, posix.F.SETFL, flags | posix.SOCK.NONBLOCK);
 }
 
+fn clampProbeTimeoutMs(ms: u32) u32 {
+    return std.math.clamp(ms, @as(u32, 500), @as(u32, 30_000));
+}
+
+fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
+    if (!enabled) return;
+    std.debug.print("zmx serve debug: " ++ fmt ++ "\n", args);
+}
+
 fn readLineFd(fd: i32, buf: []u8) ![]const u8 {
     var total: usize = 0;
     while (total < buf.len) {
@@ -116,6 +125,35 @@ fn socketFamily(fd: i32) !u16 {
     const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
     @memcpy(std.mem.asBytes(&addr)[0..len], std.mem.asBytes(&src_addr)[0..len]);
     return addr.any.family;
+}
+
+fn loadStunServerSpecs(alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
+    var specs = try std.ArrayList([]const u8).initCapacity(alloc, 4);
+    if (posix.getenv("ZMX_STUN_SERVERS")) |raw| {
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t");
+            if (trimmed.len == 0) continue;
+            try specs.append(alloc, trimmed);
+        }
+    }
+    return specs;
+}
+
+fn parseConnectDebugEnv() bool {
+    const raw = posix.getenv("ZMX_CONNECT_DEBUG") orelse return false;
+    return std.mem.eql(u8, raw, "1") or
+        std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "yes");
+}
+
+fn parseProbeTimeoutNs() i64 {
+    const raw = posix.getenv("ZMX_PROBE_TIMEOUT_MS") orelse {
+        return @as(i64, default_probe_timeout_ms) * std.time.ns_per_ms;
+    };
+    const parsed_ms = std.fmt.parseInt(u32, raw, 10) catch default_probe_timeout_ms;
+    const clamped = clampProbeTimeoutMs(parsed_ms);
+    return @as(i64, clamped) * std.time.ns_per_ms;
 }
 
 fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.Allocator, candidate: nat.Candidate, max_candidates: usize) !void {
@@ -187,20 +225,16 @@ fn parseUseLine(line: []const u8) !enum { udp, ssh } {
     return error.InvalidControlMessage;
 }
 
-fn resolveStunServer(alloc: std.mem.Allocator, socket_family: u16) ?std.net.Address {
-    const list = std.net.getAddressList(alloc, "stun.cloudflare.com", 3478) catch return null;
-    defer list.deinit();
-    for (list.addrs) |addr| {
-        if (nat.shouldUseCandidate(socket_family, addr)) return addr;
-    }
-    return null;
-}
-
-fn gatherLocalCandidates(alloc: std.mem.Allocator, sock: *udp.UdpSocket, socket_family: u16) !std.ArrayList(nat.Candidate) {
+fn gatherLocalCandidates(
+    alloc: std.mem.Allocator,
+    sock: *udp.UdpSocket,
+    socket_family: u16,
+    stun_servers: []const std.net.Address,
+) !std.ArrayList(nat.Candidate) {
     var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, 8);
     errdefer out.deinit(alloc);
 
-    if (resolveStunServer(alloc, socket_family)) |server_addr| {
+    for (stun_servers) |server_addr| {
         var stun_state = nat.StunState.init(server_addr);
         stun_state.sendRequest(sock) catch {};
 
@@ -229,6 +263,7 @@ fn gatherLocalCandidates(alloc: std.mem.Allocator, sock: *udp.UdpSocket, socket_
 
         if (stun_state.result) |srflx| {
             try appendUniqueCandidate(&out, alloc, srflx, 8);
+            break;
         }
     }
 
@@ -275,6 +310,7 @@ fn probeCandidates(
     socket_family: u16,
     candidates: []const nat.Candidate,
     reliable_recv: *const transport.RecvState,
+    probe_timeout_ns: i64,
 ) !?std.net.Address {
     var filtered = try std.ArrayList(nat.Candidate).initCapacity(alloc, candidates.len);
     defer filtered.deinit(alloc);
@@ -288,7 +324,7 @@ fn probeCandidates(
 
     var probe = nat.ProbeState{ .candidates = filtered.items };
     var next_probe_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const deadline = next_probe_ns + probe_window_ns;
+    const deadline = next_probe_ns + probe_timeout_ns;
 
     while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and !probe.isComplete()) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
@@ -351,7 +387,8 @@ pub const Gateway = struct {
     have_client_size: bool,
     last_resize: ipc.Resize,
     transport: GatewayTransport,
-    stun_server: ?std.net.Address,
+    stun_servers: std.ArrayList(std.net.Address),
+    stun_server_idx: usize,
     stun_state: ?nat.StunState,
     last_stun_keepalive_ns: i64,
     last_srflx: ?std.net.Address,
@@ -383,14 +420,27 @@ pub const Gateway = struct {
         const encoded_key = crypto.keyToBase64(key);
 
         const socket_family = try socketFamily(udp_sock.getFd());
+        const connect_debug = parseConnectDebugEnv();
+        const probe_timeout_ns = parseProbeTimeoutNs();
+
+        var stun_specs = try loadStunServerSpecs(alloc);
+        defer stun_specs.deinit(alloc);
+        var stun_servers = try nat.resolveStunServers(alloc, socket_family, stun_specs.items);
+        errdefer stun_servers.deinit(alloc);
 
         // Initialize peer (we send to_client, recv to_server from remote client)
         var peer = udp.Peer.init(key, .to_client);
         var transport_mode: GatewayTransport = .udp;
         const bootstrap_v2 = std.mem.eql(u8, posix.getenv("ZMX_BOOTSTRAP") orelse "", "2");
 
+        connectDebug(connect_debug, "bootstrap_v2={} probe_timeout_ms={d} stun_servers={d}", .{
+            bootstrap_v2,
+            @divFloor(probe_timeout_ns, std.time.ns_per_ms),
+            stun_servers.items.len,
+        });
+
         if (bootstrap_v2) {
-            var local_candidates = try gatherLocalCandidates(alloc, &udp_sock, socket_family);
+            var local_candidates = try gatherLocalCandidates(alloc, &udp_sock, socket_family, stun_servers.items);
             defer local_candidates.deinit(alloc);
 
             try sendConnect2(posix.STDOUT_FILENO, alloc, key, local_candidates.items);
@@ -401,7 +451,7 @@ pub const Gateway = struct {
             defer remote_candidates.deinit(alloc);
 
             var probe_recv = transport.RecvState{};
-            if (try probeCandidates(alloc, &udp_sock, &peer, socket_family, remote_candidates.items, &probe_recv)) |selected| {
+            if (try probeCandidates(alloc, &udp_sock, &peer, socket_family, remote_candidates.items, &probe_recv, probe_timeout_ns)) |selected| {
                 peer.addr = selected;
             }
 
@@ -459,7 +509,8 @@ pub const Gateway = struct {
             .have_client_size = false,
             .last_resize = .{ .rows = 24, .cols = 80 },
             .transport = transport_mode,
-            .stun_server = resolveStunServer(alloc, socket_family),
+            .stun_servers = stun_servers,
+            .stun_server_idx = 0,
             .stun_state = null,
             .last_stun_keepalive_ns = now,
             .last_srflx = null,
@@ -503,7 +554,7 @@ pub const Gateway = struct {
                 }
             }
 
-            if (self.stun_server != null and (now - self.last_stun_keepalive_ns) >= stun_keepalive_ns) {
+            if (self.stun_servers.items.len > 0 and (now - self.last_stun_keepalive_ns) >= stun_keepalive_ns) {
                 self.sendStunKeepalive(now) catch |err| {
                     if (err != error.WouldBlock) return err;
                 };
@@ -599,17 +650,18 @@ pub const Gateway = struct {
     }
 
     fn sendStunKeepalive(self: *Gateway, now: i64) !void {
-        const server = self.stun_server orelse return;
+        if (self.stun_servers.items.len == 0) return;
+        const idx = self.stun_server_idx % self.stun_servers.items.len;
+        const server = self.stun_servers.items[idx];
+        self.stun_server_idx = (idx + 1) % self.stun_servers.items.len;
         self.stun_state = nat.StunState.init(server);
         try self.stun_state.?.sendRequest(&self.udp_sock);
         self.last_stun_keepalive_ns = now;
     }
 
     fn handleStunDatagram(self: *Gateway, from: std.net.Address, data: []const u8) bool {
-        const server = self.stun_server orelse return false;
-        if (!nat.isStunPacket(server, from, data)) return false;
-
         if (self.stun_state) |*state| {
+            if (!nat.isStunPacket(state.server_addr, from, data)) return false;
             const parsed = state.handleResponse(data) catch return true;
             if (parsed) |candidate| {
                 if (self.last_srflx) |old| {
@@ -986,6 +1038,7 @@ pub const Gateway = struct {
         self.output_coalesce_buf.deinit(self.alloc);
         self.reliable_send.deinit();
         self.transport.deinit(self.alloc);
+        self.stun_servers.deinit(self.alloc);
     }
 };
 

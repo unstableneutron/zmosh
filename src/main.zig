@@ -403,12 +403,52 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var session_name: []const u8 = "";
         var remote_host: ?[]const u8 = null;
+        var remote_opts = remote.RemoteAttachOptions{};
+        var remote_flags_used = false;
+        var stun_servers: std.ArrayList([]const u8) = .empty;
+        defer stun_servers.deinit(alloc);
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
                 remote_host = args.next();
+            } else if (std.mem.eql(u8, arg, "--connect-debug")) {
+                remote_opts.connect_debug = true;
+                remote_flags_used = true;
+            } else if (std.mem.eql(u8, arg, "--nat-traversal") or std.mem.startsWith(u8, arg, "--nat-traversal=")) {
+                const value = if (std.mem.startsWith(u8, arg, "--nat-traversal="))
+                    arg["--nat-traversal=".len..]
+                else
+                    args.next() orelse return error.InvalidArgument;
+
+                if (std.mem.eql(u8, value, "auto")) {
+                    remote_opts.nat_traversal = .auto;
+                } else if (std.mem.eql(u8, value, "off")) {
+                    remote_opts.nat_traversal = .off;
+                } else {
+                    std.log.err("invalid --nat-traversal value: {s} (expected auto|off)", .{value});
+                    return error.InvalidArgument;
+                }
+                remote_flags_used = true;
+            } else if (std.mem.eql(u8, arg, "--stun-server") or std.mem.startsWith(u8, arg, "--stun-server=")) {
+                const value = if (std.mem.startsWith(u8, arg, "--stun-server="))
+                    arg["--stun-server=".len..]
+                else
+                    args.next() orelse return error.InvalidArgument;
+                try stun_servers.append(alloc, value);
+                remote_flags_used = true;
+            } else if (std.mem.eql(u8, arg, "--probe-timeout-ms") or std.mem.startsWith(u8, arg, "--probe-timeout-ms=")) {
+                const value = if (std.mem.startsWith(u8, arg, "--probe-timeout-ms="))
+                    arg["--probe-timeout-ms=".len..]
+                else
+                    args.next() orelse return error.InvalidArgument;
+
+                remote_opts.probe_timeout_ms = std.fmt.parseInt(u32, value, 10) catch {
+                    std.log.err("invalid --probe-timeout-ms value: {s}", .{value});
+                    return error.InvalidArgument;
+                };
+                remote_flags_used = true;
             } else if (session_name.len == 0) {
                 session_name = arg;
             } else {
@@ -416,16 +456,25 @@ pub fn main() !void {
             }
         }
 
+        if (stun_servers.items.len > 0) {
+            remote_opts.stun_servers = stun_servers.items;
+        }
+
         const sesh = try getSeshName(alloc, session_name);
         defer alloc.free(sesh);
 
         // Remote attach via encrypted UDP
         if (remote_host) |host| {
-            const session = remote.connectRemote(alloc, host, sesh) catch |err| {
+            const session = remote.connectRemote(alloc, host, sesh, remote_opts) catch |err| {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
                 return;
             };
-            return remote.remoteAttach(alloc, session);
+            return remote.remoteAttach(alloc, session, remote_opts);
+        }
+
+        if (remote_flags_used) {
+            std.log.err("remote-only flags require --remote/-r", .{});
+            return error.InvalidArgument;
         }
 
         // Local attach (existing behavior)
@@ -572,6 +621,10 @@ fn help() !void {
         \\Commands:
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
         \\  [a]ttach -r <host> <name>      Attach to remote session via UDP
+        \\      --nat-traversal=auto|off   Remote attach NAT traversal mode (default: auto)
+        \\      --stun-server <host:port>  Remote attach STUN server (repeatable)
+        \\      --probe-timeout-ms <ms>    Remote attach hole-punch timeout (default: 3000)
+        \\      --connect-debug            Print remote connectivity debug logs
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [s]erve <name>                 Start UDP gateway for remote access
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
