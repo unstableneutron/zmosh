@@ -4,14 +4,18 @@ const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
+const nat = @import("nat.zig");
 
 const log = std.log.scoped(.serve);
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_unix_write_buf = 1024 * 1024;
 const max_output_coalesce = 256 * 1024;
+const max_control_line = 4096;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 500 * std.time.ns_per_ms;
+const stun_keepalive_ns = 25 * std.time.ns_per_s;
+const probe_window_ns = 3 * std.time.ns_per_s;
 
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -51,6 +55,277 @@ fn connectUnix(path: []const u8) !i32 {
     return fd;
 }
 
+const GatewayTransport = union(enum) {
+    udp,
+    ssh: struct {
+        read_fd: i32,
+        write_fd: i32,
+        read_buf: ipc.SocketBuffer,
+        write_buf: std.ArrayList(u8),
+    },
+
+    fn deinit(self: *GatewayTransport, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .udp => {},
+            .ssh => |*s| {
+                s.read_buf.deinit();
+                s.write_buf.deinit(alloc);
+            },
+        }
+    }
+};
+
+const Candidates2Json = struct {
+    candidates: []nat.CandidateWire,
+};
+
+fn setNonBlocking(fd: i32) !void {
+    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+    _ = try posix.fcntl(fd, posix.F.SETFL, flags | posix.SOCK.NONBLOCK);
+}
+
+fn readLineFd(fd: i32, buf: []u8) ![]const u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try posix.read(fd, buf[total..]);
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOfScalar(u8, buf[0..total], '\n') != null) break;
+    }
+    if (total == 0) return error.UnexpectedEof;
+    const nl = std.mem.indexOfScalar(u8, buf[0..total], '\n') orelse total;
+    if (nl == buf.len) return error.LineTooLong;
+    return std.mem.trimRight(u8, buf[0..nl], "\r\n");
+}
+
+fn writeAllFd(fd: i32, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = try posix.write(fd, bytes[off..]);
+        if (n == 0) return error.WriteFailed;
+        off += n;
+    }
+}
+
+fn socketFamily(fd: i32) !u16 {
+    var src_addr: posix.sockaddr.storage = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try posix.getsockname(fd, @ptrCast(&src_addr), &addr_len);
+
+    var addr: std.net.Address = std.mem.zeroes(std.net.Address);
+    const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
+    @memcpy(std.mem.asBytes(&addr)[0..len], std.mem.asBytes(&src_addr)[0..len]);
+    return addr.any.family;
+}
+
+fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.Allocator, candidate: nat.Candidate, max_candidates: usize) !void {
+    for (list.items) |existing| {
+        if (nat.isAddressEqual(existing.addr, candidate.addr)) return;
+    }
+    if (list.items.len >= max_candidates) return;
+    try list.append(alloc, candidate);
+}
+
+fn sendConnect2(
+    fd: i32,
+    alloc: std.mem.Allocator,
+    key: crypto.Key,
+    candidates: []const nat.Candidate,
+) !void {
+    const encoded_key = crypto.keyToBase64(key);
+
+    var wire_list = try std.ArrayList(nat.CandidateWire).initCapacity(alloc, candidates.len);
+    defer wire_list.deinit(alloc);
+    var owned_endpoints = try std.ArrayList([]u8).initCapacity(alloc, candidates.len);
+    defer {
+        for (owned_endpoints.items) |ep| alloc.free(ep);
+        owned_endpoints.deinit(alloc);
+    }
+
+    for (candidates) |cand| {
+        const endpoint = try nat.endpointForAddressAlloc(alloc, cand.addr);
+        try owned_endpoints.append(alloc, endpoint);
+        try wire_list.append(alloc, .{
+            .ctype = cand.ctype,
+            .endpoint = endpoint,
+            .source = cand.source,
+        });
+    }
+
+    const payload = nat.Connect2Payload{
+        .key = &encoded_key,
+        .candidates = wire_list.items,
+        .ssh_fallback = true,
+    };
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    try builder.writer.print("ZMX_CONNECT2 {f}\n", .{std.json.fmt(payload, .{})});
+    try writeAllFd(fd, builder.writer.buffered());
+}
+
+fn parseCandidatesLine(alloc: std.mem.Allocator, line: []const u8) !std.ArrayList(nat.Candidate) {
+    if (!std.mem.startsWith(u8, line, "ZMX_CANDIDATES2 ")) return error.InvalidControlMessage;
+    const json_payload = line["ZMX_CANDIDATES2 ".len..];
+
+    var parsed = try std.json.parseFromSlice(Candidates2Json, alloc, json_payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var out = try std.ArrayList(nat.Candidate).initCapacity(alloc, parsed.value.candidates.len);
+    errdefer out.deinit(alloc);
+    for (parsed.value.candidates) |wire| {
+        const candidate = try nat.wireToCandidate(wire);
+        if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
+        try out.append(alloc, candidate);
+    }
+    return out;
+}
+
+fn parseUseLine(line: []const u8) !enum { udp, ssh } {
+    if (std.mem.eql(u8, line, "ZMX_USE udp")) return .udp;
+    if (std.mem.eql(u8, line, "ZMX_USE ssh")) return .ssh;
+    return error.InvalidControlMessage;
+}
+
+fn resolveStunServer(alloc: std.mem.Allocator, socket_family: u16) ?std.net.Address {
+    const list = std.net.getAddressList(alloc, "stun.cloudflare.com", 3478) catch return null;
+    defer list.deinit();
+    for (list.addrs) |addr| {
+        if (nat.shouldUseCandidate(socket_family, addr)) return addr;
+    }
+    return null;
+}
+
+fn gatherLocalCandidates(alloc: std.mem.Allocator, sock: *udp.UdpSocket, socket_family: u16) !std.ArrayList(nat.Candidate) {
+    var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, 8);
+    errdefer out.deinit(alloc);
+
+    if (resolveStunServer(alloc, socket_family)) |server_addr| {
+        var stun_state = nat.StunState.init(server_addr);
+        stun_state.sendRequest(sock) catch {};
+
+        const deadline = @as(i64, @intCast(std.time.nanoTimestamp())) + 4 * std.time.ns_per_s;
+        while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and stun_state.result == null and stun_state.waiting_response) {
+            var poll_fds = [_]posix.pollfd{.{ .fd = sock.getFd(), .events = posix.POLL.IN, .revents = 0 }};
+            _ = posix.poll(&poll_fds, 100) catch |err| {
+                if (err == error.Interrupted) continue;
+                break;
+            };
+
+            if (poll_fds[0].revents & posix.POLL.IN != 0) {
+                while (true) {
+                    var recv_buf: [1500]u8 = undefined;
+                    const raw = sock.recvRaw(&recv_buf) catch break;
+                    const packet = raw orelse break;
+                    if (nat.isStunPacket(server_addr, packet.from, packet.data)) {
+                        _ = stun_state.handleResponse(packet.data) catch {};
+                    }
+                }
+            }
+
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            stun_state.maybeRetry(sock, now) catch {};
+        }
+
+        if (stun_state.result) |srflx| {
+            try appendUniqueCandidate(&out, alloc, srflx, 8);
+        }
+    }
+
+    nat.sortCandidatesByPriority(out.items);
+    return out;
+}
+
+fn sendProbeHeartbeatTo(
+    peer: *udp.Peer,
+    sock: *udp.UdpSocket,
+    target: std.net.Address,
+    reliable_recv: *const transport.RecvState,
+) !void {
+    var pkt_buf: [1200]u8 = undefined;
+    const pkt = try transport.buildUnreliable(
+        .heartbeat,
+        0,
+        reliable_recv.ack(),
+        reliable_recv.ackBits(),
+        "",
+        &pkt_buf,
+    );
+
+    var enc_buf: [9000]u8 = undefined;
+    const datagram = try crypto.encodeDatagram(
+        peer.key,
+        peer.direction,
+        peer.send_seq,
+        pkt,
+        &enc_buf,
+    );
+    try sock.sendTo(datagram, target);
+
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    peer.last_send_time_any = now;
+    peer.send_seq += 1;
+}
+
+fn probeCandidates(
+    alloc: std.mem.Allocator,
+    sock: *udp.UdpSocket,
+    peer: *udp.Peer,
+    socket_family: u16,
+    candidates: []const nat.Candidate,
+    reliable_recv: *const transport.RecvState,
+) !?std.net.Address {
+    var filtered = try std.ArrayList(nat.Candidate).initCapacity(alloc, candidates.len);
+    defer filtered.deinit(alloc);
+    for (candidates) |cand| {
+        if (!nat.shouldUseCandidate(socket_family, cand.addr)) continue;
+        if (!nat.isCandidateAddressUsable(cand.addr)) continue;
+        try appendUniqueCandidate(&filtered, alloc, cand, 8);
+    }
+    nat.sortCandidatesByPriority(filtered.items);
+    if (filtered.items.len == 0) return null;
+
+    var probe = nat.ProbeState{ .candidates = filtered.items };
+    var next_probe_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const deadline = next_probe_ns + probe_window_ns;
+
+    while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and !probe.isComplete()) {
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        if (now >= next_probe_ns) {
+            if (probe.nextProbeAddr()) |addr| {
+                sendProbeHeartbeatTo(peer, sock, addr, reliable_recv) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+            }
+            next_probe_ns = now + @as(i64, probe.interval_ms) * std.time.ns_per_ms;
+        }
+
+        const timeout_ns = @min(deadline - now, @max(@as(i64, 0), next_probe_ns - now));
+        const timeout_ms: i32 = @intCast(@divFloor(timeout_ns, std.time.ns_per_ms));
+        var poll_fds = [_]posix.pollfd{.{ .fd = sock.getFd(), .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&poll_fds, timeout_ms) catch |err| {
+            if (err == error.Interrupted) continue;
+            return err;
+        };
+
+        if (poll_fds[0].revents & posix.POLL.IN != 0) {
+            while (true) {
+                var raw_buf: [9000]u8 = undefined;
+                const raw = try sock.recvRaw(&raw_buf) orelse break;
+
+                var decrypt_buf: [9000]u8 = undefined;
+                const old_addr = peer.addr;
+                const decoded = try peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf);
+                peer.addr = old_addr;
+                if (decoded == null) continue;
+                probe.onAuthenticatedRecv(raw.from);
+            }
+        }
+    }
+
+    return probe.selected;
+}
+
 pub const Gateway = struct {
     alloc: std.mem.Allocator,
     udp_sock: udp.UdpSocket,
@@ -78,6 +353,11 @@ pub const Gateway = struct {
     snapshot_in_flight_id: ?u32,
     have_client_size: bool,
     last_resize: ipc.Resize,
+    transport: GatewayTransport,
+    stun_server: ?std.net.Address,
+    stun_state: ?nat.StunState,
+    last_stun_keepalive_ns: i64,
+    last_srflx: ?std.net.Address,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -105,18 +385,53 @@ pub const Gateway = struct {
         const key = crypto.generateKey();
         const encoded_key = crypto.keyToBase64(key);
 
-        // Print bootstrap line for SSH capture
-        {
+        const socket_family = try socketFamily(udp_sock.getFd());
+
+        // Initialize peer (we send to_client, recv to_server from remote client)
+        var peer = udp.Peer.init(key, .to_client);
+        var transport_mode: GatewayTransport = .udp;
+        const bootstrap_v2 = std.mem.eql(u8, posix.getenv("ZMX_BOOTSTRAP") orelse "", "2");
+
+        if (bootstrap_v2) {
+            var local_candidates = try gatherLocalCandidates(alloc, &udp_sock, socket_family);
+            defer local_candidates.deinit(alloc);
+
+            try sendConnect2(posix.STDOUT_FILENO, alloc, key, local_candidates.items);
+
+            var line_buf: [max_control_line]u8 = undefined;
+            const candidates_line = try readLineFd(posix.STDIN_FILENO, &line_buf);
+            var remote_candidates = try parseCandidatesLine(alloc, candidates_line);
+            defer remote_candidates.deinit(alloc);
+
+            var probe_recv = transport.RecvState{};
+            if (try probeCandidates(alloc, &udp_sock, &peer, socket_family, remote_candidates.items, &probe_recv)) |selected| {
+                peer.addr = selected;
+            }
+
+            const use_line = try readLineFd(posix.STDIN_FILENO, &line_buf);
+            const use_mode = try parseUseLine(use_line);
+            if (use_mode == .udp) {
+                posix.close(posix.STDIN_FILENO);
+                posix.close(posix.STDOUT_FILENO);
+            } else {
+                try setNonBlocking(posix.STDIN_FILENO);
+                try setNonBlocking(posix.STDOUT_FILENO);
+                transport_mode = .{ .ssh = .{
+                    .read_fd = posix.STDIN_FILENO,
+                    .write_fd = posix.STDOUT_FILENO,
+                    .read_buf = try ipc.SocketBuffer.init(alloc),
+                    .write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096),
+                } };
+            }
+        } else {
+            // Print bootstrap line for SSH capture
             var out_buf: [256]u8 = undefined;
             const line = std.fmt.bufPrint(&out_buf, "ZMX_CONNECT udp {d} {s}\n", .{ udp_sock.bound_port, encoded_key }) catch unreachable;
             _ = try posix.write(posix.STDOUT_FILENO, line);
+
+            // Close stdout so SSH session can terminate
+            posix.close(posix.STDOUT_FILENO);
         }
-
-        // Close stdout so SSH session can terminate
-        posix.close(posix.STDOUT_FILENO);
-
-        // Initialize peer (we send to_client, recv to_server from remote client)
-        const peer = udp.Peer.init(key, .to_client);
 
         const unix_read_buf = try ipc.SocketBuffer.init(alloc);
         const unix_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
@@ -151,12 +466,21 @@ pub const Gateway = struct {
             .snapshot_in_flight_id = null,
             .have_client_size = false,
             .last_resize = .{ .rows = 24, .cols = 80 },
+            .transport = transport_mode,
+            .stun_server = resolveStunServer(alloc, socket_family),
+            .stun_state = null,
+            .last_stun_keepalive_ns = now,
+            .last_srflx = null,
         };
     }
 
     pub fn run(self: *Gateway) !void {
         setupSigtermHandler();
         var was_disconnected = false;
+
+        if (self.transport == .ssh) {
+            return self.runSsh();
+        }
 
         while (self.running) {
             if (sigterm_received.swap(false, .acq_rel)) {
@@ -195,6 +519,18 @@ pub const Gateway = struct {
                 }
             }
 
+            if (self.stun_server != null and (now - self.last_stun_keepalive_ns) >= stun_keepalive_ns) {
+                self.sendStunKeepalive(now) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+            }
+
+            if (self.stun_state) |*stun_state| {
+                stun_state.maybeRetry(&self.udp_sock, now) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+            }
+
             // Build poll fds
             var poll_fds: [2]posix.pollfd = undefined;
             poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
@@ -214,10 +550,16 @@ pub const Gateway = struct {
             // Handle incoming UDP datagrams → decrypt → decode transport packet
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 while (true) {
+                    var raw_buf: [9000]u8 = undefined;
+                    const raw = try self.udp_sock.recvRaw(&raw_buf) orelse break;
+
+                    if (self.handleStunDatagram(raw.from, raw.data)) {
+                        continue;
+                    }
+
                     var decrypt_buf: [9000]u8 = undefined;
-                    const recv_result = try self.peer.recv(&self.udp_sock, &decrypt_buf);
-                    const result = recv_result orelse break;
-                    try self.handleTransportPacket(result.data, now);
+                    const decoded = try self.peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf) orelse continue;
+                    try self.handleTransportPacket(decoded, now);
                 }
             }
 
@@ -270,6 +612,155 @@ pub const Gateway = struct {
                 log.debug("failed to send SessionEnd: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    fn sendStunKeepalive(self: *Gateway, now: i64) !void {
+        const server = self.stun_server orelse return;
+        self.stun_state = nat.StunState.init(server);
+        try self.stun_state.?.sendRequest(&self.udp_sock);
+        self.last_stun_keepalive_ns = now;
+    }
+
+    fn handleStunDatagram(self: *Gateway, from: std.net.Address, data: []const u8) bool {
+        const server = self.stun_server orelse return false;
+        if (!nat.isStunPacket(server, from, data)) return false;
+
+        if (self.stun_state) |*state| {
+            const parsed = state.handleResponse(data) catch return true;
+            if (parsed) |candidate| {
+                if (self.last_srflx) |old| {
+                    if (!nat.isAddressEqual(old, candidate.addr)) {
+                        log.warn("stun mapping changed old={f} new={f}", .{ old, candidate.addr });
+                    }
+                }
+                self.last_srflx = candidate.addr;
+            }
+        }
+        return true;
+    }
+
+    fn runSsh(self: *Gateway) !void {
+        var ssh = &self.transport.ssh;
+
+        while (self.running) {
+            if (sigterm_received.swap(false, .acq_rel)) {
+                log.info("SIGTERM received, shutting down gateway", .{});
+                break;
+            }
+
+            var poll_fds: [3]posix.pollfd = undefined;
+            var poll_count: usize = 2;
+
+            poll_fds[0] = .{ .fd = ssh.read_fd, .events = posix.POLL.IN, .revents = 0 };
+
+            var unix_events: i16 = posix.POLL.IN;
+            if (self.unix_write_buf.items.len > 0) unix_events |= posix.POLL.OUT;
+            poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
+
+            var ssh_write_idx: ?usize = null;
+            if (ssh.write_buf.items.len > 0) {
+                ssh_write_idx = poll_count;
+                poll_fds[poll_count] = .{ .fd = ssh.write_fd, .events = posix.POLL.OUT, .revents = 0 };
+                poll_count += 1;
+            }
+
+            _ = posix.poll(poll_fds[0..poll_count], 250) catch |err| {
+                if (err == error.Interrupted) continue;
+                return err;
+            };
+
+            if (poll_fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                self.running = false;
+            }
+            if (poll_fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                self.running = false;
+            }
+            if (ssh_write_idx) |idx| {
+                if (poll_fds[idx].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                    self.running = false;
+                }
+            }
+            if (!self.running) break;
+
+            if (poll_fds[0].revents & posix.POLL.IN != 0) {
+                while (true) {
+                    const n = ssh.read_buf.read(ssh.read_fd) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        self.running = false;
+                        break;
+                    };
+                    if (!self.running) break;
+                    if (n == 0) {
+                        self.running = false;
+                        break;
+                    }
+
+                    while (ssh.read_buf.next()) |msg| {
+                        if ((msg.header.tag == .Init or msg.header.tag == .Resize) and msg.payload.len == @sizeOf(ipc.Resize)) {
+                            self.last_resize = std.mem.bytesToValue(ipc.Resize, msg.payload);
+                            self.have_client_size = true;
+                        }
+                        ipc.appendMessage(self.alloc, &self.unix_write_buf, msg.header.tag, msg.payload) catch |err| {
+                            log.warn("unix write buffer overflow: {s}", .{@errorName(err)});
+                            self.running = false;
+                            break;
+                        };
+                    }
+                    if (!self.running) break;
+                }
+            }
+
+            if (ssh_write_idx) |idx| {
+                if (poll_fds[idx].revents & posix.POLL.OUT != 0) {
+                    const written = posix.write(ssh.write_fd, ssh.write_buf.items) catch |err| blk: {
+                        if (err == error.WouldBlock) break :blk @as(usize, 0);
+                        self.running = false;
+                        break :blk @as(usize, 0);
+                    };
+                    if (written > 0) {
+                        ssh.write_buf.replaceRange(self.alloc, 0, written, &[_]u8{}) catch unreachable;
+                    }
+                }
+            }
+
+            if (poll_fds[1].revents & posix.POLL.IN != 0) {
+                while (true) {
+                    const n = self.unix_read_buf.read(self.unix_fd) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        self.running = false;
+                        break;
+                    };
+                    if (!self.running) break;
+                    if (n == 0) {
+                        self.running = false;
+                        break;
+                    }
+
+                    while (self.unix_read_buf.next()) |msg| {
+                        ipc.appendMessage(self.alloc, &ssh.write_buf, msg.header.tag, msg.payload) catch |err| {
+                            log.warn("ssh write buffer overflow: {s}", .{@errorName(err)});
+                            self.running = false;
+                            break;
+                        };
+                    }
+                    if (!self.running) break;
+                }
+            }
+
+            if (poll_fds[1].revents & posix.POLL.OUT != 0 and self.unix_write_buf.items.len > 0) {
+                const written = posix.write(self.unix_fd, self.unix_write_buf.items) catch |err| blk: {
+                    if (err == error.WouldBlock) break :blk @as(usize, 0);
+                    self.running = false;
+                    break :blk @as(usize, 0);
+                };
+                if (written > 0) {
+                    self.unix_write_buf.replaceRange(self.alloc, 0, written, &[_]u8{}) catch unreachable;
+                }
+            }
+        }
+
+        ipc.appendMessage(self.alloc, &ssh.write_buf, .SessionEnd, "") catch {};
+        writeAllFd(ssh.write_fd, ssh.write_buf.items) catch {};
     }
 
     fn computePollTimeoutMs(self: *Gateway, now: i64) i32 {
@@ -577,6 +1068,7 @@ pub const Gateway = struct {
         self.output_coalesce_buf.deinit(self.alloc);
         self.reliable_inbox.deinit();
         self.reliable_send.deinit();
+        self.transport.deinit(self.alloc);
     }
 };
 
