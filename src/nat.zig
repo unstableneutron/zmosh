@@ -10,6 +10,10 @@ const c = @cImport({
 });
 
 pub const stun_magic_cookie: u32 = 0x2112A442;
+pub const default_stun_servers = [_][]const u8{
+    "stun.cloudflare.com:3478",
+    "stun.l.google.com:19302",
+};
 const retry_schedule_ms = [_]u32{ 500, 1000, 2000 };
 
 pub const CandidateType = enum {
@@ -42,6 +46,72 @@ pub const Candidates2Payload = struct {
 
 pub fn endpointForAddressAlloc(alloc: std.mem.Allocator, addr: std.net.Address) ![]u8 {
     return std.fmt.allocPrint(alloc, "{f}", .{addr});
+}
+
+pub const HostPort = struct {
+    host: []const u8,
+    port: u16,
+};
+
+pub fn parseHostPort(spec: []const u8, default_port: u16) !HostPort {
+    if (spec.len == 0) return error.InvalidHostPort;
+
+    if (spec[0] == '[') {
+        const close_idx = std.mem.indexOfScalar(u8, spec, ']') orelse return error.InvalidHostPort;
+        const host = spec[1..close_idx];
+        if (host.len == 0) return error.InvalidHostPort;
+
+        if (close_idx + 1 == spec.len) {
+            return .{ .host = host, .port = default_port };
+        }
+
+        if (close_idx + 2 > spec.len or spec[close_idx + 1] != ':') return error.InvalidHostPort;
+        const port = std.fmt.parseInt(u16, spec[close_idx + 2 ..], 10) catch return error.InvalidHostPort;
+        return .{ .host = host, .port = port };
+    }
+
+    const colon_idx_opt = std.mem.lastIndexOfScalar(u8, spec, ':');
+    if (colon_idx_opt == null) {
+        return .{ .host = spec, .port = default_port };
+    }
+
+    const colon_idx = colon_idx_opt.?;
+    const host = spec[0..colon_idx];
+    if (host.len == 0) return error.InvalidHostPort;
+    const port = std.fmt.parseInt(u16, spec[colon_idx + 1 ..], 10) catch return error.InvalidHostPort;
+    return .{ .host = host, .port = port };
+}
+
+pub fn resolveStunServers(
+    alloc: std.mem.Allocator,
+    socket_family: u16,
+    server_specs: []const []const u8,
+) !std.ArrayList(std.net.Address) {
+    const specs = if (server_specs.len > 0) server_specs else default_stun_servers[0..];
+
+    var out = try std.ArrayList(std.net.Address).initCapacity(alloc, specs.len);
+    errdefer out.deinit(alloc);
+
+    for (specs) |spec| {
+        const hp = parseHostPort(spec, 3478) catch continue;
+        const list = std.net.getAddressList(alloc, hp.host, hp.port) catch continue;
+        defer list.deinit();
+
+        for (list.addrs) |addr| {
+            if (!shouldUseCandidate(socket_family, addr)) continue;
+
+            var exists = false;
+            for (out.items) |existing| {
+                if (isAddressEqual(existing, addr)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) try out.append(alloc, addr);
+        }
+    }
+
+    return out;
 }
 
 pub fn parseEndpoint(endpoint: []const u8) !std.net.Address {
@@ -404,6 +474,20 @@ test "parseEndpoint ipv4 and ipv6" {
     const v6 = try parseEndpoint("[2001:db8::1]:60001");
     try std.testing.expect(v6.any.family == posix.AF.INET6);
     try std.testing.expect(v6.getPort() == 60001);
+}
+
+test "parseHostPort supports defaults and bracketed ipv6" {
+    const a = try parseHostPort("stun.cloudflare.com", 3478);
+    try std.testing.expectEqualStrings("stun.cloudflare.com", a.host);
+    try std.testing.expect(a.port == 3478);
+
+    const b = try parseHostPort("stun.example.com:5349", 3478);
+    try std.testing.expectEqualStrings("stun.example.com", b.host);
+    try std.testing.expect(b.port == 5349);
+
+    const hp_v6 = try parseHostPort("[2001:db8::1]:9999", 3478);
+    try std.testing.expectEqualStrings("2001:db8::1", hp_v6.host);
+    try std.testing.expect(hp_v6.port == 9999);
 }
 
 test "isStunPacket validates source and cookie" {
