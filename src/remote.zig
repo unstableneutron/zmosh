@@ -14,6 +14,9 @@ const default_probe_timeout_ms: u32 = 3000;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
 const session_end_grace_ns = 2 * std.time.ns_per_s;
+const ssh_fallback_after_disconnected_ns = 10 * std.time.ns_per_s;
+const use_ack_timeout_ms: i32 = 2000;
+const max_standby_buffer = 8 * 1024;
 
 const c = switch (builtin.os.tag) {
     .macos => @cImport({
@@ -105,6 +108,7 @@ pub const RemoteTransport = union(enum) {
 const Connect2Json = struct {
     v: u8,
     key: []const u8,
+    port: u16 = 0,
     candidates: []nat.CandidateWire,
     ssh_fallback: bool = false,
 };
@@ -132,7 +136,7 @@ pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key }
 fn parseConnect2Line(
     alloc: std.mem.Allocator,
     line: []const u8,
-) !struct { key: crypto.Key, candidates: std.ArrayList(nat.Candidate) } {
+) !struct { key: crypto.Key, port: u16, candidates: std.ArrayList(nat.Candidate) } {
     const trimmed = std.mem.trimRight(u8, line, "\r\n");
     if (!std.mem.startsWith(u8, trimmed, "ZMX_CONNECT2 ")) return error.InvalidConnectLine;
 
@@ -152,7 +156,7 @@ fn parseConnect2Line(
         try candidates.append(alloc, candidate);
     }
 
-    return .{ .key = key, .candidates = candidates };
+    return .{ .key = key, .port = parsed.value.port, .candidates = candidates };
 }
 
 fn isValidSessionName(session: []const u8) bool {
@@ -543,7 +547,12 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
         try setNonBlocking(stdin_fd);
         try setNonBlocking(stdout_fd);
 
-        const port = if (parsed.candidates.items.len > 0) parsed.candidates.items[0].addr.getPort() else 60000;
+        const port = if (parsed.port != 0)
+            parsed.port
+        else if (parsed.candidates.items.len > 0)
+            parsed.candidates.items[0].addr.getPort()
+        else
+            60000;
 
         return .{
             .host = host,
@@ -707,6 +716,131 @@ fn flushWriteBuffer(fd: i32, write_buf: *std.ArrayList(u8), alloc: std.mem.Alloc
     }
 }
 
+fn closeSshBootstrap(pipes: SshBootstrap) void {
+    if (pipes.stdin_fd == pipes.stdout_fd) {
+        posix.close(pipes.stdin_fd);
+    } else {
+        posix.close(pipes.stdin_fd);
+        posix.close(pipes.stdout_fd);
+    }
+}
+
+fn shouldSwitchToStandbySsh(now: i64, disconnected_since_ns: ?i64, standby_ssh: ?SshBootstrap) bool {
+    if (standby_ssh == null) return false;
+    const since = disconnected_since_ns orelse return false;
+    return (now - since) >= ssh_fallback_after_disconnected_ns;
+}
+
+fn waitForUseAck(fd: i32, alloc: std.mem.Allocator, mode: []const u8, buffered: *std.ArrayList(u8)) !void {
+    var expected_buf: [32]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "ZMX_USE_OK {s}", .{mode});
+
+    const deadline_ms = @as(i64, @intCast(std.time.milliTimestamp())) + use_ack_timeout_ms;
+    while (true) {
+        if (std.mem.indexOfScalar(u8, buffered.items, '\n')) |nl_idx| {
+            const line = std.mem.trimRight(u8, buffered.items[0..nl_idx], "\r\n");
+            if (std.mem.eql(u8, line, expected)) {
+                try buffered.replaceRange(alloc, 0, nl_idx + 1, &[_]u8{});
+                return;
+            }
+            try buffered.replaceRange(alloc, 0, nl_idx + 1, &[_]u8{});
+            continue;
+        }
+
+        const now_ms = @as(i64, @intCast(std.time.milliTimestamp()));
+        if (now_ms >= deadline_ms) return error.UseAckTimeout;
+
+        const wait_ms = @min(@as(i64, 200), deadline_ms - now_ms);
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&fds, @intCast(@max(@as(i64, 1), wait_ms))) catch |err| {
+            if (err == error.Interrupted) continue;
+            return err;
+        };
+
+        if (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            return error.UnexpectedEof;
+        }
+        if (fds[0].revents & posix.POLL.IN == 0) continue;
+
+        var tmp: [256]u8 = undefined;
+        const n = posix.read(fd, &tmp) catch |err| {
+            if (err == error.WouldBlock) continue;
+            return err;
+        };
+        if (n == 0) return error.UnexpectedEof;
+        if (buffered.items.len + n > max_standby_buffer) return error.ControlMessageTooLarge;
+        try buffered.appendSlice(alloc, tmp[0..n]);
+    }
+}
+
+fn switchToStandbySsh(
+    alloc: std.mem.Allocator,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?SshBootstrap,
+    standby_buffer: *std.ArrayList(u8),
+) !void {
+    const pipes = standby_ssh.* orelse return error.MissingSshPipes;
+    try sendUse(pipes.stdin_fd, "ssh");
+
+    try waitForUseAck(pipes.stdout_fd, alloc, "ssh", standby_buffer);
+
+    var read_buf = try ipc.SocketBuffer.init(alloc);
+    errdefer read_buf.deinit();
+    if (standby_buffer.items.len > 0) {
+        try read_buf.buf.appendSlice(read_buf.alloc, standby_buffer.items);
+        standby_buffer.clearRetainingCapacity();
+    }
+
+    var write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+    errdefer write_buf.deinit(alloc);
+
+    transport_mode.* = .{ .ssh = .{
+        .read_fd = pipes.stdout_fd,
+        .write_fd = pipes.stdin_fd,
+        .read_buf = read_buf,
+        .write_buf = write_buf,
+    } };
+    standby_ssh.* = null;
+}
+
+fn performSshFallback(
+    alloc: std.mem.Allocator,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?SshBootstrap,
+    standby_buffer: *std.ArrayList(u8),
+    connect_debug: bool,
+    reason: []const u8,
+    disconnected_since_ns: *?i64,
+    was_disconnected: *bool,
+    pending_ssh_detach: *bool,
+) !bool {
+    if (standby_ssh.* == null) return false;
+
+    switchToStandbySsh(alloc, transport_mode, standby_ssh, standby_buffer) catch |err| {
+        connectDebug(connect_debug, "failed to switch to SSH fallback: {s}", .{@errorName(err)});
+        if (standby_ssh.*) |pipes| {
+            closeSshBootstrap(pipes);
+            standby_ssh.* = null;
+        }
+        standby_buffer.clearRetainingCapacity();
+        return false;
+    };
+
+    _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
+    _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: UDP unavailable — switched to SSH tunnel\r\n") catch {};
+    connectDebug(connect_debug, "switched to SSH fallback ({s})", .{reason});
+
+    disconnected_since_ns.* = null;
+    was_disconnected.* = false;
+    pending_ssh_detach.* = false;
+
+    if (transport_mode.* == .ssh) {
+        const resumed_size = getTerminalSize();
+        try appendSshIpc(&transport_mode.ssh.write_buf, alloc, .Init, std.mem.asBytes(&resumed_size));
+    }
+    return true;
+}
+
 /// Remote attach: connect to a remote zmx session via UDP or SSH fallback.
 pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options: RemoteAttachOptions) !void {
     var session = session_in;
@@ -763,30 +897,29 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var transport_mode: RemoteTransport = .{ .udp = .{ .sock = &udp_sock, .peer = &peer } };
     defer transport_mode.deinit(alloc);
 
+    var standby_ssh: ?SshBootstrap = null;
+    defer if (standby_ssh) |pipes| closeSshBootstrap(pipes);
+    var standby_buffer: std.ArrayList(u8) = .empty;
+    defer standby_buffer.deinit(alloc);
+
     const decision = try probeAndSelectTransport(alloc, &session, options, fallback_addr, &udp_sock, &peer, &reliable_recv);
     if (decision == .udp and session.ssh != null) {
         try sendUse(session.ssh.?.stdin_fd, "udp");
-        posix.close(session.ssh.?.stdin_fd);
-        posix.close(session.ssh.?.stdout_fd);
+        standby_ssh = session.ssh;
         session.ssh = null;
-        connectDebug(options.connect_debug, "selected UDP transport", .{});
+        standby_buffer.clearRetainingCapacity();
+        connectDebug(options.connect_debug, "selected UDP transport with SSH standby", .{});
     } else if (decision == .ssh) {
         if (session.ssh == null) return error.MissingSshPipes;
-        try sendUse(session.ssh.?.stdin_fd, "ssh");
+        try switchToStandbySsh(alloc, &transport_mode, &session.ssh, &standby_buffer);
         _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: using SSH tunnel (no UDP connectivity)\r\n") catch {};
         connectDebug(options.connect_debug, "selected SSH transport", .{});
-
-        transport_mode = .{ .ssh = .{
-            .read_fd = session.ssh.?.stdout_fd,
-            .write_fd = session.ssh.?.stdin_fd,
-            .read_buf = try ipc.SocketBuffer.init(alloc),
-            .write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096),
-        } };
-        session.ssh = null;
     }
     var was_disconnected = false;
+    var disconnected_since_ns: ?i64 = null;
     var session_ended = false;
     var session_end_deadline_ns: ?i64 = null;
+    var pending_ssh_detach = false;
 
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
@@ -842,6 +975,20 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             const state = peer.updateState(now, config);
             if (state == .dead) {
                 if (!session_ended) {
+                    if (try performSshFallback(
+                        alloc,
+                        &transport_mode,
+                        &standby_ssh,
+                        &standby_buffer,
+                        options.connect_debug,
+                        "dead UDP state",
+                        &disconnected_since_ns,
+                        &was_disconnected,
+                        &pending_ssh_detach,
+                    )) {
+                        continue;
+                    }
+
                     _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: connection lost permanently\r\n") catch {};
                     return;
                 }
@@ -851,13 +998,34 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 was_disconnected = true;
                 sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
                 sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+                disconnected_since_ns = now;
+            } else if (state == .disconnected and disconnected_since_ns == null) {
+                disconnected_since_ns = now;
             } else if (state == .connected and was_disconnected) {
                 _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
                 was_disconnected = false;
+                disconnected_since_ns = null;
+            }
+
+            if (state == .disconnected and shouldSwitchToStandbySsh(now, disconnected_since_ns, standby_ssh)) {
+                if (!(try performSshFallback(
+                    alloc,
+                    &transport_mode,
+                    &standby_ssh,
+                    &standby_buffer,
+                    options.connect_debug,
+                    "disconnect timeout",
+                    &disconnected_since_ns,
+                    &was_disconnected,
+                    &pending_ssh_detach,
+                ))) {
+                    continue;
+                }
+                continue;
             }
         }
 
-        var poll_fds: [4]posix.pollfd = undefined;
+        var poll_fds: [5]posix.pollfd = undefined;
         var poll_count: usize = 0;
 
         const stdin_idx = poll_count;
@@ -874,6 +1042,13 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             },
         }
         poll_count += 1;
+
+        var standby_read_idx: ?usize = null;
+        if (transport_mode == .udp and standby_ssh != null) {
+            standby_read_idx = poll_count;
+            poll_fds[poll_count] = .{ .fd = standby_ssh.?.stdout_fd, .events = posix.POLL.IN, .revents = 0 };
+            poll_count += 1;
+        }
 
         var stdout_idx: ?usize = null;
         if (stdout_buf.items.len > 0) {
@@ -899,6 +1074,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
             const heartbeat_ms = @divFloor(peer.heartbeatDelayNs(now, config), std.time.ns_per_ms);
             poll_timeout = @min(poll_timeout, heartbeat_ms);
+        } else if (pending_ssh_detach and transport_mode.ssh.write_buf.items.len > 0) {
+            poll_timeout = @min(poll_timeout, @as(i64, 20));
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
 
@@ -918,7 +1095,52 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
-        if (poll_fds[stdin_idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+        if (standby_read_idx) |idx| {
+            if (poll_fds[idx].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                if (standby_ssh) |pipes| {
+                    closeSshBootstrap(pipes);
+                    standby_ssh = null;
+                }
+                standby_buffer.clearRetainingCapacity();
+            }
+
+            if (standby_ssh != null and poll_fds[idx].revents & posix.POLL.IN != 0) {
+                while (true) {
+                    var drain_buf: [256]u8 = undefined;
+                    const n = posix.read(standby_ssh.?.stdout_fd, &drain_buf) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        if (standby_ssh) |pipes| {
+                            closeSshBootstrap(pipes);
+                            standby_ssh = null;
+                        }
+                        standby_buffer.clearRetainingCapacity();
+                        break;
+                    };
+                    if (n == 0) {
+                        if (standby_ssh) |pipes| {
+                            closeSshBootstrap(pipes);
+                            standby_ssh = null;
+                        }
+                        standby_buffer.clearRetainingCapacity();
+                        break;
+                    }
+
+                    if (standby_buffer.items.len + n > max_standby_buffer) {
+                        standby_buffer.clearRetainingCapacity();
+                    }
+                    standby_buffer.appendSlice(alloc, drain_buf[0..n]) catch {
+                        if (standby_ssh) |pipes| {
+                            closeSshBootstrap(pipes);
+                            standby_ssh = null;
+                        }
+                        standby_buffer.clearRetainingCapacity();
+                        break;
+                    };
+                }
+            }
+        }
+
+        if (!pending_ssh_detach and poll_fds[stdin_idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
             var input_raw: [4096]u8 = undefined;
             const n_opt: ?usize = posix.read(posix.STDIN_FILENO, &input_raw) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk null;
@@ -938,11 +1160,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         .ssh => |*s| {
                             if (should_detach) {
                                 try appendSshIpc(&s.write_buf, alloc, .Detach, "");
-                                try writeAllFd(s.write_fd, s.write_buf.items);
-                                s.write_buf.clearRetainingCapacity();
-                                return;
+                                pending_ssh_detach = true;
+                            } else {
+                                try appendSshIpc(&s.write_buf, alloc, .Input, input_raw[0..n]);
                             }
-                            try appendSshIpc(&s.write_buf, alloc, .Input, input_raw[0..n]);
                         },
                     }
                 } else {
@@ -1137,6 +1358,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
+        if (pending_ssh_detach and transport_mode == .ssh and transport_mode.ssh.write_buf.items.len == 0) {
+            return;
+        }
+
         if (stdout_idx) |idx| {
             if (poll_fds[idx].revents & posix.POLL.OUT != 0 and stdout_buf.items.len > 0) {
                 const written = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
@@ -1191,6 +1416,30 @@ test "parseConnectLine invalid prefix" {
 
 test "parseConnectLine unsupported protocol" {
     try std.testing.expectError(error.UnsupportedProtocol, parseConnectLine("ZMX_CONNECT tcp 60042 key\n"));
+}
+
+test "parseConnect2Line keeps explicit bootstrap port" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var parsed = try parseConnect2Line(
+        alloc,
+        "ZMX_CONNECT2 {\"v\":2,\"key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"port\":60444,\"candidates\":[]}\n",
+    );
+    defer parsed.candidates.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 60444), parsed.port);
+}
+
+test "ssh standby fallback threshold" {
+    const now: i64 = 20 * std.time.ns_per_s;
+    const pipes = SshBootstrap{ .stdin_fd = 1, .stdout_fd = 2 };
+
+    try std.testing.expect(!shouldSwitchToStandbySsh(now, null, pipes));
+    try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 5 * std.time.ns_per_s, pipes));
+    try std.testing.expect(shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, pipes));
+    try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, null));
 }
 
 test "session name validation" {

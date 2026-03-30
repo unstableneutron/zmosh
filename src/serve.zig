@@ -75,6 +75,24 @@ const GatewayTransport = union(enum) {
     }
 };
 
+const StandbySsh = struct {
+    read_fd: i32,
+    write_fd: i32,
+    control_buf: std.ArrayList(u8),
+
+    fn deinit(self: *StandbySsh, alloc: std.mem.Allocator, close_fds: bool) void {
+        if (close_fds) {
+            if (self.read_fd == self.write_fd) {
+                posix.close(self.read_fd);
+            } else {
+                posix.close(self.read_fd);
+                posix.close(self.write_fd);
+            }
+        }
+        self.control_buf.deinit(alloc);
+    }
+};
+
 const Candidates2Json = struct {
     candidates: []nat.CandidateWire,
 };
@@ -114,6 +132,12 @@ fn writeAllFd(fd: i32, bytes: []const u8) !void {
         if (n == 0) return error.WriteFailed;
         off += n;
     }
+}
+
+fn sendUseAck(fd: i32, mode: []const u8) !void {
+    var line_buf: [32]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "ZMX_USE_OK {s}\n", .{mode});
+    try writeAllFd(fd, line);
 }
 
 fn socketFamily(fd: i32) !u16 {
@@ -168,6 +192,7 @@ fn sendConnect2(
     fd: i32,
     alloc: std.mem.Allocator,
     key: crypto.Key,
+    port: u16,
     candidates: []const nat.Candidate,
 ) !void {
     const encoded_key = crypto.keyToBase64(key);
@@ -192,6 +217,7 @@ fn sendConnect2(
 
     const payload = nat.Connect2Payload{
         .key = &encoded_key,
+        .port = port,
         .candidates = wire_list.items,
         .ssh_fallback = true,
     };
@@ -390,6 +416,7 @@ pub const Gateway = struct {
     have_client_size: bool,
     last_resize: ipc.Resize,
     transport: GatewayTransport,
+    standby_ssh: ?StandbySsh,
     stun_servers: std.ArrayList(std.net.Address),
     stun_server_idx: usize,
     stun_state: ?nat.StunState,
@@ -434,6 +461,9 @@ pub const Gateway = struct {
         // Initialize peer (we send to_client, recv to_server from remote client)
         var peer = udp.Peer.init(key, .to_client);
         var transport_mode: GatewayTransport = .udp;
+        errdefer transport_mode.deinit(alloc);
+        var standby_ssh: ?StandbySsh = null;
+        errdefer if (standby_ssh) |*standby| standby.deinit(alloc, true);
         const bootstrap_v2 = std.mem.eql(u8, posix.getenv("ZMX_BOOTSTRAP") orelse "", "2");
 
         connectDebug(connect_debug, "bootstrap_v2={} probe_timeout_ms={d} stun_servers={d}", .{
@@ -446,7 +476,7 @@ pub const Gateway = struct {
             var local_candidates = try gatherLocalCandidates(alloc, &udp_sock, socket_family, stun_servers.items);
             defer local_candidates.deinit(alloc);
 
-            try sendConnect2(posix.STDOUT_FILENO, alloc, key, local_candidates.items);
+            try sendConnect2(posix.STDOUT_FILENO, alloc, key, udp_sock.bound_port, local_candidates.items);
 
             var line_buf: [max_control_line]u8 = undefined;
             const candidates_line = try readLineFd(posix.STDIN_FILENO, &line_buf);
@@ -461,9 +491,15 @@ pub const Gateway = struct {
             const use_line = try readLineFd(posix.STDIN_FILENO, &line_buf);
             const use_mode = try parseUseLine(use_line);
             if (use_mode == .udp) {
-                posix.close(posix.STDIN_FILENO);
-                posix.close(posix.STDOUT_FILENO);
+                try setNonBlocking(posix.STDIN_FILENO);
+                try setNonBlocking(posix.STDOUT_FILENO);
+                standby_ssh = .{
+                    .read_fd = posix.STDIN_FILENO,
+                    .write_fd = posix.STDOUT_FILENO,
+                    .control_buf = try std.ArrayList(u8).initCapacity(alloc, 128),
+                };
             } else {
+                try sendUseAck(posix.STDOUT_FILENO, "ssh");
                 try setNonBlocking(posix.STDIN_FILENO);
                 try setNonBlocking(posix.STDOUT_FILENO);
                 transport_mode = .{ .ssh = .{
@@ -517,6 +553,7 @@ pub const Gateway = struct {
             .have_client_size = false,
             .last_resize = .{ .rows = 24, .cols = 80 },
             .transport = transport_mode,
+            .standby_ssh = standby_ssh,
             .stun_servers = stun_servers,
             .stun_server_idx = 0,
             .stun_state = null,
@@ -583,7 +620,8 @@ pub const Gateway = struct {
             }
 
             // Build poll fds
-            var poll_fds: [2]posix.pollfd = undefined;
+            var poll_fds: [3]posix.pollfd = undefined;
+            var poll_count: usize = 2;
             poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
 
             var unix_events: i16 = posix.POLL.IN;
@@ -592,11 +630,24 @@ pub const Gateway = struct {
             }
             poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
 
+            var standby_idx: ?usize = null;
+            if (self.standby_ssh) |standby| {
+                standby_idx = poll_count;
+                poll_fds[poll_count] = .{ .fd = standby.read_fd, .events = posix.POLL.IN, .revents = 0 };
+                poll_count += 1;
+            }
+
             const poll_timeout = self.computePollTimeoutMs(now);
-            _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
+            _ = posix.poll(poll_fds[0..poll_count], poll_timeout) catch |err| {
                 if (err == error.Interrupted) continue;
                 return err;
             };
+
+            if (standby_idx) |idx| {
+                if (try self.handleStandbySshEvents(poll_fds[idx].revents)) {
+                    return self.runSsh();
+                }
+            }
 
             // Handle incoming UDP datagrams → decrypt → decode transport packet
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
@@ -676,19 +727,111 @@ pub const Gateway = struct {
     }
 
     fn handleStunDatagram(self: *Gateway, from: std.net.Address, data: []const u8) bool {
-        if (self.stun_state) |*state| {
-            if (!nat.isStunPacket(state.server_addr, from, data)) return false;
-            const parsed = state.handleResponse(data) catch return true;
-            if (parsed) |candidate| {
-                if (self.last_srflx) |old| {
-                    if (!nat.isAddressEqual(old, candidate.addr)) {
-                        log.warn("stun mapping changed old={f} new={f}", .{ old, candidate.addr });
-                    }
+        const state = self.stun_state orelse return false;
+        if (!state.waiting_response) return false;
+        if (!nat.isStunPacket(state.server_addr, from, data)) return false;
+
+        const parsed = self.stun_state.?.handleResponse(data) catch return true;
+        if (parsed) |candidate| {
+            if (self.last_srflx) |old| {
+                if (!nat.isAddressEqual(old, candidate.addr)) {
+                    log.warn("stun mapping changed old={f} new={f}", .{ old, candidate.addr });
                 }
-                self.last_srflx = candidate.addr;
             }
+            self.last_srflx = candidate.addr;
+        }
+        if (!self.stun_state.?.waiting_response) {
+            self.stun_state = null;
         }
         return true;
+    }
+
+    fn handleStandbySshEvents(self: *Gateway, revents: i16) !bool {
+        if (self.standby_ssh == null) return false;
+
+        if (revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            log.info("standby ssh control channel closed", .{});
+            self.standby_ssh.?.deinit(self.alloc, true);
+            self.standby_ssh = null;
+            return false;
+        }
+
+        if (revents & posix.POLL.IN == 0) return false;
+
+        while (true) {
+            var tmp: [256]u8 = undefined;
+            const n = posix.read(self.standby_ssh.?.read_fd, &tmp) catch |err| {
+                if (err == error.WouldBlock) break;
+                log.warn("standby ssh control read failed: {s}", .{@errorName(err)});
+                self.standby_ssh.?.deinit(self.alloc, true);
+                self.standby_ssh = null;
+                return false;
+            };
+            if (n == 0) {
+                log.info("standby ssh control reached EOF", .{});
+                self.standby_ssh.?.deinit(self.alloc, true);
+                self.standby_ssh = null;
+                return false;
+            }
+
+            var standby = &self.standby_ssh.?;
+            try standby.control_buf.appendSlice(self.alloc, tmp[0..n]);
+            if (standby.control_buf.items.len > max_control_line) {
+                log.warn("standby ssh control line too long; disabling fallback channel", .{});
+                standby.deinit(self.alloc, true);
+                self.standby_ssh = null;
+                return false;
+            }
+        }
+
+        while (self.standby_ssh != null) {
+            var standby = &self.standby_ssh.?;
+            const nl_idx = std.mem.indexOfScalar(u8, standby.control_buf.items, '\n') orelse break;
+            const line = std.mem.trimRight(u8, standby.control_buf.items[0..nl_idx], "\r\n");
+            const mode = parseUseLine(line) catch {
+                log.warn("invalid standby ssh control message: {s}", .{line});
+                try standby.control_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
+                continue;
+            };
+            try standby.control_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
+
+            if (mode == .ssh) {
+                sendUseAck(standby.write_fd, "ssh") catch {
+                    standby.deinit(self.alloc, true);
+                    self.standby_ssh = null;
+                    return false;
+                };
+                try self.promoteStandbyToSsh();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn promoteStandbyToSsh(self: *Gateway) !void {
+        var standby = self.standby_ssh orelse return error.NoStandbySsh;
+        self.standby_ssh = null;
+
+        var close_fds = true;
+        defer standby.deinit(self.alloc, close_fds);
+
+        var read_buf = try ipc.SocketBuffer.init(self.alloc);
+        errdefer read_buf.deinit();
+        if (standby.control_buf.items.len > 0) {
+            try read_buf.buf.appendSlice(read_buf.alloc, standby.control_buf.items);
+        }
+
+        var write_buf = try std.ArrayList(u8).initCapacity(self.alloc, 4096);
+        errdefer write_buf.deinit(self.alloc);
+
+        self.transport = .{ .ssh = .{
+            .read_fd = standby.read_fd,
+            .write_fd = standby.write_fd,
+            .read_buf = read_buf,
+            .write_buf = write_buf,
+        } };
+        close_fds = false;
     }
 
     fn runSsh(self: *Gateway) !void {
@@ -1115,6 +1258,10 @@ pub const Gateway = struct {
     pub fn deinit(self: *Gateway) void {
         posix.close(self.unix_fd);
         self.udp_sock.close();
+        if (self.standby_ssh) |*standby| {
+            standby.deinit(self.alloc, true);
+            self.standby_ssh = null;
+        }
         self.unix_read_buf.deinit();
         self.unix_write_buf.deinit(self.alloc);
         self.output_coalesce_buf.deinit(self.alloc);
@@ -1168,4 +1315,16 @@ test "resolveSocketDir returns valid path" {
     defer alloc.free(dir);
     try std.testing.expect(dir.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, dir, "zmx") != null);
+}
+
+test "stun datagrams are ignored without active stun state" {
+    var gateway: Gateway = undefined;
+    gateway.stun_state = null;
+    gateway.last_srflx = null;
+
+    const from = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 3478);
+    var pkt: [20]u8 = [_]u8{0} ** 20;
+    std.mem.writeInt(u32, pkt[4..8], nat.stun_magic_cookie, .big);
+
+    try std.testing.expect(!gateway.handleStunDatagram(from, &pkt));
 }

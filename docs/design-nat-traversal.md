@@ -101,7 +101,7 @@ without framing.
 
 **Server → client (stdout):**
 ```
-ZMX_CONNECT2 {"v":2,"key":"<b64>","candidates":[...],"ssh_fallback":true}\n
+ZMX_CONNECT2 {"v":2,"key":"<b64>","port":<udp_port>,"candidates":[...],"ssh_fallback":true}\n
 ```
 
 **Client → server (stdin):**

@@ -36,6 +36,7 @@ pub const CandidateWire = struct {
 pub const Connect2Payload = struct {
     v: u8 = 2,
     key: []const u8,
+    port: u16,
     candidates: []CandidateWire,
     ssh_fallback: bool = true,
 };
@@ -199,14 +200,17 @@ pub const StunState = struct {
         }
         if (now_ns < self.next_retry_ns) return;
 
-        self.retries += 1;
-
         var req: [20]u8 = undefined;
         std.mem.writeInt(u16, req[0..2], 0x0001, .big);
         std.mem.writeInt(u16, req[2..4], 0, .big);
         std.mem.writeInt(u32, req[4..8], stun_magic_cookie, .big);
         req[8..20].* = self.txn_id;
-        try sock.sendTo(&req, self.server_addr);
+        sock.sendTo(&req, self.server_addr) catch |err| {
+            if (err == error.WouldBlock) return;
+            return err;
+        };
+
+        self.retries += 1;
 
         self.sent_ns = now_ns;
         if (self.retries < retry_schedule_ms.len) {
@@ -433,22 +437,23 @@ pub fn sortCandidatesByPriority(candidates: []Candidate) void {
 
 pub const ProbeState = struct {
     candidates: []Candidate,
-    current_idx: usize = 0,
     attempts_per_candidate: u8 = 5,
     interval_ms: u32 = 200,
     selected: ?std.net.Address = null,
 
-    attempts_on_current: u8 = 0,
+    current_round: u8 = 0,
+    next_idx: usize = 0,
 
     pub fn nextProbeAddr(self: *ProbeState) ?std.net.Address {
         if (self.selected != null) return null;
-        if (self.current_idx >= self.candidates.len) return null;
+        if (self.candidates.len == 0) return null;
+        if (self.current_round >= self.attempts_per_candidate) return null;
 
-        const addr = self.candidates[self.current_idx].addr;
-        self.attempts_on_current += 1;
-        if (self.attempts_on_current >= self.attempts_per_candidate) {
-            self.attempts_on_current = 0;
-            self.current_idx += 1;
+        const addr = self.candidates[self.next_idx].addr;
+        self.next_idx += 1;
+        if (self.next_idx >= self.candidates.len) {
+            self.next_idx = 0;
+            self.current_round += 1;
         }
         return addr;
     }
@@ -458,7 +463,7 @@ pub const ProbeState = struct {
     }
 
     pub fn isComplete(self: *const ProbeState) bool {
-        return self.selected != null or self.current_idx >= self.candidates.len;
+        return self.selected != null or self.candidates.len == 0 or self.current_round >= self.attempts_per_candidate;
     }
 };
 
@@ -545,9 +550,9 @@ test "probe state progresses and locks on auth recv" {
         .attempts_per_candidate = 2,
     };
 
-    _ = state.nextProbeAddr().?;
-    _ = state.nextProbeAddr().?;
-    try std.testing.expect(state.current_idx == 1);
+    const first = state.nextProbeAddr().?;
+    const second = state.nextProbeAddr().?;
+    try std.testing.expect(!isAddressEqual(first, second));
 
     state.onAuthenticatedRecv(std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 61000));
     try std.testing.expect(state.isComplete());
