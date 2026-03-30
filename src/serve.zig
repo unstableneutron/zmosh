@@ -126,9 +126,21 @@ fn readLineFd(fd: i32, buf: []u8) ![]const u8 {
 }
 
 fn writeAllFd(fd: i32, bytes: []const u8) !void {
+    const deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + 2 * std.time.ns_per_s;
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = try posix.write(fd, bytes[off..]);
+        const n = posix.write(fd, bytes[off..]) catch |err| {
+            if (err == error.WouldBlock) {
+                if (@as(i64, @intCast(std.time.nanoTimestamp())) >= deadline_ns) return error.WriteFailed;
+                var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                _ = posix.poll(&fds, 200) catch |poll_err| {
+                    if (poll_err == error.Interrupted) continue;
+                    return error.WriteFailed;
+                };
+                continue;
+            }
+            return error.WriteFailed;
+        };
         if (n == 0) return error.WriteFailed;
         off += n;
     }
@@ -727,11 +739,11 @@ pub const Gateway = struct {
     }
 
     fn handleStunDatagram(self: *Gateway, from: std.net.Address, data: []const u8) bool {
-        const state = self.stun_state orelse return false;
+        const state = &(self.stun_state orelse return false);
         if (!state.waiting_response) return false;
         if (!nat.isStunPacket(state.server_addr, from, data)) return false;
 
-        const parsed = self.stun_state.?.handleResponse(data) catch return true;
+        const parsed = state.handleResponse(data) catch return true;
         if (parsed) |candidate| {
             if (self.last_srflx) |old| {
                 if (!nat.isAddressEqual(old, candidate.addr)) {
@@ -740,7 +752,7 @@ pub const Gateway = struct {
             }
             self.last_srflx = candidate.addr;
         }
-        if (!self.stun_state.?.waiting_response) {
+        if (!state.waiting_response) {
             self.stun_state = null;
         }
         return true;
