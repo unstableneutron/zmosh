@@ -9,7 +9,7 @@ on:
     tags: ["v1*"]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -276,18 +276,55 @@ jobs:
 
       - name: Generate release notes
         run: |
+          platform_for() {
+            case "$1" in
+              *linux-aarch64.tar.gz)
+                echo "Linux ARM64"
+                ;;
+              *linux-x86_64.tar.gz)
+                echo "Linux x86_64"
+                ;;
+              *darwin-aarch64.tar.gz|*darwin-arm64.tar.gz|*macos-aarch64.tar.gz|*macos-arm64.tar.gz)
+                echo "macOS ARM64"
+                ;;
+              *darwin-x86_64.tar.gz|*macos-x86_64.tar.gz)
+                echo "macOS x86_64"
+                ;;
+              *)
+                echo "-"
+                ;;
+            esac
+          }
+
+          HEAD_SHA=$(git rev-parse HEAD)
+          BASE_SHA=
+          if [[ "$PRERELEASE" == "true" ]] && git rev-parse --verify origin/main >/dev/null 2>&1; then
+            BASE_SHA=$(git merge-base origin/main "$HEAD_SHA")
+          fi
+
           {
             echo "## CLI Binaries"
             echo ""
             echo "| Platform | File |"
             echo "|----------|------|"
             for f in release-artifacts/*.tar.gz; do
-              echo "| | \`$(basename "$f")\` |"
+              BASENAME=$(basename "$f")
+              echo "| $(platform_for "$BASENAME") | \`${BASENAME}\` |"
             done
             echo ""
             echo "**Version:** \`${RELEASE_VERSION}\`"
             echo "**Commit:** \`${SHORT_SHA}\`"
             echo ""
+
+            if [[ "$PRERELEASE" == "true" ]] && [[ -n "$BASE_SHA" ]] && [[ "$BASE_SHA" != "$HEAD_SHA" ]]; then
+              echo "## Changes vs main"
+              echo ""
+              echo "[Compare changes](https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA})"
+              echo ""
+              git log --no-merges --reverse --format='- %s (`%h`)' "${BASE_SHA}..${HEAD_SHA}"
+              echo ""
+            fi
+
             echo "## Install via mise"
             echo ""
             if [[ "$PRERELEASE" == "true" ]]; then
