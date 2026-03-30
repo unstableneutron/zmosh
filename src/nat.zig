@@ -206,7 +206,10 @@ pub const StunState = struct {
         std.mem.writeInt(u32, req[4..8], stun_magic_cookie, .big);
         req[8..20].* = self.txn_id;
         sock.sendTo(&req, self.server_addr) catch |err| {
-            if (err == error.WouldBlock) return;
+            if (err == error.WouldBlock) {
+                self.next_retry_ns = now_ns + 50 * std.time.ns_per_ms;
+                return;
+            }
             return err;
         };
 

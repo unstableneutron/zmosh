@@ -199,12 +199,17 @@ fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
 }
 
 fn writeAllFd(fd: i32, bytes: []const u8) !void {
+    const deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + 2 * std.time.ns_per_s;
     var off: usize = 0;
     while (off < bytes.len) {
         const n = posix.write(fd, bytes[off..]) catch |err| {
             if (err == error.WouldBlock) {
+                if (@as(i64, @intCast(std.time.nanoTimestamp())) >= deadline_ns) return error.WriteTimeout;
                 var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-                _ = try posix.poll(&fds, 1000);
+                _ = posix.poll(&fds, 200) catch |poll_err| {
+                    if (poll_err == error.Interrupted) continue;
+                    return poll_err;
+                };
                 continue;
             }
             return err;
@@ -814,11 +819,7 @@ fn performSshFallback(
 
     switchToStandbySsh(alloc, transport_mode, standby_ssh, standby_buffer) catch |err| {
         connectDebug(connect_debug, "failed to switch to SSH fallback: {s}", .{@errorName(err)});
-        if (standby_ssh.*) |pipes| {
-            closeSshBootstrap(pipes);
-            standby_ssh.* = null;
-        }
-        standby_buffer.clearRetainingCapacity();
+        disableStandby(standby_ssh, standby_buffer);
         return false;
     };
 
@@ -835,6 +836,14 @@ fn performSshFallback(
         try appendSshIpc(&transport_mode.ssh.write_buf, alloc, .Init, std.mem.asBytes(&resumed_size));
     }
     return true;
+}
+
+fn disableStandby(standby_ssh: *?SshBootstrap, standby_buffer: *std.ArrayList(u8)) void {
+    if (standby_ssh.*) |pipes| {
+        closeSshBootstrap(pipes);
+        standby_ssh.* = null;
+    }
+    standby_buffer.clearRetainingCapacity();
 }
 
 /// Remote attach: connect to a remote zmx session via UDP or SSH fallback.
@@ -912,6 +921,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var disconnected_since_ns: ?i64 = null;
     var session_ended = false;
     var pending_ssh_detach = false;
+    var pending_ssh_detach_ns: ?i64 = null;
 
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
@@ -1076,11 +1086,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
 
         if (standby_read_idx) |idx| {
             if (poll_fds[idx].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-                if (standby_ssh) |pipes| {
-                    closeSshBootstrap(pipes);
-                    standby_ssh = null;
-                }
-                standby_buffer.clearRetainingCapacity();
+                disableStandby(&standby_ssh, &standby_buffer);
             }
 
             if (standby_ssh != null and poll_fds[idx].revents & posix.POLL.IN != 0) {
@@ -1088,19 +1094,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     var drain_buf: [256]u8 = undefined;
                     const n = posix.read(standby_ssh.?.stdout_fd, &drain_buf) catch |err| {
                         if (err == error.WouldBlock) break;
-                        if (standby_ssh) |pipes| {
-                            closeSshBootstrap(pipes);
-                            standby_ssh = null;
-                        }
-                        standby_buffer.clearRetainingCapacity();
+                        disableStandby(&standby_ssh, &standby_buffer);
                         break;
                     };
                     if (n == 0) {
-                        if (standby_ssh) |pipes| {
-                            closeSshBootstrap(pipes);
-                            standby_ssh = null;
-                        }
-                        standby_buffer.clearRetainingCapacity();
+                        disableStandby(&standby_ssh, &standby_buffer);
                         break;
                     }
 
@@ -1108,11 +1106,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         standby_buffer.clearRetainingCapacity();
                     }
                     standby_buffer.appendSlice(alloc, drain_buf[0..n]) catch {
-                        if (standby_ssh) |pipes| {
-                            closeSshBootstrap(pipes);
-                            standby_ssh = null;
-                        }
-                        standby_buffer.clearRetainingCapacity();
+                        disableStandby(&standby_ssh, &standby_buffer);
                         break;
                     };
                 }
@@ -1140,6 +1134,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                             if (should_detach) {
                                 try appendSshIpc(&s.write_buf, alloc, .Detach, "");
                                 pending_ssh_detach = true;
+                                pending_ssh_detach_ns = @intCast(std.time.nanoTimestamp());
                             } else {
                                 try appendSshIpc(&s.write_buf, alloc, .Input, input_raw[0..n]);
                             }
@@ -1249,8 +1244,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
-        if (pending_ssh_detach and transport_mode == .ssh and transport_mode.ssh.write_buf.items.len == 0) {
-            return;
+        if (pending_ssh_detach and transport_mode == .ssh) {
+            if (transport_mode.ssh.write_buf.items.len == 0) return;
+            const detach_elapsed = @as(i64, @intCast(std.time.nanoTimestamp())) - (pending_ssh_detach_ns orelse 0);
+            if (detach_elapsed >= 2 * std.time.ns_per_s) return;
         }
 
         if (stdout_idx) |idx| {
