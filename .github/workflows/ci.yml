@@ -6,7 +6,7 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: ["**"]
-    tags: ["v1*"]
+    tags: ["v*"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
@@ -138,7 +138,7 @@ jobs:
             RUN_MACOS=true
             RELEASE_TAG=tip
             RELEASE_TITLE_PREFIX="zmosh tip"
-          elif [[ "$GITHUB_REF" == refs/tags/v1* ]]; then
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             SHOULD_RUN=true
             SHOULD_PUBLISH=true
             RUN_MACOS=true
