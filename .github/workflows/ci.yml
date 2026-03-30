@@ -1,0 +1,389 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: ["**"]
+    tags: ["v1*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      checkout_repository: ${{ steps.plan.outputs.checkout_repository }}
+      checkout_ref: ${{ steps.plan.outputs.checkout_ref }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      release_target_ref: ${{ steps.plan.outputs.release_target_ref }}
+      release_title_prefix: ${{ steps.plan.outputs.release_title_prefix }}
+      run_macos: ${{ steps.plan.outputs.run_macos }}
+      should_publish: ${{ steps.plan.outputs.should_publish }}
+      should_run: ${{ steps.plan.outputs.should_run }}
+    steps:
+      - name: Detect open PR to main for branch pushes
+        id: open_pr
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') && (contains(github.event.head_commit.message, '[ci-build]') || contains(github.event.head_commit.message, '[ci-build:macos]') || contains(github.event.head_commit.message, '[ci-release]') || contains(github.event.head_commit.message, '[ci-release:macos]'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          HAS_MAIN_PR=false
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            REPO_OWNER="${GITHUB_REPOSITORY%%/*}"
+            COUNT=$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/pulls" \
+              --method GET \
+              -f state=open \
+              -f head="${REPO_OWNER}:${GITHUB_REF_NAME}" \
+              -f base=main \
+              -f per_page=1 \
+              --jq 'length')
+            if [[ "$COUNT" -gt 0 ]]; then
+              HAS_MAIN_PR=true
+            fi
+          fi
+
+          echo "has_main_pr=$HAS_MAIN_PR" >> "$GITHUB_OUTPUT"
+
+      - name: Compute workflow plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_MAIN_PR: ${{ steps.open_pr.outputs.has_main_pr }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          IS_SAME_REPO_PR: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+        run: |
+          sanitize_ref() {
+            local input="$1"
+            local output=""
+            local char hex
+
+            for ((i = 0; i < ${#input}; i++)); do
+              char="${input:i:1}"
+              case "$char" in
+                [a-zA-Z0-9._-])
+                  output+="$char"
+                  ;;
+                *)
+                  printf -v hex '%02X' "'$char"
+                  output+="_${hex}"
+                  ;;
+              esac
+            done
+
+            printf '%s\n' "$output"
+          }
+
+          CHECKOUT_REPOSITORY="$GITHUB_REPOSITORY"
+          SHOULD_RUN=false
+          SHOULD_PUBLISH=false
+          RUN_MACOS=false
+          PRERELEASE=true
+          RELEASE_TAG=
+          RELEASE_TITLE_PREFIX=
+          RELEASE_TARGET_REF="$GITHUB_SHA"
+          CHECKOUT_REF="$GITHUB_SHA"
+          HAS_MAIN_PR="${HAS_MAIN_PR:-false}"
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            HEAD_COMMIT_MESSAGE=$(gh api \
+              "/repos/${PR_HEAD_REPO}/commits/${PR_HEAD_SHA}" \
+              --jq '.commit.message')
+            CHECKOUT_REPOSITORY="$PR_HEAD_REPO"
+          fi
+
+          WANTS_MACOS=false
+          if [[ " ${PR_LABELS} " == *" ci-release:macos "* ]] || [[ "$HEAD_COMMIT_MESSAGE" == *"[ci-build:macos]"* ]] || [[ "$HEAD_COMMIT_MESSAGE" == *"[ci-release:macos]"* ]]; then
+            WANTS_MACOS=true
+          fi
+
+          WANTS_BUILD=false
+          if [[ "$HEAD_COMMIT_MESSAGE" == *"[ci-build]"* ]] || [[ "$HEAD_COMMIT_MESSAGE" == *"[ci-build:macos]"* ]]; then
+            WANTS_BUILD=true
+          fi
+
+          WANTS_RELEASE=false
+          if [[ "$HEAD_COMMIT_MESSAGE" == *"[ci-release]"* ]] || [[ "$HEAD_COMMIT_MESSAGE" == *"[ci-release:macos]"* ]]; then
+            WANTS_RELEASE=true
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            SHOULD_RUN=true
+            CHECKOUT_REF="$PR_HEAD_SHA"
+            RELEASE_TARGET_REF="$PR_HEAD_SHA"
+            RELEASE_TAG=$(sanitize_ref "$PR_HEAD_REF")
+            RELEASE_TITLE_PREFIX="zmosh ${RELEASE_TAG}"
+
+            if [[ "$IS_SAME_REPO_PR" == "true" ]]; then
+              SHOULD_PUBLISH=true
+            fi
+
+            RUN_MACOS="$WANTS_MACOS"
+          elif [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            SHOULD_RUN=true
+            SHOULD_PUBLISH=true
+            RUN_MACOS=true
+            RELEASE_TAG=tip
+            RELEASE_TITLE_PREFIX="zmosh tip"
+          elif [[ "$GITHUB_REF" == refs/tags/v1* ]]; then
+            SHOULD_RUN=true
+            SHOULD_PUBLISH=true
+            RUN_MACOS=true
+            PRERELEASE=false
+            RELEASE_TAG="$GITHUB_REF_NAME"
+            RELEASE_TITLE_PREFIX="zmosh ${GITHUB_REF_NAME}"
+          elif [[ "$HAS_MAIN_PR" == "true" ]]; then
+            :
+          elif [[ "$WANTS_RELEASE" == "true" ]]; then
+            SHOULD_RUN=true
+            SHOULD_PUBLISH=true
+            RUN_MACOS="$WANTS_MACOS"
+            RELEASE_TAG=$(sanitize_ref "$GITHUB_REF_NAME")
+            RELEASE_TITLE_PREFIX="zmosh ${RELEASE_TAG}"
+          elif [[ "$WANTS_BUILD" == "true" ]]; then
+            SHOULD_RUN=true
+            RUN_MACOS="$WANTS_MACOS"
+          fi
+
+          {
+            echo "checkout_repository=$CHECKOUT_REPOSITORY"
+            echo "checkout_ref=$CHECKOUT_REF"
+            echo "prerelease=$PRERELEASE"
+            echo "release_tag=$RELEASE_TAG"
+            echo "release_target_ref=$RELEASE_TARGET_REF"
+            echo "release_title_prefix=$RELEASE_TITLE_PREFIX"
+            echo "run_macos=$RUN_MACOS"
+            echo "should_publish=$SHOULD_PUBLISH"
+            echo "should_run=$SHOULD_RUN"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    runs-on: ${{ needs.prepare.outputs.run_macos == 'true' && 'macos-latest' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          repository: ${{ needs.prepare.outputs.checkout_repository }}
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+      - uses: mlugg/setup-zig@v2.2.1
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build release tarballs
+        run: zig build release
+
+      - name: Build XCFramework
+        if: runner.os == 'macOS'
+        run: zig build xcframework
+
+      - name: Package XCFramework
+        if: runner.os == 'macOS'
+        run: |
+          cd zig-out
+          ditto -c -k --keepParent zmosh.xcframework zmosh.xcframework.zip
+
+      - name: Stage build artifacts
+        env:
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_TITLE_PREFIX: ${{ needs.prepare.outputs.release_title_prefix }}
+        run: |
+          RELEASE_VERSION=$(sed -n 's/.*\.version = "\(.*\)".*/\1/p' build.zig.zon)
+          if [[ "$PRERELEASE" != "true" ]] && [[ "$RELEASE_TAG" == v* ]]; then
+            RELEASE_VERSION="${RELEASE_TAG#v}"
+          fi
+
+          mkdir -p release-artifacts
+          cp zig-out/dist/*.tar.gz release-artifacts/
+          cp zig-out/dist/*.sha256 release-artifacts/
+
+          XCF_EXISTS=false
+          if [[ -f zig-out/zmosh.xcframework.zip ]]; then
+            cp zig-out/zmosh.xcframework.zip release-artifacts/
+            XCF_EXISTS=true
+            XCF_SHA=$(swift package compute-checksum zig-out/zmosh.xcframework.zip)
+          fi
+
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          if [[ -n "$RELEASE_TAG" ]]; then
+            if [[ "$PRERELEASE" == "true" ]]; then
+              RELEASE_NAME="${RELEASE_TITLE_PREFIX} (${RELEASE_VERSION}+${SHORT_SHA})"
+            else
+              RELEASE_NAME="$RELEASE_TITLE_PREFIX"
+            fi
+          else
+            RELEASE_NAME=
+          fi
+
+          {
+            echo "PRERELEASE=$PRERELEASE"
+            echo "RELEASE_NAME=$RELEASE_NAME"
+            echo "RELEASE_TAG=$RELEASE_TAG"
+            echo "RELEASE_VERSION=$RELEASE_VERSION"
+            echo "SHORT_SHA=$SHORT_SHA"
+            echo "XCF_EXISTS=$XCF_EXISTS"
+            if [[ "$XCF_EXISTS" == "true" ]]; then
+              echo "XCF_SHA=$XCF_SHA"
+            fi
+          } > release-artifacts/release.env
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: release-artifacts
+          path: release-artifacts/
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          repository: ${{ needs.prepare.outputs.checkout_repository }}
+          ref: ${{ needs.prepare.outputs.release_target_ref }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-artifacts
+          path: release-artifacts
+
+      - name: Load release metadata
+        run: cat release-artifacts/release.env >> "$GITHUB_ENV"
+
+      - name: Generate release notes
+        run: |
+          platform_for() {
+            case "$1" in
+              *linux-aarch64.tar.gz)
+                echo "Linux ARM64"
+                ;;
+              *linux-x86_64.tar.gz)
+                echo "Linux x86_64"
+                ;;
+              *darwin-aarch64.tar.gz|*darwin-arm64.tar.gz|*macos-aarch64.tar.gz|*macos-arm64.tar.gz)
+                echo "macOS ARM64"
+                ;;
+              *darwin-x86_64.tar.gz|*macos-x86_64.tar.gz)
+                echo "macOS x86_64"
+                ;;
+              *)
+                echo "-"
+                ;;
+            esac
+          }
+
+          HEAD_SHA=$(git rev-parse HEAD)
+          BASE_SHA=
+          if [[ "$PRERELEASE" == "true" ]] && git rev-parse --verify origin/main >/dev/null 2>&1; then
+            BASE_SHA=$(git merge-base origin/main "$HEAD_SHA")
+          fi
+
+          {
+            echo "## CLI Binaries"
+            echo ""
+            echo "| Platform | File |"
+            echo "|----------|------|"
+            for f in release-artifacts/*.tar.gz; do
+              BASENAME=$(basename "$f")
+              echo "| $(platform_for "$BASENAME") | \`${BASENAME}\` |"
+            done
+            echo ""
+            echo "**Version:** \`${RELEASE_VERSION}\`"
+            echo "**Commit:** \`${SHORT_SHA}\`"
+            echo ""
+
+            if [[ "$PRERELEASE" == "true" ]] && [[ -n "$BASE_SHA" ]] && [[ "$BASE_SHA" != "$HEAD_SHA" ]]; then
+              echo "## Changes vs main"
+              echo ""
+              echo "[Compare changes](https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA})"
+              echo ""
+              git log --no-merges --reverse --format='- %s (`%h`)' "${BASE_SHA}..${HEAD_SHA}"
+              echo ""
+            fi
+
+            echo "## Install via mise"
+            echo ""
+            if [[ "$PRERELEASE" == "true" ]]; then
+              echo '```sh'
+              echo "mise use -g \"github:${GITHUB_REPOSITORY}@${RELEASE_TAG}\""
+              echo '```'
+              echo ""
+              echo "Refresh this mutable prerelease with:"
+              echo ""
+              echo '```sh'
+              echo "mise install --force github:${GITHUB_REPOSITORY}@${RELEASE_TAG}"
+              echo '```'
+            else
+              echo '```sh'
+              echo "mise use -g \"github:${GITHUB_REPOSITORY}@latest\""
+              echo "mise use -g \"github:${GITHUB_REPOSITORY}@${RELEASE_TAG}\""
+              echo '```'
+            fi
+          } > release_notes.md
+
+          if [[ "$XCF_EXISTS" == "true" ]]; then
+            {
+              echo ""
+              echo "## XCFramework (iOS/macOS)"
+              echo ""
+              echo "Add to your Swift package:"
+              echo ""
+              echo '```swift'
+              echo '.binaryTarget('
+              echo '    name: "zmosh",'
+              echo "    url: \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/zmosh.xcframework.zip\","
+              echo "    checksum: \"${XCF_SHA}\""
+              echo ')'
+              echo '```'
+            } >> release_notes.md
+          fi
+
+      - name: Delete existing prerelease
+        if: env.PRERELEASE == 'true'
+        run: gh release delete --yes --cleanup-tag -- "$RELEASE_TAG" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create release tag
+        if: env.PRERELEASE == 'true'
+        run: |
+          git tag -f "$RELEASE_TAG" "${{ needs.prepare.outputs.release_target_ref }}"
+          git push --force origin "refs/tags/$RELEASE_TAG"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2.6.1
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ needs.prepare.outputs.release_target_ref }}
+          prerelease: ${{ env.PRERELEASE == 'true' }}
+          body_path: release_notes.md
+          files: |
+            release-artifacts/*.tar.gz
+            release-artifacts/*.sha256
+            release-artifacts/zmosh.xcframework.zip
+          fail_on_unmatched_files: false
