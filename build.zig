@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Version string for release") orelse
         @as([]const u8, @import("build.zig.zon").version);
+    const ghostty_hash = @import("build.zig.zon").dependencies.ghostty.hash;
+    const ghostty_build_version = dependencyVersionFromHash("ghostty", ghostty_hash);
 
     const run_step = b.step("run", "Run the app");
     const test_step = b.step("test", "Run unit tests");
@@ -29,7 +31,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_sha", git_sha);
-    options.addOption([]const u8, "ghostty_version", @import("build.zig.zon").dependencies.ghostty.hash);
+    options.addOption([]const u8, "ghostty_version", ghostty_hash);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -43,6 +45,9 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,
+        // Force an explicit Ghostty version so dependency builds never infer
+        // our repo's branch/release tags from the cache layout.
+        .@"version-string" = ghostty_build_version,
     })) |dep| {
         exe_mod.addImport(
             "ghostty-vt",
@@ -104,6 +109,7 @@ pub fn build(b: *std.Build) void {
         if (b.lazyDependency("ghostty", .{
             .target = resolved,
             .optimize = .ReleaseSafe,
+            .@"version-string" = ghostty_build_version,
         })) |dep| {
             release_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
         }
@@ -218,6 +224,20 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Create a static library target for lib.zig with the given target query.
+fn dependencyVersionFromHash(comptime dep_name: []const u8, hash: []const u8) []const u8 {
+    const prefix = dep_name ++ "-";
+    if (!std.mem.startsWith(u8, hash, prefix)) {
+        @panic("dependency hash is missing the expected prefix");
+    }
+
+    const rest = hash[prefix.len..];
+    const suffix_start = std.mem.lastIndexOfScalar(u8, rest, '-') orelse {
+        @panic("dependency hash is missing the content hash suffix");
+    };
+
+    return rest[0..suffix_start];
+}
+
 fn addLibTarget(b: *std.Build, query: std.Target.Query) *std.Build.Step.Compile {
     const resolved = b.resolveTargetQuery(query);
     const mod = b.createModule(.{
@@ -275,34 +295,36 @@ fn addXCFrameworkCommand(b: *std.Build, output_path: []const u8, slices: []const
         cp_hdr.step.dependOn(&mkdir.step);
 
         // Write framework Info.plist
-        const write_plist = b.addSystemCommand(&.{ "sh", "-c", b.fmt(
-            \\cat > {s}/Info.plist << 'PLIST'
-            \\<?xml version="1.0" encoding="UTF-8"?>
-            \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            \\<plist version="1.0">
-            \\<dict>
-            \\    <key>CFBundleDevelopmentRegion</key>
-            \\    <string>en</string>
-            \\    <key>CFBundleExecutable</key>
-            \\    <string>zmosh</string>
-            \\    <key>CFBundleIdentifier</key>
-            \\    <string>com.mmonad.zmosh</string>
-            \\    <key>CFBundleInfoDictionaryVersion</key>
-            \\    <string>6.0</string>
-            \\    <key>CFBundleName</key>
-            \\    <string>zmosh</string>
-            \\    <key>CFBundlePackageType</key>
-            \\    <string>FMWK</string>
-            \\    <key>CFBundleShortVersionString</key>
-            \\    <string>0.1.0</string>
-            \\    <key>CFBundleVersion</key>
-            \\    <string>1</string>
-            \\    <key>MinimumOSVersion</key>
-            \\    <string>17.0</string>
-            \\</dict>
-            \\</plist>
-            \\PLIST
-        , .{fw_dir}) });
+        const write_plist = b.addSystemCommand(&.{
+            "sh", "-c", b.fmt(
+                \\cat > {s}/Info.plist << 'PLIST'
+                \\<?xml version="1.0" encoding="UTF-8"?>
+                \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                \\<plist version="1.0">
+                \\<dict>
+                \\    <key>CFBundleDevelopmentRegion</key>
+                \\    <string>en</string>
+                \\    <key>CFBundleExecutable</key>
+                \\    <string>zmosh</string>
+                \\    <key>CFBundleIdentifier</key>
+                \\    <string>com.mmonad.zmosh</string>
+                \\    <key>CFBundleInfoDictionaryVersion</key>
+                \\    <string>6.0</string>
+                \\    <key>CFBundleName</key>
+                \\    <string>zmosh</string>
+                \\    <key>CFBundlePackageType</key>
+                \\    <string>FMWK</string>
+                \\    <key>CFBundleShortVersionString</key>
+                \\    <string>0.1.0</string>
+                \\    <key>CFBundleVersion</key>
+                \\    <string>1</string>
+                \\    <key>MinimumOSVersion</key>
+                \\    <string>17.0</string>
+                \\</dict>
+                \\</plist>
+                \\PLIST
+            , .{fw_dir}),
+        });
         write_plist.step.dependOn(&mkdir.step);
 
         xcf.addArg("-framework");
