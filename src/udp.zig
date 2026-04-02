@@ -3,6 +3,7 @@ const posix = std.posix;
 const crypto = @import("crypto.zig");
 
 const log = std.log.scoped(.udp);
+const replay_window_size = 128;
 
 /// Truncate nanoTimestamp (i128) to i64 for storage. Sufficient for ~292 years.
 fn nanoNow() i64 {
@@ -112,6 +113,12 @@ pub const Peer = struct {
     // Sequence numbers
     send_seq: u63,
     max_recv_seq: u63,
+    has_received_first: bool,
+
+    // Sliding replay window semantics: the bitmap tracks the 127 packets below
+    // max_recv_seq, and max_recv_seq itself is tracked separately for 128 total.
+    // Bit 0 = max_recv_seq - 1, bit 1 = max_recv_seq - 2, etc.
+    recv_bitmap: u128,
 
     // RTT estimation (RFC 6298, 50ms min RTO like Mosh)
     srtt_us: ?i64,
@@ -135,6 +142,8 @@ pub const Peer = struct {
             .key = key,
             .send_seq = 0,
             .max_recv_seq = 0,
+            .has_received_first = false,
+            .recv_bitmap = 0,
             .srtt_us = null,
             .rttvar_us = null,
             .last_send_time = null,
@@ -193,14 +202,43 @@ pub const Peer = struct {
 
         const now = nanoNow();
 
-        // Anti-replay + roaming: only update state if seq > max_recv_seq.
-        // Old or duplicate packets are dropped after authentication.
-        if (decoded.seq > self.max_recv_seq) {
+        if (!self.has_received_first) {
+            self.addr = result.addr;
+            self.max_recv_seq = decoded.seq;
+            self.has_received_first = true;
+            self.recv_bitmap = 0;
+            self.last_recv_time = now;
+        } else if (decoded.seq > self.max_recv_seq) {
+            const shift = decoded.seq - self.max_recv_seq;
+            if (shift >= replay_window_size) {
+                self.recv_bitmap = 0;
+            } else {
+                self.recv_bitmap <<= @intCast(shift);
+                self.recv_bitmap |= @as(u128, 1) << @intCast(shift - 1);
+            }
             self.addr = result.addr;
             self.max_recv_seq = decoded.seq;
             self.last_recv_time = now;
+        } else if (decoded.seq == self.max_recv_seq) {
+            log.debug("duplicate current-max seq={d}", .{decoded.seq});
+            return null;
+        } else {
+            const diff = self.max_recv_seq - decoded.seq;
+            if (diff > replay_window_size) {
+                log.debug("old seq={d} max={d} (outside window)", .{ decoded.seq, self.max_recv_seq });
+                return null;
+            }
 
-            // RTT measurement
+            const bit_idx: u7 = @intCast(diff - 1);
+            const bit = @as(u128, 1) << bit_idx;
+            if (self.recv_bitmap & bit != 0) {
+                log.debug("duplicate seq={d}", .{decoded.seq});
+                return null;
+            }
+
+            self.recv_bitmap |= bit;
+            self.last_recv_time = now;
+
             if (self.last_send_time) |send_time| {
                 const rtt_ns = now - send_time;
                 if (rtt_ns > 0) {
@@ -208,14 +246,16 @@ pub const Peer = struct {
                 }
                 self.last_send_time = null;
             }
-        } else if (decoded.seq == 0 and self.max_recv_seq == 0) {
-            // First packet (seq 0)
-            self.addr = result.addr;
-            self.max_recv_seq = 0;
-            self.last_recv_time = now;
-        } else {
-            log.debug("old seq={d} max={d}", .{ decoded.seq, self.max_recv_seq });
-            return null;
+        }
+
+        if (decoded.seq >= self.max_recv_seq) {
+            if (self.last_send_time) |send_time| {
+                const rtt_ns = now - send_time;
+                if (rtt_ns > 0) {
+                    self.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
+                }
+                self.last_send_time = null;
+            }
         }
 
         if (self.state == .disconnected) {
@@ -331,7 +371,7 @@ test "Peer send/recv round-trip (loopback)" {
     try std.testing.expectEqualStrings(msg, recv_result.?.data);
 }
 
-test "Anti-replay: reject datagram with seq <= max_recv_seq" {
+test "Replay window: accept out-of-order packets within window" {
     const key = crypto.generateKey();
     var peer = Peer.init(key, .to_client);
 
@@ -356,16 +396,206 @@ test "Anti-replay: reject datagram with seq <= max_recv_seq" {
     try std.testing.expect(r1 != null);
     try std.testing.expect(peer.max_recv_seq == 10);
 
-    // Send lower seq — packet is dropped.
+    // Send lower seq within the replay window.
     const old_port = peer.addr.?.getPort();
     try sock_send.sendTo(pkt_lo, target);
     try testPollReady(sock_recv.fd);
 
     var recv_buf2: [4096]u8 = undefined;
     const r2 = try peer.recv(&sock_recv, &recv_buf2);
-    try std.testing.expect(r2 == null);
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("first", r2.?.data);
     try std.testing.expect(peer.max_recv_seq == 10);
     try std.testing.expect(peer.addr.?.getPort() == old_port);
+}
+
+test "Replay window: reject duplicate of max_recv_seq" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60940, 60950);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(60950, 60960);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "first", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+    try std.testing.expect(peer.max_recv_seq == 5);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "dupe", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: reject duplicate within window" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60960, 60970);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(60970, 60980);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf0: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 10, "hi", &buf0), target);
+    try testPollReady(sock_recv.fd);
+    var rb0: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb0);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "first", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    const r1 = try peer.recv(&sock_recv, &rb1);
+    try std.testing.expect(r1 != null);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "dupe", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: roaming only updates on advancing seq" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60980, 60990);
+    defer sock_recv.close();
+    var sock_a = try testBindIp4(60990, 61000);
+    defer sock_a.close();
+    var sock_b = try testBindIp4(61000, 61010);
+    defer sock_b.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_a.sendTo(try crypto.encodeDatagram(key, .to_server, 10, "a", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+    const port_a = peer.addr.?.getPort();
+
+    var buf2: [128]u8 = undefined;
+    try sock_b.sendTo(try crypto.encodeDatagram(key, .to_server, 8, "b", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 != null);
+    try std.testing.expect(peer.addr.?.getPort() == port_a);
+}
+
+test "Replay window: below-window packet rejected" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61010, 61020);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61020, 61030);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 200, "hi", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 1, "old", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: boundary packet stays inside 128-packet window" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61030, 61040);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61040, 61050);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 200, "hi", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 72, "edge", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("edge", r2.?.data);
+}
+
+test "Replay window: packet just outside 128-packet window is rejected" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61050, 61060);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61060, 61070);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 200, "hi", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 71, "old", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: large jump forward clears bitmap" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61070, 61080);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61080, 61090);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "a", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 500, "b", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 != null);
+    try std.testing.expect(peer.max_recv_seq == 500);
 }
 
 test "Roaming: verify addr updates on authentic packet" {
