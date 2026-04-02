@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 4 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
+const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
 
 const c = switch (builtin.os.tag) {
     .macos => @cImport({
@@ -234,14 +234,16 @@ fn requestResync(
     reliable_send: *transport.ReliableSend,
     reliable_recv: *const transport.RecvState,
     last_resync_request_ns: *i64,
+    resync_backoff_ns: *i64,
     now: i64,
 ) !void {
-    if ((now - last_resync_request_ns.*) < resync_cooldown_ns) return;
+    if ((now - last_resync_request_ns.*) < resync_backoff_ns.*) return;
 
     var ctrl_buf: [8]u8 = undefined;
     const payload = transport.buildControl(.resync_request, &ctrl_buf);
     try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .control, payload, now);
     last_resync_request_ns.* = now;
+    resync_backoff_ns.* = @min(resync_backoff_ns.* * 2, std.time.ns_per_s);
 }
 
 /// Remote attach: connect to a remote zmx session via UDP.
@@ -313,6 +315,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
     var last_resync_request_ns: i64 = 0;
+    var resync_backoff_ns: i64 = initial_resync_backoff_ns;
 
     // Send Init message with terminal size (reliable)
     const size = getTerminalSize();
@@ -435,8 +438,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                             if (hdr.tag == .Output and payload.len > 0) {
                                 if (stdout_buf.items.len + payload.len > max_stdout_buf) {
                                     stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, now);
                                 } else {
+                                    resync_backoff_ns = initial_resync_backoff_ns;
                                     try stdout_buf.appendSlice(alloc, payload);
                                 }
                             } else if (hdr.tag == .SessionEnd) {
@@ -452,13 +456,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                 if (packet.payload.len == 0) continue;
                                 if (stdout_buf.items.len + packet.payload.len > max_stdout_buf) {
                                     stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, now);
                                 } else {
+                                    resync_backoff_ns = initial_resync_backoff_ns;
                                     try stdout_buf.appendSlice(alloc, packet.payload);
                                 }
                             },
                             .gap => {
-                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, now);
                             },
                             .duplicate, .stale => {},
                         }

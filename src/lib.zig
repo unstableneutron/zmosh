@@ -8,7 +8,7 @@ const transport = @import("transport.zig");
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_input_len = 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
+const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
 
 // Silence all logging in library mode.
 pub const std_options: std.Options = .{
@@ -65,6 +65,7 @@ const Session = struct {
     last_ack_send_ns: i64,
     ack_dirty: bool,
     last_resync_request_ns: i64,
+    resync_backoff_ns: i64,
 
     output_cb: OutputFn,
     state_cb: ?StateFn,
@@ -127,12 +128,13 @@ fn sendIpcReliable(s: *Session, tag: ipc.Tag, payload: []const u8, now: i64) !vo
 }
 
 fn requestResync(s: *Session, now: i64) !void {
-    if ((now - s.last_resync_request_ns) < resync_cooldown_ns) return;
+    if ((now - s.last_resync_request_ns) < s.resync_backoff_ns) return;
 
     var ctrl_buf: [8]u8 = undefined;
     const payload = transport.buildControl(.resync_request, &ctrl_buf);
     try sendReliablePayload(s, .control, payload, now);
     s.last_resync_request_ns = now;
+    s.resync_backoff_ns = @min(s.resync_backoff_ns * 2, std.time.ns_per_s);
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +247,7 @@ export fn zmosh_connect(
         .last_ack_send_ns = now,
         .ack_dirty = false,
         .last_resync_request_ns = 0,
+        .resync_backoff_ns = initial_resync_backoff_ns,
         .output_cb = cb,
         .state_cb = state_cb,
         .end_cb = end_cb,
@@ -329,6 +332,7 @@ export fn zmosh_poll(session: ?*Session) Status {
                     const payload = remaining[@sizeOf(ipc.Header)..msg_len];
 
                     if (hdr.tag == .Output and payload.len > 0) {
+                        s.resync_backoff_ns = initial_resync_backoff_ns;
                         s.output_cb(s.ctx, payload.ptr, @intCast(payload.len));
                     } else if (hdr.tag == .SessionEnd) {
                         s.session_ended = true;
@@ -343,6 +347,7 @@ export fn zmosh_poll(session: ?*Session) Status {
                 switch (s.output_recv.onPacket(packet.seq)) {
                     .accept => {
                         if (packet.payload.len > 0) {
+                            s.resync_backoff_ns = initial_resync_backoff_ns;
                             s.output_cb(s.ctx, packet.payload.ptr, @intCast(packet.payload.len));
                         }
                     },

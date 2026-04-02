@@ -11,7 +11,7 @@ const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_unix_write_buf = 1024 * 1024;
 const max_output_coalesce = 256 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
+const resync_cooldown_ns = 500 * std.time.ns_per_ms;
 
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -72,6 +72,7 @@ pub const Gateway = struct {
     ack_dirty: bool,
 
     last_resync_request_ns: i64,
+    snapshot_id: u32,
     have_client_size: bool,
     last_resize: ipc.Resize,
 
@@ -140,6 +141,7 @@ pub const Gateway = struct {
             .last_ack_send_ns = now,
             .ack_dirty = false,
             .last_resync_request_ns = 0,
+            .snapshot_id = 0,
             .have_client_size = false,
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
@@ -397,12 +399,13 @@ pub const Gateway = struct {
     fn requestSnapshot(self: *Gateway, now: i64) !void {
         if ((now - self.last_resync_request_ns) < resync_cooldown_ns) return;
         self.last_resync_request_ns = now;
+        self.snapshot_id +%= 1;
 
         const size = if (self.have_client_size) self.last_resize else ipc.Resize{ .rows = 24, .cols = 80 };
         var init_buf: [64]u8 = undefined;
         const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
         try self.appendUnixWrite(init_ipc);
-        log.debug("requested terminal snapshot rows={d} cols={d}", .{ size.rows, size.cols });
+        log.debug("requested terminal snapshot id={d} rows={d} cols={d}", .{ self.snapshot_id, size.rows, size.cols });
     }
 
     fn handleTransportPacket(self: *Gateway, plaintext: []const u8, now: i64) !void {
