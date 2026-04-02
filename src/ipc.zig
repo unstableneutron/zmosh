@@ -14,6 +14,7 @@ pub const Tag = enum(u8) {
     Run = 9,
     Ack = 10,
     SessionEnd = 11,
+    Snapshot = 12,
 };
 
 pub const Header = packed struct {
@@ -24,6 +25,21 @@ pub const Header = packed struct {
 pub const Resize = packed struct {
     rows: u16,
     cols: u16,
+};
+
+pub const Init = packed struct {
+    rows: u16,
+    cols: u16,
+    snapshot_id: u32,
+};
+
+pub const Snapshot = packed struct {
+    id: u32,
+    flags: u8,
+
+    pub fn isFinal(self: Snapshot) bool {
+        return (self.flags & 0x1) != 0;
+    }
 };
 
 pub const MAX_CMD_LEN = 256;

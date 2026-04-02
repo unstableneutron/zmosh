@@ -223,7 +223,7 @@ pub const Peer = struct {
             return null;
         } else {
             const diff = self.max_recv_seq - decoded.seq;
-            if (diff > replay_window_size) {
+            if (diff >= replay_window_size) {
                 log.debug("old seq={d} max={d} (outside window)", .{ decoded.seq, self.max_recv_seq });
                 return null;
             }
@@ -251,17 +251,21 @@ pub const Peer = struct {
 
     /// Check if a heartbeat should be sent.
     pub fn shouldSendHeartbeat(self: *Peer, now: i64, config: Config) bool {
+        return self.heartbeatDelayNs(now, config) == 0;
+    }
+
+    pub fn heartbeatDelayNs(self: *Peer, now: i64, config: Config) i64 {
         if (self.recovery_mode) {
             if (now >= self.recovery_deadline_ns) {
                 self.recovery_mode = false;
                 self.recovery_deadline_ns = 0;
             } else {
-                return (now - self.last_send_time_any) >= 200 * std.time.ns_per_ms;
+                return @max(@as(i64, 0), 200 * std.time.ns_per_ms - (now - self.last_send_time_any));
             }
         }
 
         const interval_ns = @as(i64, config.heartbeat_interval_ms) * std.time.ns_per_ms;
-        return (now - self.last_send_time_any) >= interval_ns;
+        return @max(@as(i64, 0), interval_ns - (now - self.last_send_time_any));
     }
 
     pub fn enterRecoveryMode(self: *Peer, now: i64) void {
@@ -524,7 +528,7 @@ test "Replay window: below-window packet rejected" {
     try std.testing.expect(r2 == null);
 }
 
-test "Replay window: boundary packet stays inside 128-packet window" {
+test "Replay window: boundary packet stays inside documented window" {
     const key = crypto.generateKey();
     var peer = Peer.init(key, .to_client);
 
@@ -542,7 +546,7 @@ test "Replay window: boundary packet stays inside 128-packet window" {
     _ = try peer.recv(&sock_recv, &rb1);
 
     var buf2: [128]u8 = undefined;
-    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 72, "edge", &buf2), target);
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 73, "edge", &buf2), target);
     try testPollReady(sock_recv.fd);
     var rb2: [4096]u8 = undefined;
     const r2 = try peer.recv(&sock_recv, &rb2);
@@ -550,7 +554,7 @@ test "Replay window: boundary packet stays inside 128-packet window" {
     try std.testing.expectEqualStrings("edge", r2.?.data);
 }
 
-test "Replay window: packet just outside 128-packet window is rejected" {
+test "Replay window: packet just outside documented window is rejected" {
     const key = crypto.generateKey();
     var peer = Peer.init(key, .to_client);
 
@@ -568,7 +572,7 @@ test "Replay window: packet just outside 128-packet window is rejected" {
     _ = try peer.recv(&sock_recv, &rb1);
 
     var buf2: [128]u8 = undefined;
-    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 71, "old", &buf2), target);
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 72, "old", &buf2), target);
     try testPollReady(sock_recv.fd);
     var rb2: [4096]u8 = undefined;
     const r2 = try peer.recv(&sock_recv, &rb2);

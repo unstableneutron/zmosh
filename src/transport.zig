@@ -37,6 +37,10 @@ pub const OutputAction = enum {
     gap,
 };
 
+pub const OutputPrefix = packed struct {
+    epoch: u32,
+};
+
 /// RFC 1982 serial number arithmetic: returns true if `a` is after `b`.
 pub fn seqAfter(a: u32, b: u32) bool {
     return a != b and @as(i32, @bitCast(a -% b)) > 0;
@@ -61,8 +65,10 @@ pub const RecvState = struct {
 
         if (seqAfter(seq, self.latest)) {
             const shift = seqDist(seq, self.latest);
-            if (shift >= 32) {
+            if (shift > 32) {
                 self.mask = 0;
+            } else if (shift == 32) {
+                self.mask = @as(u32, 1) << 31;
             } else {
                 self.mask <<= @intCast(shift);
                 self.mask |= @as(u32, 1) << @intCast(shift - 1);
@@ -114,6 +120,65 @@ pub const OutputRecvState = struct {
         // seq jumped ahead.
         self.latest = seq;
         return .gap;
+    }
+};
+
+pub const ReliableDelivery = struct {
+    seq: u32,
+    channel: Channel,
+    payload: []u8,
+
+    pub fn deinit(self: ReliableDelivery, alloc: std.mem.Allocator) void {
+        alloc.free(self.payload);
+    }
+};
+
+pub const ReliableInbox = struct {
+    alloc: std.mem.Allocator,
+    next_seq: u32 = 1,
+    pending: std.ArrayList(ReliableDelivery),
+
+    pub fn accepts(self: *const ReliableInbox, seq: u32) bool {
+        if (seq == self.next_seq) return true;
+        if (!seqAfter(seq, self.next_seq)) return false;
+        return seqDist(seq, self.next_seq) <= 32;
+    }
+
+    pub fn init(alloc: std.mem.Allocator) !ReliableInbox {
+        return .{
+            .alloc = alloc,
+            .pending = try std.ArrayList(ReliableDelivery).initCapacity(alloc, 8),
+        };
+    }
+
+    pub fn deinit(self: *ReliableInbox) void {
+        for (self.pending.items) |delivery| {
+            delivery.deinit(self.alloc);
+        }
+        self.pending.deinit(self.alloc);
+    }
+
+    pub fn push(self: *ReliableInbox, seq: u32, channel: Channel, payload: []const u8) !void {
+        const owned_payload = try self.alloc.dupe(u8, payload);
+        errdefer self.alloc.free(owned_payload);
+
+        try self.pending.append(self.alloc, .{
+            .seq = seq,
+            .channel = channel,
+            .payload = owned_payload,
+        });
+    }
+
+    pub fn popReady(self: *ReliableInbox) ?ReliableDelivery {
+        var i: usize = 0;
+        while (i < self.pending.items.len) : (i += 1) {
+            if (self.pending.items[i].seq == self.next_seq) {
+                const delivery = self.pending.swapRemove(i);
+                self.next_seq +%= 1;
+                return delivery;
+            }
+        }
+        return null;
     }
 };
 
@@ -354,6 +419,55 @@ test "reliable recv window" {
     try std.testing.expect(recv.onReliable(9) == .duplicate);
     try std.testing.expect(recv.onReliable(11) == .accept);
     try std.testing.expectEqual(@as(u32, 11), recv.ack());
+}
+
+test "reliable recv window keeps the 32-packet boundary acked" {
+    var recv = RecvState{};
+    try std.testing.expect(recv.onReliable(10) == .accept);
+    try std.testing.expect(recv.onReliable(42) == .accept);
+    try std.testing.expectEqual(@as(u32, 42), recv.ack());
+    try std.testing.expectEqual(@as(u32, 1) << 31, recv.ackBits());
+}
+
+test "ReliableInbox delivers reliable packets in order" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var inbox = try ReliableInbox.init(alloc);
+    defer inbox.deinit();
+
+    try inbox.push(2, .control, "two");
+    try std.testing.expect(inbox.popReady() == null);
+
+    try inbox.push(1, .reliable_ipc, "one");
+
+    const first = inbox.popReady().?;
+    defer first.deinit(alloc);
+    try std.testing.expect(first.seq == 1);
+    try std.testing.expect(first.channel == .reliable_ipc);
+    try std.testing.expectEqualStrings("one", first.payload);
+
+    const second = inbox.popReady().?;
+    defer second.deinit(alloc);
+    try std.testing.expect(second.seq == 2);
+    try std.testing.expect(second.channel == .control);
+    try std.testing.expectEqualStrings("two", second.payload);
+
+    try std.testing.expect(inbox.popReady() == null);
+}
+
+test "ReliableInbox rejects packets too far ahead of next_seq" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var inbox = try ReliableInbox.init(alloc);
+    defer inbox.deinit();
+
+    try std.testing.expect(inbox.accepts(1));
+    try std.testing.expect(inbox.accepts(33));
+    try std.testing.expect(!inbox.accepts(34));
 }
 
 test "output gap detection" {

@@ -62,7 +62,9 @@ pub const Gateway = struct {
 
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.RecvState,
+    reliable_inbox: transport.ReliableInbox,
     output_seq: u32,
+    output_epoch: u32,
 
     config: udp.Config,
     running: bool,
@@ -73,6 +75,7 @@ pub const Gateway = struct {
 
     last_resync_request_ns: i64,
     snapshot_id: u32,
+    snapshot_in_flight_id: ?u32,
     have_client_size: bool,
     last_resize: ipc.Resize,
 
@@ -119,6 +122,7 @@ pub const Gateway = struct {
         const unix_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
         const output_coalesce_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
         const reliable_send = try transport.ReliableSend.init(alloc);
+        const reliable_inbox = try transport.ReliableInbox.init(alloc);
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
@@ -134,7 +138,9 @@ pub const Gateway = struct {
             .output_coalesce_buf = output_coalesce_buf,
             .reliable_send = reliable_send,
             .reliable_recv = .{},
+            .reliable_inbox = reliable_inbox,
             .output_seq = 1,
+            .output_epoch = 0,
             .config = config,
             .running = true,
             .last_output_flush_ns = now,
@@ -142,6 +148,7 @@ pub const Gateway = struct {
             .ack_dirty = false,
             .last_resync_request_ns = 0,
             .snapshot_id = 0,
+            .snapshot_in_flight_id = null,
             .have_client_size = false,
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
@@ -265,7 +272,7 @@ pub const Gateway = struct {
         }
     }
 
-    fn computePollTimeoutMs(self: *const Gateway, now: i64) i32 {
+    fn computePollTimeoutMs(self: *Gateway, now: i64) i32 {
         var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000);
 
         if (self.output_coalesce_buf.items.len > 0) {
@@ -279,6 +286,9 @@ pub const Gateway = struct {
             const rto_ms = @divFloor(self.peer.rto_us(), 1000);
             timeout = @min(timeout, @max(@as(i64, 1), rto_ms));
         }
+
+        const heartbeat_ms = @divFloor(self.peer.heartbeatDelayNs(now, self.config), std.time.ns_per_ms);
+        timeout = @min(timeout, heartbeat_ms);
 
         if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
 
@@ -330,10 +340,14 @@ pub const Gateway = struct {
 
         var sent_off: usize = 0;
         while (sent_off < self.output_coalesce_buf.items.len) {
-            const end = @min(sent_off + transport.max_payload_len, self.output_coalesce_buf.items.len);
-            const chunk = self.output_coalesce_buf.items[sent_off..end];
+            const max_chunk_len = transport.max_payload_len - @sizeOf(transport.OutputPrefix);
+            const end = @min(sent_off + max_chunk_len, self.output_coalesce_buf.items.len);
 
             var pkt_buf: [1200]u8 = undefined;
+            const prefix = transport.OutputPrefix{ .epoch = self.output_epoch };
+            @memcpy(pkt_buf[0..@sizeOf(transport.OutputPrefix)], std.mem.asBytes(&prefix));
+            @memcpy(pkt_buf[@sizeOf(transport.OutputPrefix) .. @sizeOf(transport.OutputPrefix) + (end - sent_off)], self.output_coalesce_buf.items[sent_off..end]);
+            const chunk = pkt_buf[0 .. @sizeOf(transport.OutputPrefix) + (end - sent_off)];
             const seq = self.output_seq;
             self.output_seq +%= 1;
             const pkt = try transport.buildUnreliable(
@@ -380,7 +394,11 @@ pub const Gateway = struct {
 
             const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
             const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
-            if ((hdr.tag == .Init or hdr.tag == .Resize) and msg_payload.len == @sizeOf(ipc.Resize)) {
+            if (hdr.tag == .Init and msg_payload.len == @sizeOf(ipc.Init)) {
+                const init_msg = std.mem.bytesToValue(ipc.Init, msg_payload);
+                self.last_resize = .{ .rows = init_msg.rows, .cols = init_msg.cols };
+                self.have_client_size = true;
+            } else if (hdr.tag == .Resize and msg_payload.len == @sizeOf(ipc.Resize)) {
                 self.last_resize = std.mem.bytesToValue(ipc.Resize, msg_payload);
                 self.have_client_size = true;
             }
@@ -400,10 +418,14 @@ pub const Gateway = struct {
         if ((now - self.last_resync_request_ns) < resync_cooldown_ns) return;
         self.last_resync_request_ns = now;
         self.snapshot_id +%= 1;
+        self.snapshot_in_flight_id = self.snapshot_id;
+        self.output_epoch = self.snapshot_id;
+        self.output_coalesce_buf.clearRetainingCapacity();
 
         const size = if (self.have_client_size) self.last_resize else ipc.Resize{ .rows = 24, .cols = 80 };
         var init_buf: [64]u8 = undefined;
-        const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+        const init_msg = ipc.Init{ .rows = size.rows, .cols = size.cols, .snapshot_id = self.snapshot_id };
+        const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init_msg), &init_buf);
         try self.appendUnixWrite(init_ipc);
         log.debug("requested terminal snapshot id={d} rows={d} cols={d}", .{ self.snapshot_id, size.rows, size.cols });
     }
@@ -425,23 +447,30 @@ pub const Gateway = struct {
             },
             .reliable_ipc, .control => {
                 self.ack_dirty = true;
+                if (!self.reliable_inbox.accepts(packet.seq)) return;
                 const action = self.reliable_recv.onReliable(packet.seq);
                 if (action != .accept) return;
 
-                if (packet.channel == .reliable_ipc) {
-                    self.trackClientResize(packet.payload);
-                    self.appendUnixWrite(packet.payload) catch |err| {
-                        log.warn("unix write buffer overflow: {s}", .{@errorName(err)});
-                        self.running = false;
-                        return;
-                    };
-                } else {
-                    const ctrl = transport.parseControl(packet.payload) catch return;
-                    if (ctrl == .resync_request) {
-                        self.requestSnapshot(now) catch |err| {
-                            log.warn("failed to queue snapshot request: {s}", .{@errorName(err)});
+                try self.reliable_inbox.push(packet.seq, packet.channel, packet.payload);
+
+                while (self.reliable_inbox.popReady()) |delivery| {
+                    defer delivery.deinit(self.alloc);
+
+                    if (delivery.channel == .reliable_ipc) {
+                        self.trackClientResize(delivery.payload);
+                        self.appendUnixWrite(delivery.payload) catch |err| {
+                            log.warn("unix write buffer overflow: {s}", .{@errorName(err)});
                             self.running = false;
+                            return;
                         };
+                    } else {
+                        const ctrl = transport.parseControl(delivery.payload) catch continue;
+                        if (ctrl == .resync_request) {
+                            self.requestSnapshot(now) catch |err| {
+                                log.warn("failed to queue snapshot request: {s}", .{@errorName(err)});
+                                self.running = false;
+                            };
+                        }
                     }
                 }
             },
@@ -480,8 +509,37 @@ pub const Gateway = struct {
         }
     }
 
+    fn sendSnapshotReliable(self: *Gateway, payload: []const u8, now: i64) !void {
+        if (payload.len < @sizeOf(ipc.Snapshot)) return;
+
+        const snapshot = std.mem.bytesToValue(ipc.Snapshot, payload[0..@sizeOf(ipc.Snapshot)]);
+        const snapshot_data = payload[@sizeOf(ipc.Snapshot)..];
+        const max_chunk_payload = max_ipc_payload - @sizeOf(ipc.Snapshot);
+
+        var off: usize = 0;
+        while (off < snapshot_data.len) {
+            const end = @min(off + max_chunk_payload, snapshot_data.len);
+            const chunk_snapshot = ipc.Snapshot{
+                .id = snapshot.id,
+                .flags = if (end == snapshot_data.len) 0x1 else 0,
+            };
+            var chunk_buf: [max_ipc_payload]u8 = undefined;
+            @memcpy(chunk_buf[0..@sizeOf(ipc.Snapshot)], std.mem.asBytes(&chunk_snapshot));
+            @memcpy(chunk_buf[@sizeOf(ipc.Snapshot) .. @sizeOf(ipc.Snapshot) + (end - off)], snapshot_data[off..end]);
+            const chunk = chunk_buf[0 .. @sizeOf(ipc.Snapshot) + (end - off)];
+
+            var wire_buf: [transport.max_payload_len]u8 = undefined;
+            const ipc_bytes = transport.buildIpcBytes(.Snapshot, chunk, &wire_buf);
+            try self.sendReliablePayload(.reliable_ipc, ipc_bytes, now);
+            off = end;
+        }
+    }
+
     fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
         if (tag == .Output) {
+            if (self.snapshot_in_flight_id != null) {
+                return;
+            }
             if (self.output_coalesce_buf.items.len + payload.len > max_output_coalesce) {
                 log.debug("output coalesce buffer overflow; dropping stale output and requesting snapshot", .{});
                 self.output_coalesce_buf.clearRetainingCapacity();
@@ -495,6 +553,18 @@ pub const Gateway = struct {
             return;
         }
 
+        if (tag == .Snapshot) {
+            if (payload.len < @sizeOf(ipc.Snapshot)) return;
+            const snapshot = std.mem.bytesToValue(ipc.Snapshot, payload[0..@sizeOf(ipc.Snapshot)]);
+            if (self.snapshot_in_flight_id) |pending_id| {
+                if (snapshot.id < pending_id) return;
+            }
+            try self.flushOutput(now, true);
+            try self.sendSnapshotReliable(payload, now);
+            self.snapshot_in_flight_id = null;
+            return;
+        }
+
         try self.flushOutput(now, true);
         try self.sendIpcReliable(tag, payload, now);
     }
@@ -505,6 +575,7 @@ pub const Gateway = struct {
         self.unix_read_buf.deinit();
         self.unix_write_buf.deinit(self.alloc);
         self.output_coalesce_buf.deinit(self.alloc);
+        self.reliable_inbox.deinit();
         self.reliable_send.deinit();
     }
 };
