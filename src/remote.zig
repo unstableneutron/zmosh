@@ -407,7 +407,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                 const result = recv_result orelse break;
 
                 const packet = transport.parsePacket(result.data) catch continue;
-                reliable_send.ack(packet.ack, packet.ack_bits);
+                if (reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
+                    peer.reportRtt(rtt_us);
+                }
 
                 switch (packet.channel) {
                     .heartbeat => {},

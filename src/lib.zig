@@ -305,7 +305,9 @@ export fn zmosh_poll(session: ?*Session) Status {
         const result = recv_result orelse break;
 
         const packet = transport.parsePacket(result.data) catch continue;
-        s.reliable_send.ack(packet.ack, packet.ack_bits);
+        if (s.reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
+            s.peer.reportRtt(rtt_us);
+        }
 
         switch (packet.channel) {
             .heartbeat => {},

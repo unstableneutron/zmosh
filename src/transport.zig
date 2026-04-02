@@ -164,16 +164,25 @@ pub const ReliableSend = struct {
         return packet;
     }
 
-    pub fn ack(self: *ReliableSend, ack_seq: u32, ack_bits: u32) void {
+    pub fn ack(self: *ReliableSend, ack_seq: u32, ack_bits: u32) ?i64 {
+        var rtt_sample: ?i64 = null;
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
         var i: usize = self.pending.items.len;
         while (i > 0) {
             i -= 1;
             const p = self.pending.items[i];
             if (isAcked(p.seq, ack_seq, ack_bits)) {
+                if (p.retries == 0 and rtt_sample == null) {
+                    const rtt_ns = now_ns - p.sent_ns;
+                    if (rtt_ns > 0) {
+                        rtt_sample = @divFloor(rtt_ns, std.time.ns_per_us);
+                    }
+                }
                 self.alloc.free(p.packet);
                 _ = self.pending.swapRemove(i);
             }
         }
+        return rtt_sample;
     }
 
     pub fn collectRetransmits(
@@ -315,4 +324,57 @@ test "output gap detection" {
     try std.testing.expect(out.onPacket(1) == .accept);
     try std.testing.expect(out.onPacket(3) == .gap);
     try std.testing.expect(out.onPacket(2) == .duplicate);
+}
+
+test "ReliableSend.ack returns null for retransmitted packets" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    const now: i64 = 100 * std.time.ns_per_s;
+    _ = try send.buildAndTrack(.reliable_ipc, "test", 0, 0, now);
+    send.pending.items[0].retries = 1;
+
+    const rtt = send.ack(1, 0);
+    try std.testing.expect(rtt == null);
+}
+
+test "ReliableSend.ack returns single RTT from multiple acked packets" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    _ = try send.buildAndTrack(.reliable_ipc, "a", 0, 0, now_ns - 50 * std.time.ns_per_ms);
+    _ = try send.buildAndTrack(.reliable_ipc, "b", 0, 0, now_ns - 20 * std.time.ns_per_ms);
+
+    const rtt = send.ack(2, 1);
+    try std.testing.expect(rtt != null);
+    try std.testing.expect(rtt.? > 0);
+    try std.testing.expect(send.pending.items.len == 0);
+}
+
+test "ReliableSend.ack returns RTT when packet is acked by ack bits only" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    _ = try send.buildAndTrack(.reliable_ipc, "a", 0, 0, now_ns - 50 * std.time.ns_per_ms);
+    _ = try send.buildAndTrack(.reliable_ipc, "b", 0, 0, now_ns - 20 * std.time.ns_per_ms);
+
+    const rtt = send.ack(3, 0b10);
+    try std.testing.expect(rtt != null);
+    try std.testing.expect(rtt.? > 0);
+    try std.testing.expect(send.pending.items.len == 1);
+    try std.testing.expect(send.pending.items[0].seq == 2);
 }

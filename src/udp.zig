@@ -124,9 +124,6 @@ pub const Peer = struct {
     srtt_us: ?i64,
     rttvar_us: ?i64,
 
-    // Timestamps for RTT measurement
-    last_send_time: ?i64,
-
     // Heartbeat tracking
     last_recv_time: i64,
     last_send_time_any: i64,
@@ -146,7 +143,6 @@ pub const Peer = struct {
             .recv_bitmap = 0,
             .srtt_us = null,
             .rttvar_us = null,
-            .last_send_time = null,
             .last_recv_time = now,
             .last_send_time_any = now,
             .state = .connected,
@@ -169,9 +165,7 @@ pub const Peer = struct {
 
         try sock.sendTo(datagram, addr);
 
-        const now = nanoNow();
-        self.last_send_time = now;
-        self.last_send_time_any = now;
+        self.last_send_time_any = nanoNow();
         self.send_seq += 1;
     }
 
@@ -238,24 +232,6 @@ pub const Peer = struct {
 
             self.recv_bitmap |= bit;
             self.last_recv_time = now;
-
-            if (self.last_send_time) |send_time| {
-                const rtt_ns = now - send_time;
-                if (rtt_ns > 0) {
-                    self.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
-                }
-                self.last_send_time = null;
-            }
-        }
-
-        if (decoded.seq >= self.max_recv_seq) {
-            if (self.last_send_time) |send_time| {
-                const rtt_ns = now - send_time;
-                if (rtt_ns > 0) {
-                    self.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
-                }
-                self.last_send_time = null;
-            }
         }
 
         if (self.state == .disconnected) {
@@ -298,6 +274,11 @@ pub const Peer = struct {
             return @max(min_rto, srtt + 4 * rttvar);
         }
         return 1_000_000; // 1s default
+    }
+
+    /// Report an RTT sample from a correlated ack.
+    pub fn reportRtt(self: *Peer, rtt_us: i64) void {
+        self.updateRtt(rtt_us);
     }
 
     /// Update RTT estimate (RFC 6298, 50ms min RTO).
@@ -677,4 +658,16 @@ test "RTT estimation basic sanity" {
     peer.updateRtt(50_000);
     try std.testing.expect(peer.rttvar_us.? == 45_000);
     try std.testing.expect(peer.srtt_us.? == 95_937);
+}
+
+test "RTT reported via explicit reportRtt, not global send time" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    try std.testing.expect(peer.srtt_us == null);
+
+    peer.reportRtt(100_000);
+    try std.testing.expect(peer.srtt_us.? == 100_000);
+    try std.testing.expect(peer.rttvar_us.? == 50_000);
+
+    peer.reportRtt(120_000);
+    try std.testing.expect(peer.srtt_us.? == 102_500);
 }

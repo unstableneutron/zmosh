@@ -403,7 +403,9 @@ pub const Gateway = struct {
             return;
         };
 
-        self.reliable_send.ack(packet.ack, packet.ack_bits);
+        if (self.reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
+            self.peer.reportRtt(rtt_us);
+        }
 
         switch (packet.channel) {
             .heartbeat => {},
