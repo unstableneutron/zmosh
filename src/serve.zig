@@ -147,6 +147,7 @@ pub const Gateway = struct {
 
     pub fn run(self: *Gateway) !void {
         setupSigtermHandler();
+        var was_disconnected = false;
 
         while (self.running) {
             if (sigterm_received.swap(false, .acq_rel)) {
@@ -161,6 +162,13 @@ pub const Gateway = struct {
             if (state == .dead) {
                 log.info("peer dead (alive timeout), shutting down", .{});
                 break;
+            }
+            if (state == .disconnected and !was_disconnected) {
+                was_disconnected = true;
+                self.sendHeartbeat(now) catch {};
+                self.sendHeartbeat(now) catch {};
+            } else if (state == .connected and was_disconnected) {
+                was_disconnected = false;
             }
 
             try self.flushRetransmits(now);

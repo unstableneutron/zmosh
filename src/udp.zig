@@ -12,7 +12,7 @@ fn nanoNow() i64 {
 
 pub const Config = struct {
     heartbeat_interval_ms: u32 = 1000,
-    heartbeat_timeout_ms: u32 = 5000,
+    heartbeat_timeout_ms: u32 = 3000,
     alive_timeout_ms: u32 = 86400 * 1000,
     port_range_start: u16 = 60000,
     port_range_end: u16 = 61000,
@@ -128,6 +128,9 @@ pub const Peer = struct {
     last_recv_time: i64,
     last_send_time_any: i64,
 
+    recovery_mode: bool,
+    recovery_deadline_ns: i64,
+
     // State
     state: PeerState,
     direction: crypto.Direction,
@@ -145,6 +148,8 @@ pub const Peer = struct {
             .rttvar_us = null,
             .last_recv_time = now,
             .last_send_time_any = now,
+            .recovery_mode = false,
+            .recovery_deadline_ns = 0,
             .state = .connected,
             .direction = direction,
         };
@@ -236,6 +241,8 @@ pub const Peer = struct {
 
         if (self.state == .disconnected) {
             self.state = .connected;
+            self.recovery_mode = false;
+            self.recovery_deadline_ns = 0;
             log.info("peer reconnected", .{});
         }
 
@@ -243,9 +250,23 @@ pub const Peer = struct {
     }
 
     /// Check if a heartbeat should be sent.
-    pub fn shouldSendHeartbeat(self: *const Peer, now: i64, config: Config) bool {
+    pub fn shouldSendHeartbeat(self: *Peer, now: i64, config: Config) bool {
+        if (self.recovery_mode) {
+            if (now >= self.recovery_deadline_ns) {
+                self.recovery_mode = false;
+                self.recovery_deadline_ns = 0;
+            } else {
+                return (now - self.last_send_time_any) >= 200 * std.time.ns_per_ms;
+            }
+        }
+
         const interval_ns = @as(i64, config.heartbeat_interval_ms) * std.time.ns_per_ms;
         return (now - self.last_send_time_any) >= interval_ns;
+    }
+
+    pub fn enterRecoveryMode(self: *Peer, now: i64) void {
+        self.recovery_mode = true;
+        self.recovery_deadline_ns = now + 2 * std.time.ns_per_s;
     }
 
     /// Update peer state based on time since last recv.
@@ -259,6 +280,7 @@ pub const Peer = struct {
         } else if (since_recv_ns >= hb_ns) {
             if (self.state == .connected) {
                 log.warn("peer disconnected (heartbeat timeout)", .{});
+                self.enterRecoveryMode(now);
             }
             self.state = .disconnected;
         }
@@ -621,6 +643,45 @@ test "Heartbeat timing logic" {
 
     const later = now + @as(i64, config.heartbeat_interval_ms) * std.time.ns_per_ms + 1;
     try std.testing.expect(peer.shouldSendHeartbeat(later, config));
+}
+
+test "Fast recovery mode sends faster heartbeats" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    const config = Config{};
+    const now = nanoNow();
+    peer.last_send_time_any = now;
+
+    try std.testing.expect(!peer.shouldSendHeartbeat(now + 100 * std.time.ns_per_ms, config));
+
+    peer.enterRecoveryMode(now);
+    try std.testing.expect(peer.recovery_mode);
+
+    peer.last_send_time_any = now;
+    try std.testing.expect(peer.shouldSendHeartbeat(now + 250 * std.time.ns_per_ms, config));
+}
+
+test "Recovery mode expires after 2 seconds" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    const now = nanoNow();
+
+    peer.enterRecoveryMode(now);
+    try std.testing.expect(peer.recovery_mode);
+
+    const after = now + 2100 * std.time.ns_per_ms;
+    _ = peer.shouldSendHeartbeat(after, .{});
+    try std.testing.expect(!peer.recovery_mode);
+}
+
+test "Disconnect auto-enters recovery mode" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    const config = Config{};
+    const now = nanoNow();
+    peer.last_recv_time = now;
+
+    const after_hb = now + @as(i64, config.heartbeat_timeout_ms) * std.time.ns_per_ms + 1;
+    _ = peer.updateState(after_hb, config);
+    try std.testing.expect(peer.state == .disconnected);
+    try std.testing.expect(peer.recovery_mode);
 }
 
 test "Peer state transitions" {

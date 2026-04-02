@@ -384,6 +384,15 @@ export fn zmosh_resize(session: ?*Session, rows: u16, cols: u16) Status {
     return .ok;
 }
 
+export fn zmosh_network_changed(session: ?*Session) Status {
+    const s = session orelse return .err_null;
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    s.peer.enterRecoveryMode(now);
+    sendHeartbeat(s, now) catch {};
+    sendHeartbeat(s, now) catch {};
+    return .ok;
+}
+
 export fn zmosh_disconnect(session: ?*Session) void {
     const s = session orelse return;
 
