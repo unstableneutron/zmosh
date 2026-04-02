@@ -37,6 +37,15 @@ pub const OutputAction = enum {
     gap,
 };
 
+/// RFC 1982 serial number arithmetic: returns true if `a` is after `b`.
+pub fn seqAfter(a: u32, b: u32) bool {
+    return a != b and @as(i32, @bitCast(a -% b)) > 0;
+}
+
+fn seqDist(a: u32, b: u32) u32 {
+    return a -% b;
+}
+
 pub const RecvState = struct {
     latest: u32 = 0,
     mask: u32 = 0,
@@ -50,8 +59,8 @@ pub const RecvState = struct {
             return .accept;
         }
 
-        if (seq > self.latest) {
-            const shift = seq - self.latest;
+        if (seqAfter(seq, self.latest)) {
+            const shift = seqDist(seq, self.latest);
             if (shift >= 32) {
                 self.mask = 0;
             } else {
@@ -62,8 +71,9 @@ pub const RecvState = struct {
             return .accept;
         }
 
-        const diff = self.latest - seq;
-        if (diff == 0) return .duplicate;
+        if (seq == self.latest) return .duplicate;
+
+        const diff = seqDist(self.latest, seq);
         if (diff > 32) return .stale;
 
         const bit: u32 = @as(u32, 1) << @intCast(diff - 1);
@@ -92,12 +102,12 @@ pub const OutputRecvState = struct {
             return .accept;
         }
 
-        if (seq == self.latest + 1) {
+        if (seq == self.latest +% 1) {
             self.latest = seq;
             return .accept;
         }
 
-        if (seq <= self.latest) {
+        if (!seqAfter(seq, self.latest)) {
             return .duplicate;
         }
 
@@ -208,9 +218,9 @@ pub const ReliableSend = struct {
     fn isAcked(seq: u32, ack_seq: u32, ack_bits: u32) bool {
         if (ack_seq == 0) return false;
         if (seq == ack_seq) return true;
-        if (seq > ack_seq) return false;
+        if (seqAfter(seq, ack_seq)) return false;
 
-        const diff = ack_seq - seq;
+        const diff = seqDist(ack_seq, seq);
         if (diff == 0) return true;
         if (diff > 32) return false;
 
@@ -308,6 +318,33 @@ test "transport header round trip" {
     try std.testing.expectEqual(@as(u32, 6), parsed.ack);
     try std.testing.expectEqual(@as(u32, 0x55), parsed.ack_bits);
     try std.testing.expectEqualStrings(payload, parsed.payload);
+}
+
+test "seqAfter handles wrap-around" {
+    try std.testing.expect(seqAfter(2, 1));
+    try std.testing.expect(!seqAfter(1, 2));
+    try std.testing.expect(!seqAfter(5, 5));
+    try std.testing.expect(seqAfter(0, std.math.maxInt(u32)));
+    try std.testing.expect(seqAfter(1, std.math.maxInt(u32)));
+    try std.testing.expect(!seqAfter(std.math.maxInt(u32), 0));
+}
+
+test "RecvState.onReliable across wrap" {
+    var recv = RecvState{};
+    recv.latest = std.math.maxInt(u32) - 1;
+    recv.has_latest = true;
+    recv.mask = 0;
+    try std.testing.expect(recv.onReliable(std.math.maxInt(u32)) == .accept);
+    try std.testing.expect(recv.onReliable(0) == .accept);
+    try std.testing.expectEqual(@as(u32, 0), recv.ack());
+}
+
+test "OutputRecvState across wrap" {
+    var out = OutputRecvState{};
+    out.latest = std.math.maxInt(u32);
+    out.has_latest = true;
+    try std.testing.expect(out.onPacket(0) == .accept);
+    try std.testing.expectEqual(@as(u32, 0), out.latest);
 }
 
 test "reliable recv window" {
