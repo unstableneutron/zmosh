@@ -353,7 +353,7 @@ export fn zmosh_poll(session: ?*Session) Status {
                 if (!s.reliable_inbox.accepts(packet.seq)) continue;
                 if (s.reliable_recv.onReliable(packet.seq) != .accept) continue;
 
-                try s.reliable_inbox.push(packet.seq, packet.channel, packet.payload);
+                s.reliable_inbox.push(packet.seq, packet.channel, packet.payload) catch return .err_poll;
                 while (s.reliable_inbox.popReady()) |delivery| {
                     defer delivery.deinit(std.heap.page_allocator);
 
