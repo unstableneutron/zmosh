@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: ["**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: ["**"]
@@ -61,6 +61,7 @@ jobs:
           HAS_MAIN_PR: ${{ steps.open_pr.outputs.has_main_pr }}
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           IS_SAME_REPO_PR: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -121,14 +122,16 @@ jobs:
           fi
 
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            SHOULD_RUN=true
             CHECKOUT_REF="$PR_HEAD_SHA"
             RELEASE_TARGET_REF="$PR_HEAD_SHA"
             RELEASE_TAG=$(sanitize_ref "$PR_HEAD_REF")
             RELEASE_TITLE_PREFIX="zmosh ${RELEASE_TAG}"
 
-            if [[ "$IS_SAME_REPO_PR" == "true" ]]; then
-              SHOULD_PUBLISH=true
+            if [[ "$PR_BASE_REF" == "main" ]] || [[ "$WANTS_BUILD" == "true" ]] || [[ "$WANTS_RELEASE" == "true" ]] || [[ "$WANTS_MACOS" == "true" ]]; then
+              SHOULD_RUN=true
+              if [[ "$IS_SAME_REPO_PR" == "true" ]]; then
+                SHOULD_PUBLISH=true
+              fi
             fi
 
             RUN_MACOS="$WANTS_MACOS"
