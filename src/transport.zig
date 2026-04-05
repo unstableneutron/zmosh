@@ -37,6 +37,19 @@ pub const OutputAction = enum {
     gap,
 };
 
+pub const OutputPrefix = packed struct {
+    epoch: u32,
+};
+
+/// RFC 1982 serial number arithmetic: returns true if `a` is after `b`.
+pub fn seqAfter(a: u32, b: u32) bool {
+    return a != b and @as(i32, @bitCast(a -% b)) > 0;
+}
+
+fn seqDist(a: u32, b: u32) u32 {
+    return a -% b;
+}
+
 pub const RecvState = struct {
     latest: u32 = 0,
     mask: u32 = 0,
@@ -50,10 +63,12 @@ pub const RecvState = struct {
             return .accept;
         }
 
-        if (seq > self.latest) {
-            const shift = seq - self.latest;
-            if (shift >= 32) {
+        if (seqAfter(seq, self.latest)) {
+            const shift = seqDist(seq, self.latest);
+            if (shift > 32) {
                 self.mask = 0;
+            } else if (shift == 32) {
+                self.mask = @as(u32, 1) << 31;
             } else {
                 self.mask <<= @intCast(shift);
                 self.mask |= @as(u32, 1) << @intCast(shift - 1);
@@ -62,8 +77,9 @@ pub const RecvState = struct {
             return .accept;
         }
 
-        const diff = self.latest - seq;
-        if (diff == 0) return .duplicate;
+        if (seq == self.latest) return .duplicate;
+
+        const diff = seqDist(self.latest, seq);
         if (diff > 32) return .stale;
 
         const bit: u32 = @as(u32, 1) << @intCast(diff - 1);
@@ -92,18 +108,77 @@ pub const OutputRecvState = struct {
             return .accept;
         }
 
-        if (seq == self.latest + 1) {
+        if (seq == self.latest +% 1) {
             self.latest = seq;
             return .accept;
         }
 
-        if (seq <= self.latest) {
+        if (!seqAfter(seq, self.latest)) {
             return .duplicate;
         }
 
         // seq jumped ahead.
         self.latest = seq;
         return .gap;
+    }
+};
+
+pub const ReliableDelivery = struct {
+    seq: u32,
+    channel: Channel,
+    payload: []u8,
+
+    pub fn deinit(self: ReliableDelivery, alloc: std.mem.Allocator) void {
+        alloc.free(self.payload);
+    }
+};
+
+pub const ReliableInbox = struct {
+    alloc: std.mem.Allocator,
+    next_seq: u32 = 1,
+    pending: std.ArrayList(ReliableDelivery),
+
+    pub fn accepts(self: *const ReliableInbox, seq: u32) bool {
+        if (seq == self.next_seq) return true;
+        if (!seqAfter(seq, self.next_seq)) return false;
+        return seqDist(seq, self.next_seq) <= 32;
+    }
+
+    pub fn init(alloc: std.mem.Allocator) !ReliableInbox {
+        return .{
+            .alloc = alloc,
+            .pending = try std.ArrayList(ReliableDelivery).initCapacity(alloc, 8),
+        };
+    }
+
+    pub fn deinit(self: *ReliableInbox) void {
+        for (self.pending.items) |delivery| {
+            delivery.deinit(self.alloc);
+        }
+        self.pending.deinit(self.alloc);
+    }
+
+    pub fn push(self: *ReliableInbox, seq: u32, channel: Channel, payload: []const u8) !void {
+        const owned_payload = try self.alloc.dupe(u8, payload);
+        errdefer self.alloc.free(owned_payload);
+
+        try self.pending.append(self.alloc, .{
+            .seq = seq,
+            .channel = channel,
+            .payload = owned_payload,
+        });
+    }
+
+    pub fn popReady(self: *ReliableInbox) ?ReliableDelivery {
+        var i: usize = 0;
+        while (i < self.pending.items.len) : (i += 1) {
+            if (self.pending.items[i].seq == self.next_seq) {
+                const delivery = self.pending.swapRemove(i);
+                self.next_seq +%= 1;
+                return delivery;
+            }
+        }
+        return null;
     }
 };
 
@@ -164,16 +239,25 @@ pub const ReliableSend = struct {
         return packet;
     }
 
-    pub fn ack(self: *ReliableSend, ack_seq: u32, ack_bits: u32) void {
+    pub fn ack(self: *ReliableSend, ack_seq: u32, ack_bits: u32) ?i64 {
+        var rtt_sample: ?i64 = null;
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
         var i: usize = self.pending.items.len;
         while (i > 0) {
             i -= 1;
             const p = self.pending.items[i];
             if (isAcked(p.seq, ack_seq, ack_bits)) {
+                if (p.retries == 0 and rtt_sample == null) {
+                    const rtt_ns = now_ns - p.sent_ns;
+                    if (rtt_ns > 0) {
+                        rtt_sample = @divFloor(rtt_ns, std.time.ns_per_us);
+                    }
+                }
                 self.alloc.free(p.packet);
                 _ = self.pending.swapRemove(i);
             }
         }
+        return rtt_sample;
     }
 
     pub fn collectRetransmits(
@@ -199,9 +283,9 @@ pub const ReliableSend = struct {
     fn isAcked(seq: u32, ack_seq: u32, ack_bits: u32) bool {
         if (ack_seq == 0) return false;
         if (seq == ack_seq) return true;
-        if (seq > ack_seq) return false;
+        if (seqAfter(seq, ack_seq)) return false;
 
-        const diff = ack_seq - seq;
+        const diff = seqDist(ack_seq, seq);
         if (diff == 0) return true;
         if (diff > 32) return false;
 
@@ -301,6 +385,33 @@ test "transport header round trip" {
     try std.testing.expectEqualStrings(payload, parsed.payload);
 }
 
+test "seqAfter handles wrap-around" {
+    try std.testing.expect(seqAfter(2, 1));
+    try std.testing.expect(!seqAfter(1, 2));
+    try std.testing.expect(!seqAfter(5, 5));
+    try std.testing.expect(seqAfter(0, std.math.maxInt(u32)));
+    try std.testing.expect(seqAfter(1, std.math.maxInt(u32)));
+    try std.testing.expect(!seqAfter(std.math.maxInt(u32), 0));
+}
+
+test "RecvState.onReliable across wrap" {
+    var recv = RecvState{};
+    recv.latest = std.math.maxInt(u32) - 1;
+    recv.has_latest = true;
+    recv.mask = 0;
+    try std.testing.expect(recv.onReliable(std.math.maxInt(u32)) == .accept);
+    try std.testing.expect(recv.onReliable(0) == .accept);
+    try std.testing.expectEqual(@as(u32, 0), recv.ack());
+}
+
+test "OutputRecvState across wrap" {
+    var out = OutputRecvState{};
+    out.latest = std.math.maxInt(u32);
+    out.has_latest = true;
+    try std.testing.expect(out.onPacket(0) == .accept);
+    try std.testing.expectEqual(@as(u32, 0), out.latest);
+}
+
 test "reliable recv window" {
     var recv = RecvState{};
     try std.testing.expect(recv.onReliable(10) == .accept);
@@ -310,9 +421,111 @@ test "reliable recv window" {
     try std.testing.expectEqual(@as(u32, 11), recv.ack());
 }
 
+test "reliable recv window keeps the 32-packet boundary acked" {
+    var recv = RecvState{};
+    try std.testing.expect(recv.onReliable(10) == .accept);
+    try std.testing.expect(recv.onReliable(42) == .accept);
+    try std.testing.expectEqual(@as(u32, 42), recv.ack());
+    try std.testing.expectEqual(@as(u32, 1) << 31, recv.ackBits());
+}
+
+test "ReliableInbox delivers reliable packets in order" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var inbox = try ReliableInbox.init(alloc);
+    defer inbox.deinit();
+
+    try inbox.push(2, .control, "two");
+    try std.testing.expect(inbox.popReady() == null);
+
+    try inbox.push(1, .reliable_ipc, "one");
+
+    const first = inbox.popReady().?;
+    defer first.deinit(alloc);
+    try std.testing.expect(first.seq == 1);
+    try std.testing.expect(first.channel == .reliable_ipc);
+    try std.testing.expectEqualStrings("one", first.payload);
+
+    const second = inbox.popReady().?;
+    defer second.deinit(alloc);
+    try std.testing.expect(second.seq == 2);
+    try std.testing.expect(second.channel == .control);
+    try std.testing.expectEqualStrings("two", second.payload);
+
+    try std.testing.expect(inbox.popReady() == null);
+}
+
+test "ReliableInbox rejects packets too far ahead of next_seq" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var inbox = try ReliableInbox.init(alloc);
+    defer inbox.deinit();
+
+    try std.testing.expect(inbox.accepts(1));
+    try std.testing.expect(inbox.accepts(33));
+    try std.testing.expect(!inbox.accepts(34));
+}
+
 test "output gap detection" {
     var out = OutputRecvState{};
     try std.testing.expect(out.onPacket(1) == .accept);
     try std.testing.expect(out.onPacket(3) == .gap);
     try std.testing.expect(out.onPacket(2) == .duplicate);
+}
+
+test "ReliableSend.ack returns null for retransmitted packets" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    const now: i64 = 100 * std.time.ns_per_s;
+    _ = try send.buildAndTrack(.reliable_ipc, "test", 0, 0, now);
+    send.pending.items[0].retries = 1;
+
+    const rtt = send.ack(1, 0);
+    try std.testing.expect(rtt == null);
+}
+
+test "ReliableSend.ack returns single RTT from multiple acked packets" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    _ = try send.buildAndTrack(.reliable_ipc, "a", 0, 0, now_ns - 50 * std.time.ns_per_ms);
+    _ = try send.buildAndTrack(.reliable_ipc, "b", 0, 0, now_ns - 20 * std.time.ns_per_ms);
+
+    const rtt = send.ack(2, 1);
+    try std.testing.expect(rtt != null);
+    try std.testing.expect(rtt.? > 0);
+    try std.testing.expect(send.pending.items.len == 0);
+}
+
+test "ReliableSend.ack returns RTT when packet is acked by ack bits only" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var send = try ReliableSend.init(alloc);
+    defer send.deinit();
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    _ = try send.buildAndTrack(.reliable_ipc, "a", 0, 0, now_ns - 50 * std.time.ns_per_ms);
+    _ = try send.buildAndTrack(.reliable_ipc, "b", 0, 0, now_ns - 20 * std.time.ns_per_ms);
+
+    const rtt = send.ack(3, 0b10);
+    try std.testing.expect(rtt != null);
+    try std.testing.expect(rtt.? > 0);
+    try std.testing.expect(send.pending.items.len == 1);
+    try std.testing.expect(send.pending.items[0].seq == 2);
 }

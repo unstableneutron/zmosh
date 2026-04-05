@@ -9,7 +9,8 @@ const builtin = @import("builtin");
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 4 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
+const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
+const session_end_grace_ns = 2 * std.time.ns_per_s;
 
 const c = switch (builtin.os.tag) {
     .macos => @cImport({
@@ -234,14 +235,18 @@ fn requestResync(
     reliable_send: *transport.ReliableSend,
     reliable_recv: *const transport.RecvState,
     last_resync_request_ns: *i64,
+    resync_backoff_ns: *i64,
+    resync_pending: *bool,
     now: i64,
 ) !void {
-    if ((now - last_resync_request_ns.*) < resync_cooldown_ns) return;
+    if ((now - last_resync_request_ns.*) < resync_backoff_ns.*) return;
 
     var ctrl_buf: [8]u8 = undefined;
     const payload = transport.buildControl(.resync_request, &ctrl_buf);
     try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .control, payload, now);
     last_resync_request_ns.* = now;
+    resync_backoff_ns.* = @min(resync_backoff_ns.* * 2, std.time.ns_per_s);
+    resync_pending.* = true;
 }
 
 /// Remote attach: connect to a remote zmx session via UDP.
@@ -270,6 +275,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var reliable_send = try transport.ReliableSend.init(alloc);
     defer reliable_send.deinit();
     var reliable_recv = transport.RecvState{};
+    var reliable_inbox = try transport.ReliableInbox.init(alloc);
+    defer reliable_inbox.deinit();
     var output_recv = transport.OutputRecvState{};
 
     // Set terminal to raw mode
@@ -307,17 +314,26 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     const config = udp_mod.Config{};
     var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
     defer stdout_buf.deinit(alloc);
+    var deferred_output_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+    defer deferred_output_buf.deinit(alloc);
     var was_disconnected = false;
     var session_ended = false;
+    var session_end_deadline_ns: ?i64 = null;
 
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
     var last_resync_request_ns: i64 = 0;
+    var resync_backoff_ns: i64 = initial_resync_backoff_ns;
+    var resync_pending = false;
+    var active_snapshot_id: ?u32 = null;
+    var current_output_epoch: u32 = 0;
+    var pending_output_epoch: ?u32 = null;
 
     // Send Init message with terminal size (reliable)
     const size = getTerminalSize();
     var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+    const init = ipc.Init{ .rows = size.rows, .cols = size.cols, .snapshot_id = 0 };
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init), &init_buf);
     try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, last_ack_send_ns);
 
     while (true) {
@@ -346,12 +362,16 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         // State check
         const state = peer.updateState(now, config);
         if (state == .dead) {
-            _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: connection lost permanently\r\n") catch {};
-            return;
+            if (!session_ended) {
+                _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: connection lost permanently\r\n") catch {};
+                return;
+            }
         }
         if (state == .disconnected and !was_disconnected) {
             _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b[7mzmx: connection lost — waiting to reconnect...\x1b[27m\x1b8") catch {};
             was_disconnected = true;
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
         } else if (state == .connected and was_disconnected) {
             _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
             was_disconnected = false;
@@ -372,6 +392,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             const rto_ms = @divFloor(peer.rto_us(), 1000);
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
+        const heartbeat_ms = @divFloor(peer.heartbeatDelayNs(now, config), std.time.ns_per_ms);
+        poll_timeout = @min(poll_timeout, heartbeat_ms);
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
@@ -407,54 +429,141 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                 const result = recv_result orelse break;
 
                 const packet = transport.parsePacket(result.data) catch continue;
-                reliable_send.ack(packet.ack, packet.ack_bits);
+                if (reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
+                    peer.reportRtt(rtt_us);
+                }
 
                 switch (packet.channel) {
                     .heartbeat => {},
-                    .control => {
+                    .control, .reliable_ipc => {
                         ack_dirty = true;
-                        if (reliable_recv.onReliable(packet.seq) != .accept) continue;
-                    },
-                    .reliable_ipc => {
-                        ack_dirty = true;
+                        if (!reliable_inbox.accepts(packet.seq)) continue;
                         if (reliable_recv.onReliable(packet.seq) != .accept) continue;
 
-                        var offset: usize = 0;
-                        while (offset < packet.payload.len) {
-                            const remaining = packet.payload[offset..];
-                            const msg_len = ipc.expectedLength(remaining) orelse break;
-                            if (remaining.len < msg_len) break;
+                        try reliable_inbox.push(packet.seq, packet.channel, packet.payload);
+                        while (reliable_inbox.popReady()) |delivery| {
+                            defer delivery.deinit(alloc);
 
-                            const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-                            const payload = remaining[@sizeOf(ipc.Header)..msg_len];
+                            switch (delivery.channel) {
+                                .control => {
+                                    const ctrl = transport.parseControl(delivery.payload) catch continue;
+                                    _ = ctrl;
+                                },
+                                .reliable_ipc => {
+                                    var offset: usize = 0;
+                                    while (offset < delivery.payload.len) {
+                                        const remaining = delivery.payload[offset..];
+                                        const msg_len = ipc.expectedLength(remaining) orelse break;
+                                        if (remaining.len < msg_len) break;
 
-                            if (hdr.tag == .Output and payload.len > 0) {
-                                if (stdout_buf.items.len + payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, payload);
-                                }
-                            } else if (hdr.tag == .SessionEnd) {
-                                session_ended = true;
+                                        const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+                                        const payload = remaining[@sizeOf(ipc.Header)..msg_len];
+
+                                        if (hdr.tag == .Output and payload.len > 0) {
+                                            if (stdout_buf.items.len + payload.len > max_stdout_buf) {
+                                                stdout_buf.clearRetainingCapacity();
+                                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now);
+                                            } else {
+                                                active_snapshot_id = null;
+                                                deferred_output_buf.clearRetainingCapacity();
+                                                resync_backoff_ns = initial_resync_backoff_ns;
+                                                try stdout_buf.appendSlice(alloc, payload);
+                                            }
+                                        } else if (hdr.tag == .Snapshot and payload.len >= @sizeOf(ipc.Snapshot)) {
+                                            const snapshot = std.mem.bytesToValue(ipc.Snapshot, payload[0..@sizeOf(ipc.Snapshot)]);
+                                            const snapshot_bytes = payload[@sizeOf(ipc.Snapshot)..];
+                                            if (active_snapshot_id) |current| {
+                                                if (snapshot.id < current) {
+                                                    offset += msg_len;
+                                                    continue;
+                                                }
+                                                if (snapshot.id > current) {
+                                                    stdout_buf.clearRetainingCapacity();
+                                                    deferred_output_buf.clearRetainingCapacity();
+                                                    pending_output_epoch = null;
+                                                    active_snapshot_id = snapshot.id;
+                                                }
+                                            } else {
+                                                stdout_buf.clearRetainingCapacity();
+                                                deferred_output_buf.clearRetainingCapacity();
+                                                pending_output_epoch = null;
+                                                active_snapshot_id = snapshot.id;
+                                            }
+
+                                            if (pending_output_epoch) |pending_epoch| {
+                                                if (pending_epoch != snapshot.id) {
+                                                    deferred_output_buf.clearRetainingCapacity();
+                                                    pending_output_epoch = null;
+                                                }
+                                            }
+
+                                            if (stdout_buf.items.len + snapshot_bytes.len > max_stdout_buf) {
+                                                stdout_buf.clearRetainingCapacity();
+                                                deferred_output_buf.clearRetainingCapacity();
+                                                pending_output_epoch = null;
+                                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now);
+                                            } else {
+                                                resync_pending = false;
+                                                current_output_epoch = snapshot.id;
+                                                resync_backoff_ns = initial_resync_backoff_ns;
+                                                try stdout_buf.appendSlice(alloc, snapshot_bytes);
+                                                if (snapshot.isFinal()) {
+                                                    active_snapshot_id = null;
+                                                    if (stdout_buf.items.len + deferred_output_buf.items.len > max_stdout_buf) {
+                                                        stdout_buf.clearRetainingCapacity();
+                                                        deferred_output_buf.clearRetainingCapacity();
+                                                        pending_output_epoch = null;
+                                                        try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now);
+                                                    } else {
+                                                        try stdout_buf.appendSlice(alloc, deferred_output_buf.items);
+                                                        deferred_output_buf.clearRetainingCapacity();
+                                                        pending_output_epoch = null;
+                                                    }
+                                                }
+                                            }
+                                        } else if (hdr.tag == .SessionEnd) {
+                                            session_ended = true;
+                                            session_end_deadline_ns = session_end_deadline_ns orelse now + session_end_grace_ns;
+                                        }
+
+                                        offset += msg_len;
+                                    }
+                                },
+                                else => unreachable,
                             }
-
-                            offset += msg_len;
                         }
                     },
                     .output => {
                         switch (output_recv.onPacket(packet.seq)) {
                             .accept => {
                                 if (packet.payload.len == 0) continue;
-                                if (stdout_buf.items.len + packet.payload.len > max_stdout_buf) {
+                                if (packet.payload.len < @sizeOf(transport.OutputPrefix)) continue;
+                                const prefix = std.mem.bytesToValue(transport.OutputPrefix, packet.payload[0..@sizeOf(transport.OutputPrefix)]);
+                                if (prefix.epoch < current_output_epoch) continue;
+                                if (resync_pending and active_snapshot_id == null) {
+                                    if (prefix.epoch <= current_output_epoch) continue;
+                                    if (pending_output_epoch) |pending_epoch| {
+                                        if (pending_epoch != prefix.epoch) {
+                                            deferred_output_buf.clearRetainingCapacity();
+                                        }
+                                    }
+                                    pending_output_epoch = prefix.epoch;
+                                } else if (prefix.epoch > current_output_epoch and active_snapshot_id == null) {
+                                    current_output_epoch = prefix.epoch;
+                                }
+                                const output_payload = packet.payload[@sizeOf(transport.OutputPrefix)..];
+                                const target_buf = if (active_snapshot_id != null) &deferred_output_buf else &stdout_buf;
+                                if (target_buf.items.len + output_payload.len > max_stdout_buf) {
                                     stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                    deferred_output_buf.clearRetainingCapacity();
+                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now);
                                 } else {
-                                    try stdout_buf.appendSlice(alloc, packet.payload);
+                                    resync_backoff_ns = initial_resync_backoff_ns;
+                                    try target_buf.appendSlice(alloc, output_payload);
                                 }
                             },
                             .gap => {
-                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now);
                             },
                             .duplicate, .stale => {},
                         }
@@ -476,9 +585,26 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             }
         }
 
-        if (session_ended) {
-            if (stdout_buf.items.len > 0) {
-                _ = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch {};
+        if (session_ended and
+            session_end_deadline_ns != null and
+            now >= session_end_deadline_ns.? and
+            active_snapshot_id == null and
+            deferred_output_buf.items.len == 0)
+        {
+            while (stdout_buf.items.len > 0) {
+                const written = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
+                    if (err == error.WouldBlock) {
+                        var out_poll = [_]posix.pollfd{.{ .fd = posix.STDOUT_FILENO, .events = posix.POLL.OUT, .revents = 0 }};
+                        _ = posix.poll(&out_poll, 100) catch break :blk @as(usize, 0);
+                        break :blk @as(usize, 0);
+                    }
+                    break :blk @as(usize, 0);
+                };
+                if (written > 0) {
+                    try stdout_buf.replaceRange(alloc, 0, written, &[_]u8{});
+                } else {
+                    break;
+                }
             }
             _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: remote session ended\r\n") catch {};
             return;

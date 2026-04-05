@@ -3,6 +3,7 @@ const posix = std.posix;
 const crypto = @import("crypto.zig");
 
 const log = std.log.scoped(.udp);
+const replay_window_size = 128;
 
 /// Truncate nanoTimestamp (i128) to i64 for storage. Sufficient for ~292 years.
 fn nanoNow() i64 {
@@ -11,7 +12,7 @@ fn nanoNow() i64 {
 
 pub const Config = struct {
     heartbeat_interval_ms: u32 = 1000,
-    heartbeat_timeout_ms: u32 = 5000,
+    heartbeat_timeout_ms: u32 = 3000,
     alive_timeout_ms: u32 = 86400 * 1000,
     port_range_start: u16 = 60000,
     port_range_end: u16 = 61000,
@@ -112,17 +113,23 @@ pub const Peer = struct {
     // Sequence numbers
     send_seq: u63,
     max_recv_seq: u63,
+    has_received_first: bool,
+
+    // Sliding replay window semantics: the bitmap tracks the 127 packets below
+    // max_recv_seq, and max_recv_seq itself is tracked separately for 128 total.
+    // Bit 0 = max_recv_seq - 1, bit 1 = max_recv_seq - 2, etc.
+    recv_bitmap: u128,
 
     // RTT estimation (RFC 6298, 50ms min RTO like Mosh)
     srtt_us: ?i64,
     rttvar_us: ?i64,
 
-    // Timestamps for RTT measurement
-    last_send_time: ?i64,
-
     // Heartbeat tracking
     last_recv_time: i64,
     last_send_time_any: i64,
+
+    recovery_mode: bool,
+    recovery_deadline_ns: i64,
 
     // State
     state: PeerState,
@@ -135,11 +142,14 @@ pub const Peer = struct {
             .key = key,
             .send_seq = 0,
             .max_recv_seq = 0,
+            .has_received_first = false,
+            .recv_bitmap = 0,
             .srtt_us = null,
             .rttvar_us = null,
-            .last_send_time = null,
             .last_recv_time = now,
             .last_send_time_any = now,
+            .recovery_mode = false,
+            .recovery_deadline_ns = 0,
             .state = .connected,
             .direction = direction,
         };
@@ -160,9 +170,7 @@ pub const Peer = struct {
 
         try sock.sendTo(datagram, addr);
 
-        const now = nanoNow();
-        self.last_send_time = now;
-        self.last_send_time_any = now;
+        self.last_send_time_any = nanoNow();
         self.send_seq += 1;
     }
 
@@ -193,33 +201,48 @@ pub const Peer = struct {
 
         const now = nanoNow();
 
-        // Anti-replay + roaming: only update state if seq > max_recv_seq.
-        // Old or duplicate packets are dropped after authentication.
-        if (decoded.seq > self.max_recv_seq) {
+        if (!self.has_received_first) {
+            self.addr = result.addr;
+            self.max_recv_seq = decoded.seq;
+            self.has_received_first = true;
+            self.recv_bitmap = 0;
+            self.last_recv_time = now;
+        } else if (decoded.seq > self.max_recv_seq) {
+            const shift = decoded.seq - self.max_recv_seq;
+            if (shift >= replay_window_size) {
+                self.recv_bitmap = 0;
+            } else {
+                self.recv_bitmap <<= @intCast(shift);
+                self.recv_bitmap |= @as(u128, 1) << @intCast(shift - 1);
+            }
             self.addr = result.addr;
             self.max_recv_seq = decoded.seq;
             self.last_recv_time = now;
-
-            // RTT measurement
-            if (self.last_send_time) |send_time| {
-                const rtt_ns = now - send_time;
-                if (rtt_ns > 0) {
-                    self.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
-                }
-                self.last_send_time = null;
-            }
-        } else if (decoded.seq == 0 and self.max_recv_seq == 0) {
-            // First packet (seq 0)
-            self.addr = result.addr;
-            self.max_recv_seq = 0;
-            self.last_recv_time = now;
-        } else {
-            log.debug("old seq={d} max={d}", .{ decoded.seq, self.max_recv_seq });
+        } else if (decoded.seq == self.max_recv_seq) {
+            log.debug("duplicate current-max seq={d}", .{decoded.seq});
             return null;
+        } else {
+            const diff = self.max_recv_seq - decoded.seq;
+            if (diff >= replay_window_size) {
+                log.debug("old seq={d} max={d} (outside window)", .{ decoded.seq, self.max_recv_seq });
+                return null;
+            }
+
+            const bit_idx: u7 = @intCast(diff - 1);
+            const bit = @as(u128, 1) << bit_idx;
+            if (self.recv_bitmap & bit != 0) {
+                log.debug("duplicate seq={d}", .{decoded.seq});
+                return null;
+            }
+
+            self.recv_bitmap |= bit;
+            self.last_recv_time = now;
         }
 
         if (self.state == .disconnected) {
             self.state = .connected;
+            self.recovery_mode = false;
+            self.recovery_deadline_ns = 0;
             log.info("peer reconnected", .{});
         }
 
@@ -227,9 +250,27 @@ pub const Peer = struct {
     }
 
     /// Check if a heartbeat should be sent.
-    pub fn shouldSendHeartbeat(self: *const Peer, now: i64, config: Config) bool {
+    pub fn shouldSendHeartbeat(self: *Peer, now: i64, config: Config) bool {
+        return self.heartbeatDelayNs(now, config) == 0;
+    }
+
+    pub fn heartbeatDelayNs(self: *Peer, now: i64, config: Config) i64 {
+        if (self.recovery_mode) {
+            if (now >= self.recovery_deadline_ns) {
+                self.recovery_mode = false;
+                self.recovery_deadline_ns = 0;
+            } else {
+                return @max(@as(i64, 0), 200 * std.time.ns_per_ms - (now - self.last_send_time_any));
+            }
+        }
+
         const interval_ns = @as(i64, config.heartbeat_interval_ms) * std.time.ns_per_ms;
-        return (now - self.last_send_time_any) >= interval_ns;
+        return @max(@as(i64, 0), interval_ns - (now - self.last_send_time_any));
+    }
+
+    pub fn enterRecoveryMode(self: *Peer, now: i64) void {
+        self.recovery_mode = true;
+        self.recovery_deadline_ns = now + 2 * std.time.ns_per_s;
     }
 
     /// Update peer state based on time since last recv.
@@ -243,6 +284,7 @@ pub const Peer = struct {
         } else if (since_recv_ns >= hb_ns) {
             if (self.state == .connected) {
                 log.warn("peer disconnected (heartbeat timeout)", .{});
+                self.enterRecoveryMode(now);
             }
             self.state = .disconnected;
         }
@@ -258,6 +300,11 @@ pub const Peer = struct {
             return @max(min_rto, srtt + 4 * rttvar);
         }
         return 1_000_000; // 1s default
+    }
+
+    /// Report an RTT sample from a correlated ack.
+    pub fn reportRtt(self: *Peer, rtt_us: i64) void {
+        self.updateRtt(rtt_us);
     }
 
     /// Update RTT estimate (RFC 6298, 50ms min RTO).
@@ -331,7 +378,7 @@ test "Peer send/recv round-trip (loopback)" {
     try std.testing.expectEqualStrings(msg, recv_result.?.data);
 }
 
-test "Anti-replay: reject datagram with seq <= max_recv_seq" {
+test "Replay window: accept out-of-order packets within window" {
     const key = crypto.generateKey();
     var peer = Peer.init(key, .to_client);
 
@@ -356,16 +403,206 @@ test "Anti-replay: reject datagram with seq <= max_recv_seq" {
     try std.testing.expect(r1 != null);
     try std.testing.expect(peer.max_recv_seq == 10);
 
-    // Send lower seq — packet is dropped.
+    // Send lower seq within the replay window.
     const old_port = peer.addr.?.getPort();
     try sock_send.sendTo(pkt_lo, target);
     try testPollReady(sock_recv.fd);
 
     var recv_buf2: [4096]u8 = undefined;
     const r2 = try peer.recv(&sock_recv, &recv_buf2);
-    try std.testing.expect(r2 == null);
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("first", r2.?.data);
     try std.testing.expect(peer.max_recv_seq == 10);
     try std.testing.expect(peer.addr.?.getPort() == old_port);
+}
+
+test "Replay window: reject duplicate of max_recv_seq" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60940, 60950);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(60950, 60960);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "first", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+    try std.testing.expect(peer.max_recv_seq == 5);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "dupe", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: reject duplicate within window" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60960, 60970);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(60970, 60980);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf0: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 10, "hi", &buf0), target);
+    try testPollReady(sock_recv.fd);
+    var rb0: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb0);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "first", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    const r1 = try peer.recv(&sock_recv, &rb1);
+    try std.testing.expect(r1 != null);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "dupe", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: roaming only updates on advancing seq" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60980, 60990);
+    defer sock_recv.close();
+    var sock_a = try testBindIp4(60990, 61000);
+    defer sock_a.close();
+    var sock_b = try testBindIp4(61000, 61010);
+    defer sock_b.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_a.sendTo(try crypto.encodeDatagram(key, .to_server, 10, "a", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+    const port_a = peer.addr.?.getPort();
+
+    var buf2: [128]u8 = undefined;
+    try sock_b.sendTo(try crypto.encodeDatagram(key, .to_server, 8, "b", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 != null);
+    try std.testing.expect(peer.addr.?.getPort() == port_a);
+}
+
+test "Replay window: below-window packet rejected" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61010, 61020);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61020, 61030);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 200, "hi", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 1, "old", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: boundary packet stays inside documented window" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61030, 61040);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61040, 61050);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 200, "hi", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 73, "edge", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("edge", r2.?.data);
+}
+
+test "Replay window: packet just outside documented window is rejected" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61050, 61060);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61060, 61070);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 200, "hi", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 72, "old", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 == null);
+}
+
+test "Replay window: large jump forward clears bitmap" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(61070, 61080);
+    defer sock_recv.close();
+    var sock_send = try testBindIp4(61080, 61090);
+    defer sock_send.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 5, "a", &buf1), target);
+    try testPollReady(sock_recv.fd);
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+
+    var buf2: [128]u8 = undefined;
+    try sock_send.sendTo(try crypto.encodeDatagram(key, .to_server, 500, "b", &buf2), target);
+    try testPollReady(sock_recv.fd);
+    var rb2: [4096]u8 = undefined;
+    const r2 = try peer.recv(&sock_recv, &rb2);
+    try std.testing.expect(r2 != null);
+    try std.testing.expect(peer.max_recv_seq == 500);
 }
 
 test "Roaming: verify addr updates on authentic packet" {
@@ -412,6 +649,45 @@ test "Heartbeat timing logic" {
     try std.testing.expect(peer.shouldSendHeartbeat(later, config));
 }
 
+test "Fast recovery mode sends faster heartbeats" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    const config = Config{};
+    const now = nanoNow();
+    peer.last_send_time_any = now;
+
+    try std.testing.expect(!peer.shouldSendHeartbeat(now + 100 * std.time.ns_per_ms, config));
+
+    peer.enterRecoveryMode(now);
+    try std.testing.expect(peer.recovery_mode);
+
+    peer.last_send_time_any = now;
+    try std.testing.expect(peer.shouldSendHeartbeat(now + 250 * std.time.ns_per_ms, config));
+}
+
+test "Recovery mode expires after 2 seconds" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    const now = nanoNow();
+
+    peer.enterRecoveryMode(now);
+    try std.testing.expect(peer.recovery_mode);
+
+    const after = now + 2100 * std.time.ns_per_ms;
+    _ = peer.shouldSendHeartbeat(after, .{});
+    try std.testing.expect(!peer.recovery_mode);
+}
+
+test "Disconnect auto-enters recovery mode" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    const config = Config{};
+    const now = nanoNow();
+    peer.last_recv_time = now;
+
+    const after_hb = now + @as(i64, config.heartbeat_timeout_ms) * std.time.ns_per_ms + 1;
+    _ = peer.updateState(after_hb, config);
+    try std.testing.expect(peer.state == .disconnected);
+    try std.testing.expect(peer.recovery_mode);
+}
+
 test "Peer state transitions" {
     var peer = Peer.init(crypto.generateKey(), .to_server);
     const config = Config{};
@@ -447,4 +723,16 @@ test "RTT estimation basic sanity" {
     peer.updateRtt(50_000);
     try std.testing.expect(peer.rttvar_us.? == 45_000);
     try std.testing.expect(peer.srtt_us.? == 95_937);
+}
+
+test "RTT reported via explicit reportRtt, not global send time" {
+    var peer = Peer.init(crypto.generateKey(), .to_server);
+    try std.testing.expect(peer.srtt_us == null);
+
+    peer.reportRtt(100_000);
+    try std.testing.expect(peer.srtt_us.? == 100_000);
+    try std.testing.expect(peer.rttvar_us.? == 50_000);
+
+    peer.reportRtt(120_000);
+    try std.testing.expect(peer.srtt_us.? == 102_500);
 }

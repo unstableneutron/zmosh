@@ -180,7 +180,7 @@ const Daemon = struct {
     pub fn handleInput(self: *Daemon, pty_fd: i32, payload: []const u8) !void {
         _ = self;
         if (payload.len > 0) {
-            _ = try posix.write(pty_fd, payload);
+            try writeAllFd(pty_fd, payload);
         }
     }
 
@@ -191,9 +191,9 @@ const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        if (payload.len != @sizeOf(ipc.Init)) return;
 
-        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        const init = std.mem.bytesToValue(ipc.Init, payload);
 
         // Serialize terminal state BEFORE resize to capture the pre-reflow
         // cursor position. We gate on has_pty_output so that the very first
@@ -203,7 +203,7 @@ const Daemon = struct {
         if (self.has_pty_output) {
             const cursor = &term.screens.active.cursor;
             std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
-            if (serializeTerminalState(self.alloc, term, resize.rows)) |term_output| {
+            if (serializeTerminalState(self.alloc, term, init.rows)) |term_output| {
                 std.log.debug("serialize terminal state", .{});
                 defer self.alloc.free(term_output);
                 // Only clear on re-init. For first Init on a fresh socket,
@@ -214,7 +214,16 @@ const Daemon = struct {
                     // is the first payload rendered after a resync request.
                     client.write_buf.clearRetainingCapacity();
                 }
-                ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
+                const snapshot_prefix = ipc.Snapshot{ .id = init.snapshot_id, .flags = 0 };
+                const snapshot_len = @sizeOf(ipc.Snapshot) + term_output.len;
+                const snapshot_payload = self.alloc.alloc(u8, snapshot_len) catch |err| {
+                    std.log.warn("failed to allocate snapshot payload err={s}", .{@errorName(err)});
+                    return;
+                };
+                defer self.alloc.free(snapshot_payload);
+                @memcpy(snapshot_payload[0..@sizeOf(ipc.Snapshot)], std.mem.asBytes(&snapshot_prefix));
+                @memcpy(snapshot_payload[@sizeOf(ipc.Snapshot)..], term_output);
+                ipc.appendMessage(self.alloc, &client.write_buf, .Snapshot, snapshot_payload) catch |err| {
                     std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
                 };
                 client.has_pending_output = true;
@@ -222,17 +231,17 @@ const Daemon = struct {
         }
 
         var ws: c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
+            .ws_row = init.rows,
+            .ws_col = init.cols,
             .ws_xpixel = 0,
             .ws_ypixel = 0,
         };
         _ = c.ioctl(pty_fd, c.TIOCSWINSZ, &ws);
-        try term.resize(self.alloc, resize.cols, resize.rows);
+        try term.resize(self.alloc, init.cols, init.rows);
 
         client.initialized = true;
 
-        std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+        std.log.debug("init resize rows={d} cols={d} snapshot_id={d}", .{ init.rows, init.cols, init.snapshot_id });
     }
 
     pub fn handleResize(self: *Daemon, pty_fd: i32, term: *ghostty_vt.Terminal, payload: []const u8) !void {
@@ -339,7 +348,7 @@ const Daemon = struct {
 
     pub fn handleRun(self: *Daemon, client: *Client, pty_fd: i32, payload: []const u8) !void {
         if (payload.len > 0) {
-            _ = try posix.write(pty_fd, payload);
+            try writeAllFd(pty_fd, payload);
         }
         try ipc.appendMessage(self.alloc, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
@@ -842,6 +851,15 @@ const HistoryFormat = enum(u8) {
     html = 2,
 };
 
+fn writeAllFd(fd: i32, data: []const u8) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const written = try posix.write(fd, data[off..]);
+        if (written == 0) return error.UnexpectedWriteZero;
+        off += written;
+    }
+}
+
 fn history(cfg: *Cfg, session_name: []const u8, format: HistoryFormat) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1141,7 +1159,8 @@ fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
 
     // Send init message with terminal size (buffered)
     const size = getTerminalSize(posix.STDOUT_FILENO);
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    const init = ipc.Init{ .rows = size.rows, .cols = size.cols, .snapshot_id = 0 };
+    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&init));
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
@@ -1479,7 +1498,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
-                        .Output, .Ack, .SessionEnd => {},
+                        .Output, .Ack, .SessionEnd, .Snapshot => {},
                     }
                 }
             }

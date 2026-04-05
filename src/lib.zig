@@ -7,8 +7,10 @@ const transport = @import("transport.zig");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_input_len = 1024 * 1024;
+const max_output_buf = 4 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
-const resync_cooldown_ns = 250 * std.time.ns_per_ms;
+const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
+const session_end_grace_ns = 2 * std.time.ns_per_s;
 
 // Silence all logging in library mode.
 pub const std_options: std.Options = .{
@@ -60,11 +62,20 @@ const Session = struct {
 
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.RecvState,
+    reliable_inbox: transport.ReliableInbox,
     output_recv: transport.OutputRecvState,
 
     last_ack_send_ns: i64,
     ack_dirty: bool,
     last_resync_request_ns: i64,
+    resync_backoff_ns: i64,
+    resync_pending: bool,
+    active_snapshot_id: ?u32,
+    current_output_epoch: u32,
+    pending_output_epoch: ?u32,
+    deferred_output_buf: std.ArrayList(u8),
+    session_end_deadline_ns: ?i64,
+    session_end_notified: bool,
 
     output_cb: OutputFn,
     state_cb: ?StateFn,
@@ -127,12 +138,14 @@ fn sendIpcReliable(s: *Session, tag: ipc.Tag, payload: []const u8, now: i64) !vo
 }
 
 fn requestResync(s: *Session, now: i64) !void {
-    if ((now - s.last_resync_request_ns) < resync_cooldown_ns) return;
+    if ((now - s.last_resync_request_ns) < s.resync_backoff_ns) return;
 
     var ctrl_buf: [8]u8 = undefined;
     const payload = transport.buildControl(.resync_request, &ctrl_buf);
     try sendReliablePayload(s, .control, payload, now);
     s.last_resync_request_ns = now;
+    s.resync_backoff_ns = @min(s.resync_backoff_ns * 2, std.time.ns_per_s);
+    s.resync_pending = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,11 +225,26 @@ export fn zmosh_connect(
         return null;
     };
     errdefer reliable_send.deinit();
+    var reliable_inbox = transport.ReliableInbox.init(std.heap.page_allocator) catch {
+        reliable_send.deinit();
+        udp_sock.close();
+        set_status(status, .err_socket);
+        return null;
+    };
+    errdefer reliable_inbox.deinit();
+    var deferred_output_buf = std.ArrayList(u8).initCapacity(std.heap.page_allocator, 4096) catch {
+        reliable_inbox.deinit();
+        reliable_send.deinit();
+        udp_sock.close();
+        set_status(status, .err_socket);
+        return null;
+    };
+    errdefer deferred_output_buf.deinit(std.heap.page_allocator);
 
     // Send Init with terminal size (reliable)
-    const size = ipc.Resize{ .rows = rows, .cols = cols };
+    const init = ipc.Init{ .rows = rows, .cols = cols, .snapshot_id = 0 };
     var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init), &init_buf);
 
     const init_packet = reliable_send.buildAndTrack(.reliable_ipc, init_ipc, 0, 0, now) catch {
         reliable_send.deinit();
@@ -241,10 +269,19 @@ export fn zmosh_connect(
         .config = .{},
         .reliable_send = reliable_send,
         .reliable_recv = .{},
+        .reliable_inbox = reliable_inbox,
         .output_recv = .{},
         .last_ack_send_ns = now,
         .ack_dirty = false,
         .last_resync_request_ns = 0,
+        .resync_backoff_ns = initial_resync_backoff_ns,
+        .resync_pending = false,
+        .active_snapshot_id = null,
+        .current_output_epoch = 0,
+        .pending_output_epoch = null,
+        .deferred_output_buf = deferred_output_buf,
+        .session_end_deadline_ns = null,
+        .session_end_notified = false,
         .output_cb = cb,
         .state_cb = state_cb,
         .end_cb = end_cb,
@@ -264,7 +301,7 @@ export fn zmosh_get_fd(session: ?*const Session) c_int {
 
 export fn zmosh_poll(session: ?*Session) Status {
     const s = session orelse return .err_null;
-    if (s.session_ended) return .ok;
+    if (s.session_ended and s.session_end_notified) return .ok;
 
     const now: i64 = @intCast(std.time.nanoTimestamp());
 
@@ -293,7 +330,7 @@ export fn zmosh_poll(session: ?*Session) Status {
         s.last_state = state;
         if (s.state_cb) |cb| cb(s.ctx, mapped);
     }
-    if (state == .dead) return .err_dead;
+    if (state == .dead and !s.session_ended) return .err_dead;
 
     // Recv loop — drain all pending datagrams
     while (true) {
@@ -305,43 +342,121 @@ export fn zmosh_poll(session: ?*Session) Status {
         const result = recv_result orelse break;
 
         const packet = transport.parsePacket(result.data) catch continue;
-        s.reliable_send.ack(packet.ack, packet.ack_bits);
+        if (s.reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
+            s.peer.reportRtt(rtt_us);
+        }
 
         switch (packet.channel) {
             .heartbeat => {},
-            .control => {
+            .control, .reliable_ipc => {
                 s.ack_dirty = true;
-                if (s.reliable_recv.onReliable(packet.seq) != .accept) continue;
-            },
-            .reliable_ipc => {
-                s.ack_dirty = true;
+                if (!s.reliable_inbox.accepts(packet.seq)) continue;
                 if (s.reliable_recv.onReliable(packet.seq) != .accept) continue;
 
-                var offset: usize = 0;
-                while (offset < packet.payload.len) {
-                    const remaining = packet.payload[offset..];
-                    const msg_len = ipc.expectedLength(remaining) orelse break;
-                    if (remaining.len < msg_len) break;
+                s.reliable_inbox.push(packet.seq, packet.channel, packet.payload) catch return .err_poll;
+                while (s.reliable_inbox.popReady()) |delivery| {
+                    defer delivery.deinit(std.heap.page_allocator);
 
-                    const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
-                    const payload = remaining[@sizeOf(ipc.Header)..msg_len];
+                    switch (delivery.channel) {
+                        .control => {
+                            const ctrl = transport.parseControl(delivery.payload) catch continue;
+                            _ = ctrl;
+                        },
+                        .reliable_ipc => {
+                            var offset: usize = 0;
+                            while (offset < delivery.payload.len) {
+                                const remaining = delivery.payload[offset..];
+                                const msg_len = ipc.expectedLength(remaining) orelse break;
+                                if (remaining.len < msg_len) break;
 
-                    if (hdr.tag == .Output and payload.len > 0) {
-                        s.output_cb(s.ctx, payload.ptr, @intCast(payload.len));
-                    } else if (hdr.tag == .SessionEnd) {
-                        s.session_ended = true;
-                        if (s.end_cb) |cb| cb(s.ctx);
-                        return .ok;
+                                const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+                                const payload = remaining[@sizeOf(ipc.Header)..msg_len];
+
+                                if (hdr.tag == .Output and payload.len > 0) {
+                                    s.active_snapshot_id = null;
+                                    s.deferred_output_buf.clearRetainingCapacity();
+                                    s.resync_backoff_ns = initial_resync_backoff_ns;
+                                    s.output_cb(s.ctx, payload.ptr, @intCast(payload.len));
+                                } else if (hdr.tag == .Snapshot and payload.len >= @sizeOf(ipc.Snapshot)) {
+                                    const snapshot = std.mem.bytesToValue(ipc.Snapshot, payload[0..@sizeOf(ipc.Snapshot)]);
+                                    const snapshot_bytes = payload[@sizeOf(ipc.Snapshot)..];
+                                    if (s.active_snapshot_id) |current| {
+                                        if (snapshot.id < current) {
+                                            offset += msg_len;
+                                            continue;
+                                        }
+                                        if (snapshot.id > current) {
+                                            s.deferred_output_buf.clearRetainingCapacity();
+                                            s.pending_output_epoch = null;
+                                        }
+                                    } else {
+                                        s.deferred_output_buf.clearRetainingCapacity();
+                                        s.pending_output_epoch = null;
+                                    }
+                                    if (s.pending_output_epoch) |pending_epoch| {
+                                        if (pending_epoch != snapshot.id) {
+                                            s.deferred_output_buf.clearRetainingCapacity();
+                                            s.pending_output_epoch = null;
+                                        }
+                                    }
+                                    s.active_snapshot_id = snapshot.id;
+                                    s.resync_pending = false;
+                                    s.current_output_epoch = snapshot.id;
+                                    s.resync_backoff_ns = initial_resync_backoff_ns;
+                                    if (snapshot_bytes.len > 0) {
+                                        s.output_cb(s.ctx, snapshot_bytes.ptr, @intCast(snapshot_bytes.len));
+                                    }
+                                    if (snapshot.isFinal()) {
+                                        s.active_snapshot_id = null;
+                                        if (s.deferred_output_buf.items.len > 0) {
+                                            s.output_cb(s.ctx, s.deferred_output_buf.items.ptr, @intCast(s.deferred_output_buf.items.len));
+                                            s.deferred_output_buf.clearRetainingCapacity();
+                                            s.pending_output_epoch = null;
+                                        }
+                                    }
+                                } else if (hdr.tag == .SessionEnd) {
+                                    s.session_ended = true;
+                                    s.session_end_deadline_ns = s.session_end_deadline_ns orelse now + session_end_grace_ns;
+                                }
+
+                                offset += msg_len;
+                            }
+                        },
+                        else => unreachable,
                     }
-
-                    offset += msg_len;
                 }
             },
             .output => {
                 switch (s.output_recv.onPacket(packet.seq)) {
                     .accept => {
                         if (packet.payload.len > 0) {
-                            s.output_cb(s.ctx, packet.payload.ptr, @intCast(packet.payload.len));
+                            if (packet.payload.len < @sizeOf(transport.OutputPrefix)) continue;
+                            const prefix = std.mem.bytesToValue(transport.OutputPrefix, packet.payload[0..@sizeOf(transport.OutputPrefix)]);
+                            if (prefix.epoch < s.current_output_epoch) continue;
+                            if (s.resync_pending and s.active_snapshot_id == null) {
+                                if (prefix.epoch <= s.current_output_epoch) continue;
+                                if (s.pending_output_epoch) |pending_epoch| {
+                                    if (pending_epoch != prefix.epoch) {
+                                        s.deferred_output_buf.clearRetainingCapacity();
+                                    }
+                                }
+                                s.pending_output_epoch = prefix.epoch;
+                            } else if (prefix.epoch > s.current_output_epoch and s.active_snapshot_id == null) {
+                                s.current_output_epoch = prefix.epoch;
+                            }
+                            const output_payload = packet.payload[@sizeOf(transport.OutputPrefix)..];
+                            if (s.active_snapshot_id != null) {
+                                if (s.deferred_output_buf.items.len + output_payload.len > max_output_buf) {
+                                    s.deferred_output_buf.clearRetainingCapacity();
+                                    requestResync(s, now) catch {};
+                                } else {
+                                    s.resync_backoff_ns = initial_resync_backoff_ns;
+                                    s.deferred_output_buf.appendSlice(std.heap.page_allocator, output_payload) catch return .err_poll;
+                                }
+                            } else {
+                                s.resync_backoff_ns = initial_resync_backoff_ns;
+                                s.output_cb(s.ctx, output_payload.ptr, @intCast(output_payload.len));
+                            }
                         }
                     },
                     .gap => {
@@ -350,6 +465,18 @@ export fn zmosh_poll(session: ?*Session) Status {
                     .duplicate, .stale => {},
                 }
             },
+        }
+    }
+
+    if (s.session_ended and
+        s.session_end_deadline_ns != null and
+        now >= s.session_end_deadline_ns.? and
+        s.active_snapshot_id == null and
+        s.deferred_output_buf.items.len == 0)
+    {
+        if (!s.session_end_notified) {
+            s.session_end_notified = true;
+            if (s.end_cb) |cb| cb(s.ctx);
         }
     }
 
@@ -382,12 +509,23 @@ export fn zmosh_resize(session: ?*Session, rows: u16, cols: u16) Status {
     return .ok;
 }
 
+export fn zmosh_network_changed(session: ?*Session) Status {
+    const s = session orelse return .err_null;
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    s.peer.enterRecoveryMode(now);
+    sendHeartbeat(s, now) catch {};
+    sendHeartbeat(s, now) catch {};
+    return .ok;
+}
+
 export fn zmosh_disconnect(session: ?*Session) void {
     const s = session orelse return;
 
     const now: i64 = @intCast(std.time.nanoTimestamp());
     sendIpcReliable(s, .Detach, "", now) catch {};
 
+    s.deferred_output_buf.deinit(std.heap.page_allocator);
+    s.reliable_inbox.deinit();
     s.reliable_send.deinit();
     s.udp_sock.close();
     std.heap.page_allocator.destroy(s);
