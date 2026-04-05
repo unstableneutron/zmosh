@@ -240,6 +240,18 @@ fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
     std.debug.print("zmx debug: " ++ fmt ++ "\n", args);
 }
 
+fn durationNsToMsForLog(ns: ?i64) i64 {
+    return if (ns) |value| @max(@as(i64, 1), @divFloor(value, std.time.ns_per_ms)) else -1;
+}
+
+fn countCandidatesByType(candidates: []const nat.Candidate, ctype: nat.CandidateType) usize {
+    var count: usize = 0;
+    for (candidates) |candidate| {
+        if (candidate.ctype == ctype) count += 1;
+    }
+    return count;
+}
+
 fn writeAllFd(fd: i32, bytes: []const u8) !void {
     const deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + 2 * std.time.ns_per_s;
     var off: usize = 0;
@@ -280,11 +292,8 @@ fn sendCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const nat.Can
 }
 
 fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.Allocator, candidate: nat.Candidate, max_candidates: usize) !void {
-    for (list.items) |existing| {
-        if (nat.isAddressEqual(existing.addr, candidate.addr)) return;
-    }
-    if (list.items.len >= max_candidates) return;
-    try list.append(alloc, candidate);
+    _ = max_candidates;
+    try nat.appendUniqueCandidate(list, alloc, candidate);
 }
 
 fn parseCandidatesLine(alloc: std.mem.Allocator, line: []const u8) !std.ArrayList(nat.Candidate) {
@@ -311,117 +320,10 @@ fn replaceCandidateSet(
     socket_family: u16,
     candidates: []const nat.Candidate,
 ) !void {
-    out.clearRetainingCapacity();
-    for (candidates) |candidate| {
-        if (!nat.shouldUseCandidate(socket_family, candidate.addr)) continue;
-        if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
-        try appendUniqueCandidate(out, alloc, candidate, 8);
-    }
-    nat.sortCandidatesByPriority(out.items);
+    try nat.replaceCandidateSet(alloc, out, socket_family, candidates, nat.max_candidates);
 }
 
-const CandidateReprobe = struct {
-    candidates: std.ArrayList(nat.Candidate) = .empty,
-    probe: nat.ProbeState = .{ .candidates = &[_]nat.Candidate{} },
-    next_probe_ns: i64 = 0,
-    persistent: bool = false,
-
-    fn deinit(self: *CandidateReprobe, alloc: std.mem.Allocator) void {
-        self.candidates.deinit(alloc);
-    }
-
-    fn clear(self: *CandidateReprobe) void {
-        self.candidates.clearRetainingCapacity();
-        self.probe.reset(self.candidates.items);
-        self.next_probe_ns = 0;
-        self.persistent = false;
-    }
-
-    fn start(
-        self: *CandidateReprobe,
-        alloc: std.mem.Allocator,
-        socket_family: u16,
-        refreshed_candidates: []const nat.Candidate,
-        now: i64,
-    ) !bool {
-        return self.startWithMode(alloc, socket_family, refreshed_candidates, now, false);
-    }
-
-    fn startPersistent(
-        self: *CandidateReprobe,
-        alloc: std.mem.Allocator,
-        socket_family: u16,
-        refreshed_candidates: []const nat.Candidate,
-        now: i64,
-    ) !bool {
-        return self.startWithMode(alloc, socket_family, refreshed_candidates, now, true);
-    }
-
-    fn startWithMode(
-        self: *CandidateReprobe,
-        alloc: std.mem.Allocator,
-        socket_family: u16,
-        refreshed_candidates: []const nat.Candidate,
-        now: i64,
-        persistent: bool,
-    ) !bool {
-        try replaceCandidateSet(alloc, &self.candidates, socket_family, refreshed_candidates);
-        self.probe.reset(self.candidates.items);
-        self.next_probe_ns = now;
-        self.persistent = persistent;
-        return self.candidates.items.len > 0;
-    }
-
-    fn isActive(self: *const CandidateReprobe) bool {
-        if (self.candidates.items.len == 0) return false;
-        if (self.probe.selected != null) return false;
-        return self.persistent or !self.probe.isComplete();
-    }
-
-    fn maybeNextProbeAddr(self: *CandidateReprobe, now: i64) ?std.net.Address {
-        if (!self.isActive()) return null;
-        if (now < self.next_probe_ns) return null;
-
-        var addr = self.probe.nextProbeAddr();
-        if (addr == null and self.persistent) {
-            self.probe.reset(self.candidates.items);
-            addr = self.probe.nextProbeAddr();
-        }
-
-        const next_addr = addr orelse return null;
-        self.next_probe_ns = now + @as(i64, self.probe.interval_ms) * std.time.ns_per_ms;
-        return next_addr;
-    }
-
-    fn pollDelayMs(self: *const CandidateReprobe, now: i64) ?i64 {
-        if (!self.isActive()) return null;
-        return @divFloor(@max(@as(i64, 0), self.next_probe_ns - now), std.time.ns_per_ms);
-    }
-
-    fn onAuthenticatedRecv(self: *CandidateReprobe, from: std.net.Address) bool {
-        return self.onAuthenticatedRecvMode(from, false);
-    }
-
-    fn onAuthenticatedRecvPeerReflexive(self: *CandidateReprobe, from: std.net.Address) bool {
-        return self.onAuthenticatedRecvMode(from, true);
-    }
-
-    fn onAuthenticatedRecvMode(self: *CandidateReprobe, from: std.net.Address, allow_peer_reflexive: bool) bool {
-        if (!self.isActive()) return false;
-
-        if (!allow_peer_reflexive) {
-            for (self.candidates.items) |candidate| {
-                if (nat.isAddressEqual(candidate.addr, from)) break;
-            } else {
-                return false;
-            }
-        }
-
-        const selected_before = self.probe.selected;
-        self.probe.onAuthenticatedRecv(from);
-        return selected_before == null and self.probe.selected != null;
-    }
-};
+const CandidateReprobe = nat.CandidateReprobe;
 
 fn handleUdpStandbyControlMessages(
     alloc: std.mem.Allocator,
@@ -474,58 +376,26 @@ fn gatherLocalCandidates(
     sock: *udp_mod.UdpSocket,
     socket_family: u16,
     stun_servers: []const []const u8,
+    stun_rtt_stats: *nat.TimingStats,
+    responsive_stun_servers: *usize,
 ) !std.ArrayList(nat.Candidate) {
-    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, 8);
+    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, nat.max_candidates);
     errdefer candidates.deinit(alloc);
 
     var stun_addrs = try nat.resolveStunServers(alloc, socket_family, stun_servers);
     defer stun_addrs.deinit(alloc);
 
-    for (stun_addrs.items) |stun_addr| {
-        var stun_state = nat.StunState.init(stun_addr);
-        stun_state.sendRequest(sock) catch {};
-        const deadline = @as(i64, @intCast(std.time.nanoTimestamp())) + 4 * std.time.ns_per_s;
+    var srflx = try nat.gatherServerReflexiveCandidates(alloc, sock, stun_addrs.items, nat.max_candidates);
+    defer srflx.deinit(alloc);
 
-        while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and stun_state.result == null and stun_state.waiting_response) {
-            var poll_fds = [_]posix.pollfd{.{ .fd = sock.getFd(), .events = posix.POLL.IN, .revents = 0 }};
-            _ = posix.poll(&poll_fds, 100) catch |err| {
-                if (err == error.Interrupted) continue;
-                break;
-            };
+    stun_rtt_stats.* = srflx.rtt_stats;
+    responsive_stun_servers.* = srflx.responsive_servers;
 
-            if (poll_fds[0].revents & posix.POLL.IN != 0) {
-                while (true) {
-                    var recv_buf: [1500]u8 = undefined;
-                    const raw = sock.recvRaw(&recv_buf) catch break;
-                    const packet = raw orelse break;
-                    if (nat.isStunPacket(stun_addr, packet.from, packet.data)) {
-                        _ = stun_state.handleResponse(packet.data) catch {};
-                    }
-                }
-            }
-
-            const now: i64 = @intCast(std.time.nanoTimestamp());
-            stun_state.maybeRetry(sock, now) catch {};
-        }
-
-        if (stun_state.result) |srflx| {
-            try appendUniqueCandidate(&candidates, alloc, srflx, 8);
-            break;
-        }
+    for (srflx.candidates.items) |candidate| {
+        try appendUniqueCandidate(&candidates, alloc, candidate, nat.max_candidates);
     }
 
-    nat.sortCandidatesByPriority(candidates.items);
-    return candidates;
-}
-
-fn gatherHostCandidatesOnly(
-    alloc: std.mem.Allocator,
-    sock: *udp_mod.UdpSocket,
-    socket_family: u16,
-) !std.ArrayList(nat.Candidate) {
-    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, 8);
-    errdefer candidates.deinit(alloc);
-    nat.sortCandidatesByPriority(candidates.items);
+    nat.sortAndTruncateCandidates(&candidates, nat.max_candidates);
     return candidates;
 }
 
@@ -582,8 +452,25 @@ fn probeAndSelectTransport(
 
     const pipes = session.ssh.?;
 
-    var local_candidates = try gatherLocalCandidates(alloc, udp_sock, fallback_addr.any.family, options.stun_servers);
+    var local_stun_rtt_stats: nat.TimingStats = .{};
+    var responsive_stun_servers: usize = 0;
+    var local_candidates = try gatherLocalCandidates(
+        alloc,
+        udp_sock,
+        fallback_addr.any.family,
+        options.stun_servers,
+        &local_stun_rtt_stats,
+        &responsive_stun_servers,
+    );
     defer local_candidates.deinit(alloc);
+
+    connectDebug(options.connect_debug, "local candidates host={d} srflx={d} responsive_stun={d} stun_rtt_ms(min/max)={d}/{d}", .{
+        countCandidatesByType(local_candidates.items, .host),
+        countCandidatesByType(local_candidates.items, .srflx),
+        responsive_stun_servers,
+        durationNsToMsForLog(local_stun_rtt_stats.min_ns),
+        durationNsToMsForLog(local_stun_rtt_stats.max_ns),
+    });
 
     try sendCandidates(pipes.stdin_fd, alloc, local_candidates.items);
 
@@ -593,26 +480,41 @@ fn probeAndSelectTransport(
     for (session.server_candidates.items) |candidate| {
         if (!nat.shouldUseCandidate(fallback_addr.any.family, candidate.addr)) continue;
         if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
-        try appendUniqueCandidate(&remote_candidates, alloc, candidate, 8);
+        try appendUniqueCandidate(&remote_candidates, alloc, candidate, nat.max_candidates);
     }
     try appendUniqueCandidate(&remote_candidates, alloc, .{
         .ctype = .host,
         .addr = fallback_addr,
         .source = "ssh_host",
-    }, 8);
+    }, nat.max_candidates);
 
-    nat.sortCandidatesByPriority(remote_candidates.items);
-    if (remote_candidates.items.len == 0) return .ssh;
+    nat.sortAndTruncateCandidates(&remote_candidates, nat.max_candidates);
+    if (remote_candidates.items.len == 0) {
+        connectDebug(options.connect_debug, "no usable remote UDP candidates; staying on SSH", .{});
+        return .ssh;
+    }
 
     var probe = nat.ProbeState{ .candidates = remote_candidates.items };
     var next_probe_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const probe_timeout_ns = @as(i64, clampProbeTimeoutMs(options.probe_timeout_ms)) * std.time.ns_per_ms;
+    const observed_rtt_ns = local_stun_rtt_stats.conservativeNs();
+    const adaptive_probe_timeout_ms = nat.adaptiveProbeTimeoutMs(clampProbeTimeoutMs(options.probe_timeout_ms), probe, observed_rtt_ns);
+    const probe_timeout_ns = @as(i64, adaptive_probe_timeout_ms) * std.time.ns_per_ms;
     const deadline = next_probe_ns + probe_timeout_ns;
+    const probe_start_ns = next_probe_ns;
+    var sent_attempts: usize = 0;
+    var authenticated_packets: usize = 0;
+
+    connectDebug(options.connect_debug, "probing remote candidates={d} timeout_ms={d} observed_stun_rtt_ms={d}", .{
+        remote_candidates.items.len,
+        adaptive_probe_timeout_ms,
+        durationNsToMsForLog(observed_rtt_ns),
+    });
 
     while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and !probe.isComplete()) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
         if (now >= next_probe_ns) {
             if (probe.nextProbeAddr()) |addr| {
+                sent_attempts += 1;
                 sendProbeHeartbeatTo(peer, udp_sock, addr, reliable_recv) catch |err| {
                     if (err != error.WouldBlock) return err;
                 };
@@ -621,7 +523,7 @@ fn probeAndSelectTransport(
         }
 
         const timeout_ns = @min(deadline - now, @max(@as(i64, 0), next_probe_ns - now));
-        const timeout_ms: i32 = @intCast(@divFloor(timeout_ns, std.time.ns_per_ms));
+        const timeout_ms: i32 = @intCast(@max(@as(i64, 0), @divFloor(timeout_ns, std.time.ns_per_ms)));
         var poll_fds = [_]posix.pollfd{.{ .fd = udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 }};
         _ = posix.poll(&poll_fds, timeout_ms) catch |err| {
             if (err == error.Interrupted) continue;
@@ -638,15 +540,20 @@ fn probeAndSelectTransport(
                 const decoded = try peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf);
                 peer.addr = prev_addr;
                 if (decoded == null) continue;
+                authenticated_packets += 1;
                 probe.onAuthenticatedRecv(raw.from);
             }
         }
     }
 
+    const elapsed_ms = @divFloor(@as(i64, @intCast(std.time.nanoTimestamp())) - probe_start_ns, std.time.ns_per_ms);
     if (probe.selected) |selected| {
+        connectDebug(options.connect_debug, "UDP probe selected={f} attempts={d} auth={d} elapsed_ms={d}", .{ selected, sent_attempts, authenticated_packets, elapsed_ms });
         peer.addr = selected;
         return .udp;
     }
+
+    connectDebug(options.connect_debug, "UDP probe fell back to SSH attempts={d} auth={d} elapsed_ms={d}", .{ sent_attempts, authenticated_packets, elapsed_ms });
     return .ssh;
 }
 
@@ -1456,6 +1363,7 @@ fn handleClientNetworkChange(
     sock: *udp_mod.UdpSocket,
     reliable_recv: *const transport.RecvState,
     standby_ssh: *?StandbySsh,
+    stun_servers: []const []const u8,
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     connect_debug: bool,
@@ -1464,11 +1372,30 @@ fn handleClientNetworkChange(
     connectDebug(connect_debug, "local network change detected", .{});
     peer.enterRecoveryMode(now);
 
-    var refreshed_candidates = gatherHostCandidatesOnly(alloc, sock, socket_family) catch |err| blk: {
-        connectDebug(connect_debug, "failed to refresh host candidates after network change: {s}", .{@errorName(err)});
+    var refreshed_stun_stats: nat.TimingStats = .{};
+    var responsive_stun_servers: usize = 0;
+    var refreshed_candidates = gatherLocalCandidates(
+        alloc,
+        sock,
+        socket_family,
+        stun_servers,
+        &refreshed_stun_stats,
+        &responsive_stun_servers,
+    ) catch |err| blk: {
+        connectDebug(connect_debug, "failed to refresh local candidates after network change: {s}", .{@errorName(err)});
         break :blk null;
     };
     defer if (refreshed_candidates) |*candidates| candidates.deinit(alloc);
+
+    if (refreshed_candidates) |candidates| {
+        connectDebug(connect_debug, "refreshed local candidates host={d} srflx={d} responsive_stun={d} stun_rtt_ms(min/max)={d}/{d}", .{
+            countCandidatesByType(candidates.items, .host),
+            countCandidatesByType(candidates.items, .srflx),
+            responsive_stun_servers,
+            durationNsToMsForLog(refreshed_stun_stats.min_ns),
+            durationNsToMsForLog(refreshed_stun_stats.max_ns),
+        });
+    }
 
     var sent_any_heartbeat = false;
     if (peer.addr) |last_peer_addr| {
@@ -1835,6 +1762,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &udp_sock,
                         &reliable_recv,
                         &standby_ssh,
+                        options.stun_servers,
                         &last_ack_send_ns,
                         &ack_dirty,
                         options.connect_debug,
@@ -1845,11 +1773,30 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     connectDebug(options.connect_debug, "local network change detected", .{});
                     peer.enterRecoveryMode(netmon_now);
 
-                    var refreshed_candidates = gatherHostCandidatesOnly(alloc, &udp_sock, socket_family) catch |err| blk: {
-                        connectDebug(options.connect_debug, "failed to refresh host candidates after network change: {s}", .{@errorName(err)});
+                    var refreshed_stun_stats: nat.TimingStats = .{};
+                    var responsive_stun_servers: usize = 0;
+                    var refreshed_candidates = gatherLocalCandidates(
+                        alloc,
+                        &udp_sock,
+                        socket_family,
+                        options.stun_servers,
+                        &refreshed_stun_stats,
+                        &responsive_stun_servers,
+                    ) catch |err| blk: {
+                        connectDebug(options.connect_debug, "failed to refresh local candidates after network change: {s}", .{@errorName(err)});
                         break :blk null;
                     };
                     defer if (refreshed_candidates) |*candidates| candidates.deinit(alloc);
+
+                    if (refreshed_candidates) |candidates| {
+                        connectDebug(options.connect_debug, "refreshed local candidates host={d} srflx={d} responsive_stun={d} stun_rtt_ms(min/max)={d}/{d}", .{
+                            countCandidatesByType(candidates.items, .host),
+                            countCandidatesByType(candidates.items, .srflx),
+                            responsive_stun_servers,
+                            durationNsToMsForLog(refreshed_stun_stats.min_ns),
+                            durationNsToMsForLog(refreshed_stun_stats.max_ns),
+                        });
+                    }
 
                     var sent_any_heartbeat = false;
                     if (peer.addr) |last_peer_addr| {
@@ -2484,7 +2431,8 @@ test "standby candidate reprobe filters reset and select refreshed path" {
 
     try std.testing.expect(try reprobe.start(alloc, posix.AF.INET, &refreshed, 0));
     try std.testing.expectEqual(@as(usize, 2), reprobe.candidates.items.len);
-    try std.testing.expect(reprobe.candidates.items[0].ctype == .srflx);
+    try std.testing.expect(reprobe.candidates.items[0].ctype == .host);
+    try std.testing.expect(reprobe.candidates.items[1].ctype == .srflx);
     try std.testing.expectEqual(@as(i64, 0), reprobe.pollDelayMs(0).?);
 
     const first = reprobe.maybeNextProbeAddr(0).?;
@@ -2512,15 +2460,15 @@ test "ssh candidate reprobe persists across probe cycles" {
 
     var probe_now: i64 = 0;
     var sends: usize = 0;
-    const total_probes = refreshed.len * @as(usize, reprobe.probe.attempts_per_candidate);
+    const total_probes = reprobe.candidates.items.len * @as(usize, reprobe.probe.attempts_per_candidate);
     while (sends < total_probes) : (sends += 1) {
         const addr = reprobe.maybeNextProbeAddr(probe_now).?;
-        try std.testing.expect(nat.isAddressEqual(addr, refreshed[sends % refreshed.len].addr));
+        try std.testing.expect(nat.isAddressEqual(addr, reprobe.candidates.items[sends % reprobe.candidates.items.len].addr));
         probe_now += @as(i64, reprobe.probe.interval_ms) * std.time.ns_per_ms;
     }
 
     const restarted = reprobe.maybeNextProbeAddr(probe_now).?;
-    try std.testing.expect(nat.isAddressEqual(restarted, refreshed[0].addr));
+    try std.testing.expect(nat.isAddressEqual(restarted, reprobe.candidates.items[0].addr));
 }
 
 test "ssh candidate reprobe accepts authenticated peer-reflexive path" {

@@ -136,6 +136,18 @@ fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
     std.debug.print("zmx serve debug: " ++ fmt ++ "\n", args);
 }
 
+fn durationNsToMsForLog(ns: ?i64) i64 {
+    return if (ns) |value| @max(@as(i64, 1), @divFloor(value, std.time.ns_per_ms)) else -1;
+}
+
+fn countCandidatesByType(candidates: []const nat.Candidate, ctype: nat.CandidateType) usize {
+    var count: usize = 0;
+    for (candidates) |candidate| {
+        if (candidate.ctype == ctype) count += 1;
+    }
+    return count;
+}
+
 fn readLineFd(fd: i32, buf: []u8) ![]const u8 {
     var total: usize = 0;
     while (total < buf.len) {
@@ -230,11 +242,8 @@ fn parseProbeTimeoutNs() i64 {
 }
 
 fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.Allocator, candidate: nat.Candidate, max_candidates: usize) !void {
-    for (list.items) |existing| {
-        if (nat.isAddressEqual(existing.addr, candidate.addr)) return;
-    }
-    if (list.items.len >= max_candidates) return;
-    try list.append(alloc, candidate);
+    _ = max_candidates;
+    try nat.appendUniqueCandidate(list, alloc, candidate);
 }
 
 fn findServerReflexiveCandidate(candidates: []const nat.Candidate) ?std.net.Address {
@@ -343,44 +352,23 @@ fn gatherLocalCandidates(
     sock: *udp.UdpSocket,
     socket_family: u16,
     stun_servers: []const std.net.Address,
+    stun_rtt_stats: *nat.TimingStats,
+    responsive_stun_servers: *usize,
 ) !std.ArrayList(nat.Candidate) {
-    var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, 8);
+    var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, nat.max_candidates);
     errdefer out.deinit(alloc);
 
-    for (stun_servers) |server_addr| {
-        var stun_state = nat.StunState.init(server_addr);
-        stun_state.sendRequest(sock) catch {};
+    var srflx = try nat.gatherServerReflexiveCandidates(alloc, sock, stun_servers, nat.max_candidates);
+    defer srflx.deinit(alloc);
 
-        const deadline = @as(i64, @intCast(std.time.nanoTimestamp())) + 4 * std.time.ns_per_s;
-        while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and stun_state.result == null and stun_state.waiting_response) {
-            var poll_fds = [_]posix.pollfd{.{ .fd = sock.getFd(), .events = posix.POLL.IN, .revents = 0 }};
-            _ = posix.poll(&poll_fds, 100) catch |err| {
-                if (err == error.Interrupted) continue;
-                break;
-            };
+    stun_rtt_stats.* = srflx.rtt_stats;
+    responsive_stun_servers.* = srflx.responsive_servers;
 
-            if (poll_fds[0].revents & posix.POLL.IN != 0) {
-                while (true) {
-                    var recv_buf: [1500]u8 = undefined;
-                    const raw = sock.recvRaw(&recv_buf) catch break;
-                    const packet = raw orelse break;
-                    if (nat.isStunPacket(server_addr, packet.from, packet.data)) {
-                        _ = stun_state.handleResponse(packet.data) catch {};
-                    }
-                }
-            }
-
-            const now: i64 = @intCast(std.time.nanoTimestamp());
-            stun_state.maybeRetry(sock, now) catch {};
-        }
-
-        if (stun_state.result) |srflx| {
-            try appendUniqueCandidate(&out, alloc, srflx, 8);
-            break;
-        }
+    for (srflx.candidates.items) |candidate| {
+        try appendUniqueCandidate(&out, alloc, candidate, nat.max_candidates);
     }
 
-    nat.sortCandidatesByPriority(out.items);
+    nat.sortAndTruncateCandidates(&out, nat.max_candidates);
     return out;
 }
 
@@ -415,6 +403,20 @@ fn sendProbeHeartbeatTo(
     peer.send_seq += 1;
 }
 
+fn startGatewayCandidateReprobe(
+    reprobe: *nat.CandidateReprobe,
+    alloc: std.mem.Allocator,
+    socket_family: u16,
+    candidates: []const nat.Candidate,
+    now: i64,
+    persistent: bool,
+) !bool {
+    return if (persistent)
+        reprobe.startPersistent(alloc, socket_family, candidates, now)
+    else
+        reprobe.start(alloc, socket_family, candidates, now);
+}
+
 fn probeCandidates(
     alloc: std.mem.Allocator,
     sock: *udp.UdpSocket,
@@ -423,25 +425,39 @@ fn probeCandidates(
     candidates: []const nat.Candidate,
     reliable_recv: *const transport.RecvState,
     probe_timeout_ns: i64,
+    observed_rtt_ns: ?i64,
+    connect_debug: bool,
 ) !?std.net.Address {
     var filtered = try std.ArrayList(nat.Candidate).initCapacity(alloc, candidates.len);
     defer filtered.deinit(alloc);
     for (candidates) |cand| {
         if (!nat.shouldUseCandidate(socket_family, cand.addr)) continue;
         if (!nat.isCandidateAddressUsable(cand.addr)) continue;
-        try appendUniqueCandidate(&filtered, alloc, cand, 8);
+        try appendUniqueCandidate(&filtered, alloc, cand, nat.max_candidates);
     }
-    nat.sortCandidatesByPriority(filtered.items);
+    nat.sortAndTruncateCandidates(&filtered, nat.max_candidates);
     if (filtered.items.len == 0) return null;
 
     var probe = nat.ProbeState{ .candidates = filtered.items };
     var next_probe_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const deadline = next_probe_ns + probe_timeout_ns;
+    const requested_timeout_ms: u32 = @intCast(@divFloor(probe_timeout_ns, std.time.ns_per_ms));
+    const adaptive_probe_timeout_ms = nat.adaptiveProbeTimeoutMs(requested_timeout_ms, probe, observed_rtt_ns);
+    const deadline = next_probe_ns + @as(i64, adaptive_probe_timeout_ms) * std.time.ns_per_ms;
+    const probe_start_ns = next_probe_ns;
+    var sent_attempts: usize = 0;
+    var authenticated_packets: usize = 0;
+
+    connectDebug(connect_debug, "bootstrap probe candidates={d} timeout_ms={d} observed_rtt_ms={d}", .{
+        filtered.items.len,
+        adaptive_probe_timeout_ms,
+        durationNsToMsForLog(observed_rtt_ns),
+    });
 
     while (@as(i64, @intCast(std.time.nanoTimestamp())) < deadline and !probe.isComplete()) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
         if (now >= next_probe_ns) {
             if (probe.nextProbeAddr()) |addr| {
+                sent_attempts += 1;
                 sendProbeHeartbeatTo(peer, sock, addr, reliable_recv) catch |err| {
                     if (err != error.WouldBlock) return err;
                 };
@@ -450,7 +466,7 @@ fn probeCandidates(
         }
 
         const timeout_ns = @min(deadline - now, @max(@as(i64, 0), next_probe_ns - now));
-        const timeout_ms: i32 = @intCast(@divFloor(timeout_ns, std.time.ns_per_ms));
+        const timeout_ms: i32 = @intCast(@max(@as(i64, 0), @divFloor(timeout_ns, std.time.ns_per_ms)));
         var poll_fds = [_]posix.pollfd{.{ .fd = sock.getFd(), .events = posix.POLL.IN, .revents = 0 }};
         _ = posix.poll(&poll_fds, timeout_ms) catch |err| {
             if (err == error.Interrupted) continue;
@@ -467,12 +483,20 @@ fn probeCandidates(
                 const decoded = try peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf);
                 peer.addr = old_addr;
                 if (decoded == null) continue;
+                authenticated_packets += 1;
                 probe.onAuthenticatedRecv(raw.from);
             }
         }
     }
 
-    return probe.selected;
+    const elapsed_ms = @divFloor(@as(i64, @intCast(std.time.nanoTimestamp())) - probe_start_ns, std.time.ns_per_ms);
+    if (probe.selected) |selected| {
+        connectDebug(connect_debug, "bootstrap probe selected={f} attempts={d} auth={d} elapsed_ms={d}", .{ selected, sent_attempts, authenticated_packets, elapsed_ms });
+        return selected;
+    }
+
+    connectDebug(connect_debug, "bootstrap probe timed out attempts={d} auth={d} elapsed_ms={d}", .{ sent_attempts, authenticated_packets, elapsed_ms });
+    return null;
 }
 
 pub const Gateway = struct {
@@ -513,6 +537,8 @@ pub const Gateway = struct {
     last_stun_keepalive_ns: i64,
     last_srflx: ?std.net.Address,
     ssh_udp_probe_authenticated_ns: ?i64,
+    candidate_reprobe: nat.CandidateReprobe,
+    connect_debug: bool,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -556,6 +582,8 @@ pub const Gateway = struct {
         var standby_ssh: ?StandbySsh = null;
         errdefer if (standby_ssh) |*standby| standby.deinit(alloc, true);
         var initial_srflx: ?std.net.Address = null;
+        var initial_stun_rtt_stats: nat.TimingStats = .{};
+        var responsive_stun_servers: usize = 0;
         const bootstrap_v2 = std.mem.eql(u8, posix.getenv("ZMX_BOOTSTRAP") orelse "", "2");
 
         connectDebug(connect_debug, "bootstrap_v2={} probe_timeout_ms={d} stun_servers={d}", .{
@@ -565,9 +593,24 @@ pub const Gateway = struct {
         });
 
         if (bootstrap_v2) {
-            var local_candidates = try gatherLocalCandidates(alloc, &udp_sock, socket_family, stun_servers.items);
+            var local_candidates = try gatherLocalCandidates(
+                alloc,
+                &udp_sock,
+                socket_family,
+                stun_servers.items,
+                &initial_stun_rtt_stats,
+                &responsive_stun_servers,
+            );
             defer local_candidates.deinit(alloc);
             initial_srflx = findServerReflexiveCandidate(local_candidates.items);
+
+            connectDebug(connect_debug, "local candidates host={d} srflx={d} responsive_stun={d} stun_rtt_ms(min/max)={d}/{d}", .{
+                countCandidatesByType(local_candidates.items, .host),
+                countCandidatesByType(local_candidates.items, .srflx),
+                responsive_stun_servers,
+                durationNsToMsForLog(initial_stun_rtt_stats.min_ns),
+                durationNsToMsForLog(initial_stun_rtt_stats.max_ns),
+            });
 
             try sendConnect2(posix.STDOUT_FILENO, alloc, key, udp_sock.bound_port, local_candidates.items);
 
@@ -577,7 +620,17 @@ pub const Gateway = struct {
             defer remote_candidates.deinit(alloc);
 
             var probe_recv = transport.RecvState{};
-            if (try probeCandidates(alloc, &udp_sock, &peer, socket_family, remote_candidates.items, &probe_recv, probe_timeout_ns)) |selected| {
+            if (try probeCandidates(
+                alloc,
+                &udp_sock,
+                &peer,
+                socket_family,
+                remote_candidates.items,
+                &probe_recv,
+                probe_timeout_ns,
+                initial_stun_rtt_stats.conservativeNs(),
+                connect_debug,
+            )) |selected| {
                 peer.addr = selected;
             }
 
@@ -656,6 +709,8 @@ pub const Gateway = struct {
             .last_stun_keepalive_ns = now,
             .last_srflx = initial_srflx,
             .ssh_udp_probe_authenticated_ns = null,
+            .candidate_reprobe = .{},
+            .connect_debug = connect_debug,
         };
     }
 
@@ -691,6 +746,12 @@ pub const Gateway = struct {
 
             try self.flushRetransmits(now);
             try self.flushOutput(now, false);
+
+            if (self.candidate_reprobe.maybeNextProbeAddr(now)) |addr| {
+                sendProbeHeartbeatTo(&self.peer, &self.udp_sock, addr, &self.reliable_recv) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+            }
 
             if (self.peer.addr != null) {
                 if (self.ack_dirty and (now - self.last_ack_send_ns >= ack_delay_ns)) {
@@ -758,6 +819,9 @@ pub const Gateway = struct {
 
                     var decrypt_buf: [9000]u8 = undefined;
                     const decoded = try self.peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf) orelse continue;
+                    if (self.candidate_reprobe.onAuthenticatedRecv(raw.from)) {
+                        connectDebug(self.connect_debug, "authenticated refreshed client UDP path {f}", .{raw.from});
+                    }
                     try self.handleTransportPacket(decoded, now);
                 }
             }
@@ -831,14 +895,14 @@ pub const Gateway = struct {
     }
 
     fn sendStandbyCandidateRefresh(self: *Gateway, srflx_addr: std.net.Address) !void {
-        var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_family, 8);
+        var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_family, nat.max_candidates);
         defer refreshed.deinit(self.alloc);
         try appendUniqueCandidate(&refreshed, self.alloc, .{
             .ctype = .srflx,
             .addr = srflx_addr,
             .source = "stun",
-        }, 8);
-        nat.sortCandidatesByPriority(refreshed.items);
+        }, nat.max_candidates);
+        nat.sortAndTruncateCandidates(&refreshed, nat.max_candidates);
 
         if (self.standby_ssh) |*standby| {
             const send_result = switch (standby.control) {
@@ -890,6 +954,7 @@ pub const Gateway = struct {
     fn noteSshUdpProbeAuthenticated(self: *Gateway, now: i64) void {
         self.ssh_udp_probe_authenticated_ns = now;
         self.peer.enterRecoveryMode(now);
+        self.candidate_reprobe.clear();
     }
 
     fn beginUdpRepromotion(self: *Gateway) u32 {
@@ -898,6 +963,7 @@ pub const Gateway = struct {
         self.output_epoch = self.snapshot_id;
         self.output_coalesce_buf.clearRetainingCapacity();
         self.ssh_udp_probe_authenticated_ns = null;
+        self.candidate_reprobe.clear();
         return self.snapshot_id;
     }
 
@@ -916,16 +982,25 @@ pub const Gateway = struct {
     fn handleStandbyCandidateRefresh(self: *Gateway, candidates: []const nat.Candidate, now: i64) !void {
         self.peer.enterRecoveryMode(now);
 
-        var filtered = try std.ArrayList(nat.Candidate).initCapacity(self.alloc, candidates.len);
-        defer filtered.deinit(self.alloc);
-        for (candidates) |candidate| {
-            if (!nat.shouldUseCandidate(self.socket_family, candidate.addr)) continue;
-            if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
-            try appendUniqueCandidate(&filtered, self.alloc, candidate, 8);
+        const started = try startGatewayCandidateReprobe(
+            &self.candidate_reprobe,
+            self.alloc,
+            self.socket_family,
+            candidates,
+            now,
+            self.transport == .ssh,
+        );
+        if (!started) {
+            connectDebug(self.connect_debug, "ignored candidate refresh with no usable client addresses", .{});
+            return;
         }
-        nat.sortCandidatesByPriority(filtered.items);
 
-        for (filtered.items) |candidate| {
+        connectDebug(self.connect_debug, "armed client candidate reprobe transport={s} candidates={d}", .{
+            if (self.transport == .udp) "udp" else "ssh",
+            self.candidate_reprobe.candidates.items.len,
+        });
+
+        for (self.candidate_reprobe.candidates.items) |candidate| {
             var burst: u8 = 0;
             while (burst < standby_candidate_probe_burst) : (burst += 1) {
                 sendProbeHeartbeatTo(&self.peer, &self.udp_sock, candidate.addr, &self.reliable_recv) catch |err| {
@@ -934,6 +1009,7 @@ pub const Gateway = struct {
                 };
             }
         }
+        self.candidate_reprobe.next_probe_ns = now + @as(i64, self.candidate_reprobe.probe.interval_ms) * std.time.ns_per_ms;
     }
 
     fn handleStandbySshEvents(self: *Gateway, revents: i16) !bool {
@@ -1112,6 +1188,7 @@ pub const Gateway = struct {
         self.ssh_baseline_pending = true;
         self.last_resync_request_ns = 0;
         self.ssh_udp_probe_authenticated_ns = null;
+        self.candidate_reprobe.clear();
 
         var pending_replay = try self.reliable_send.collectPendingReliableFrames(self.alloc);
         defer pending_replay.deinit(self.alloc);
@@ -1154,6 +1231,11 @@ pub const Gateway = struct {
                     if (err != error.WouldBlock) return err;
                 };
             }
+            if (self.candidate_reprobe.maybeNextProbeAddr(now)) |addr| {
+                sendProbeHeartbeatTo(&self.peer, &self.udp_sock, addr, &self.reliable_recv) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+            }
             if (self.ssh_udp_probe_authenticated_ns != null and self.peer.addr != null and self.peer.shouldSendHeartbeat(now, self.config)) {
                 self.sendHeartbeat(now) catch |err| {
                     if (err != error.NoPeerAddress and err != error.WouldBlock) return err;
@@ -1177,7 +1259,11 @@ pub const Gateway = struct {
                 poll_count += 1;
             }
 
-            _ = posix.poll(poll_fds[0..poll_count], 250) catch |err| {
+            var poll_timeout: i64 = 250;
+            if (self.candidate_reprobe.pollDelayMs(now)) |reprobe_ms| {
+                poll_timeout = @min(poll_timeout, reprobe_ms);
+            }
+            _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
                 if (err == error.Interrupted) continue;
                 return err;
             };
@@ -1238,6 +1324,9 @@ pub const Gateway = struct {
 
                     var decrypt_buf: [9000]u8 = undefined;
                     const decoded = try self.peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf) orelse continue;
+                    if (self.candidate_reprobe.onAuthenticatedRecvPeerReflexive(raw.from)) {
+                        connectDebug(self.connect_debug, "authenticated revived UDP path {f}", .{raw.from});
+                    }
                     self.noteSshUdpProbeAuthenticated(@intCast(std.time.nanoTimestamp()));
 
                     const packet = transport.parsePacket(decoded) catch {
@@ -1447,6 +1536,10 @@ pub const Gateway = struct {
 
         const heartbeat_ms = @divFloor(self.peer.heartbeatDelayNs(now, self.config), std.time.ns_per_ms);
         timeout = @min(timeout, heartbeat_ms);
+
+        if (self.candidate_reprobe.pollDelayMs(now)) |reprobe_ms| {
+            timeout = @min(timeout, reprobe_ms);
+        }
 
         if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
 
@@ -1873,6 +1966,7 @@ pub const Gateway = struct {
         self.reliable_send.deinit();
         self.transport.deinit(self.alloc);
         self.stun_servers.deinit(self.alloc);
+        self.candidate_reprobe.deinit(self.alloc);
     }
 };
 
@@ -1975,6 +2069,7 @@ test "udp re-promotion reserves a fresh baseline snapshot" {
     gateway.output_epoch = 3;
     gateway.output_coalesce_buf = .empty;
     gateway.ssh_udp_probe_authenticated_ns = 99;
+    gateway.candidate_reprobe = .{};
 
     const snapshot_id = gateway.beginUdpRepromotion();
     try std.testing.expectEqual(@as(u32, 8), snapshot_id);
@@ -1987,10 +2082,35 @@ test "ssh UDP probe authentication re-enters recovery mode" {
     var gateway: Gateway = undefined;
     gateway.peer = udp.Peer.init([_]u8{0} ** crypto.key_length, .to_client);
     gateway.ssh_udp_probe_authenticated_ns = null;
+    gateway.candidate_reprobe = .{};
 
     gateway.noteSshUdpProbeAuthenticated(123);
     try std.testing.expectEqual(@as(?i64, 123), gateway.ssh_udp_probe_authenticated_ns);
     try std.testing.expect(gateway.peer.recovery_mode);
+}
+
+test "gateway candidate reprobe mode follows transport intent" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var reprobe: nat.CandidateReprobe = .{};
+    defer reprobe.deinit(alloc);
+
+    var candidates = [_]nat.Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 10, 0, 0, 20 }, 60000), .source = "host" },
+        .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60001), .source = "stun" },
+    };
+
+    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, posix.AF.INET, &candidates, 55, false));
+    try std.testing.expect(!reprobe.persistent);
+    try std.testing.expectEqual(@as(i64, 55), reprobe.next_probe_ns);
+    try std.testing.expect(reprobe.maybeNextProbeAddr(55) != null);
+
+    reprobe.clear();
+    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, posix.AF.INET, &candidates, 77, true));
+    try std.testing.expect(reprobe.persistent);
+    try std.testing.expectEqual(@as(i64, 77), reprobe.next_probe_ns);
 }
 
 test "ssh promotion replay drops stale snapshots but preserves later reliable IPC" {
