@@ -400,7 +400,6 @@ fn shouldIgnoreInterface(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "docker") or
         std.mem.startsWith(u8, name, "br-") or
         std.mem.startsWith(u8, name, "veth") or
-        std.mem.startsWith(u8, name, "utun") or
         std.mem.startsWith(u8, name, "bridge");
 }
 
@@ -902,6 +901,13 @@ test "probe state progresses and locks on auth recv" {
     state.onAuthenticatedRecv(std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 61000));
     try std.testing.expect(state.isComplete());
     try std.testing.expect(state.nextProbeAddr() == null);
+}
+
+test "interface family filtering keeps utun overlays" {
+    try std.testing.expect(!shouldIgnoreInterface("utun4"));
+    try std.testing.expect(shouldIgnoreInterface("docker0"));
+    try std.testing.expect(shouldIgnoreInterface("bridge100"));
+    try std.testing.expect(isCandidateAddressUsable(std.net.Address.initIp4(.{ 100, 70, 1, 2 }, 41641)));
 }
 
 test "candidate payload json round trip" {

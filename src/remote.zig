@@ -18,6 +18,8 @@ const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
 const detach_drain_ns = 2 * std.time.ns_per_s;
 const session_end_grace_ns = 2 * std.time.ns_per_s;
 const ssh_fallback_after_disconnected_ns = 10 * std.time.ns_per_s;
+const udp_switch_request_retry_ns = 500 * std.time.ns_per_ms;
+const udp_switch_request_timeout_ns = 2 * std.time.ns_per_s;
 const use_ack_timeout_ms: i32 = 2000;
 const max_standby_buffer = 8 * 1024;
 const initial_ssh_snapshot_id: u32 = 0x8000_0000;
@@ -822,6 +824,12 @@ fn appendSshIpc(write_buf: *std.ArrayList(u8), alloc: std.mem.Allocator, tag: ip
     try ipc.appendMessage(alloc, write_buf, tag, payload);
 }
 
+fn queueUdpSwitchRequest(write_buf: *std.ArrayList(u8), alloc: std.mem.Allocator, pending_udp_switch: *PendingUdpSwitch, now: i64) !void {
+    var req_buf: [8]u8 = undefined;
+    try appendSshIpc(write_buf, alloc, .TransportSwitchRequest, ipc.encodeTransportSwitchRequest(&req_buf, .udp));
+    pending_udp_switch.arm(now);
+}
+
 fn flushWriteBuffer(fd: i32, write_buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
     if (write_buf.items.len == 0) return;
     const written = posix.write(fd, write_buf.items) catch |err| {
@@ -895,6 +903,30 @@ fn shouldSwitchToStandbySsh(now: i64, disconnected_since_ns: ?i64, standby_ssh: 
 fn shouldBufferSshOutput(active_snapshot_id: ?u32, awaiting_ssh_snapshot: bool) bool {
     return active_snapshot_id != null or awaiting_ssh_snapshot;
 }
+
+const PendingUdpSwitch = struct {
+    active: bool = false,
+    started_at_ns: i64 = 0,
+    last_request_ns: i64 = 0,
+
+    fn arm(self: *PendingUdpSwitch, now: i64) void {
+        if (!self.active) self.started_at_ns = now;
+        self.active = true;
+        self.last_request_ns = now;
+    }
+
+    fn clear(self: *PendingUdpSwitch) void {
+        self.* = .{};
+    }
+
+    fn shouldRetry(self: *const PendingUdpSwitch, now: i64) bool {
+        return self.active and !self.timedOut(now) and (now - self.last_request_ns) >= udp_switch_request_retry_ns;
+    }
+
+    fn timedOut(self: *const PendingUdpSwitch, now: i64) bool {
+        return self.active and (now - self.started_at_ns) >= udp_switch_request_timeout_ns;
+    }
+};
 
 fn reserveSshSnapshotId(next_ssh_snapshot_id: *u32, awaiting_ssh_snapshot: *bool, expected_ssh_snapshot_id: *?u32) u32 {
     const snapshot_id = next_ssh_snapshot_id.*;
@@ -1530,7 +1562,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var ssh_write_closed = false;
     var current_output_epoch: u32 = 0;
     var pending_output_epoch: ?u32 = null;
-    var pending_udp_switch = false;
+    var pending_udp_switch: PendingUdpSwitch = .{};
 
     const size = getTerminalSize();
     const init_snapshot_id = switch (transport_mode) {
@@ -1553,6 +1585,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     while (true) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
+        if (transport_mode == .ssh and pending_udp_switch.timedOut(now)) {
+            connectDebug(options.connect_debug, "timed out pending UDP switch request", .{});
+            pending_udp_switch.clear();
+        } else if (transport_mode == .ssh and pending_udp_switch.shouldRetry(now) and !ssh_write_closed and transport_mode.ssh.write_buf.items.len == 0) {
+            try queueUdpSwitchRequest(&transport_mode.ssh.write_buf, alloc, &pending_udp_switch, now);
+            connectDebug(options.connect_debug, "retrying pending UDP switch request", .{});
+        }
+
         if (sigwinch_received.swap(false, .acq_rel)) {
             const new_size = getTerminalSize();
             switch (transport_mode) {
@@ -1560,7 +1600,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Resize, std.mem.asBytes(&new_size), now);
                 },
                 .ssh => |*s| {
-                    if (!pending_udp_switch) {
+                    if (!pending_udp_switch.active) {
                         try appendSshIpc(&s.write_buf, alloc, .Resize, std.mem.asBytes(&new_size));
                     }
                 },
@@ -1609,7 +1649,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &was_disconnected,
                         &pending_ssh_detach,
                     )) {
-                        pending_udp_switch = false;
+                        pending_udp_switch.clear();
                         _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
                         continue;
                     }
@@ -1654,12 +1694,12 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 ))) {
                     continue;
                 }
-                pending_udp_switch = false;
+                pending_udp_switch.clear();
                 _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
                 continue;
             }
         } else if (transport_mode == .ssh) {
-            if (!pending_udp_switch) {
+            if (!pending_udp_switch.active) {
                 if (ssh_reprobe.maybeNextProbeAddr(now)) |addr| {
                     sendProbeHeartbeatTo(&peer, &udp_sock, addr, &reliable_recv) catch |err| {
                         if (err != error.WouldBlock) return err;
@@ -1822,7 +1862,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         try appendSshIpc(&s.write_buf, alloc, .CandidateRefresh, json_payload);
                     }
 
-                    pending_udp_switch = false;
+                    pending_udp_switch.clear();
                     _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, netmon_now);
                 },
             }
@@ -1915,7 +1955,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
-        if (!pending_ssh_detach and !(transport_mode == .ssh and pending_udp_switch) and poll_fds[stdin_idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+        if (!pending_ssh_detach and !(transport_mode == .ssh and pending_udp_switch.active) and poll_fds[stdin_idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
             var input_raw: [4096]u8 = undefined;
             const n_opt: ?usize = posix.read(posix.STDIN_FILENO, &input_raw) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk null;
@@ -2127,11 +2167,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                 connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                 continue;
                             }
-                            if (msg.header.tag == .TransportSwitchAck and pending_udp_switch) {
+                            if (msg.header.tag == .TransportSwitchAck and pending_udp_switch.active) {
                                 const ack = ipc.parseTransportSwitchAck(msg.payload) catch continue;
                                 if (ack.mode == .udp) {
                                     udp_repromotion_snapshot_id = ack.baseline_snapshot_id;
-                                    pending_udp_switch = false;
+                                    pending_udp_switch.clear();
                                     break :ssh_messages;
                                 }
                                 continue;
@@ -2160,11 +2200,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                         connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                         continue;
                                     }
-                                    if (msg.header.tag == .TransportSwitchAck and pending_udp_switch) {
+                                    if (msg.header.tag == .TransportSwitchAck and pending_udp_switch.active) {
                                         const ack = ipc.parseTransportSwitchAck(msg.payload) catch continue;
                                         if (ack.mode == .udp) {
                                             udp_repromotion_snapshot_id = ack.baseline_snapshot_id;
-                                            pending_udp_switch = false;
+                                            pending_udp_switch.clear();
                                             break :ssh_messages;
                                         }
                                         continue;
@@ -2193,10 +2233,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 if (ssh_reprobe.onAuthenticatedRecvPeerReflexive(raw.from)) {
                     peer.addr = raw.from;
                     connectDebug(options.connect_debug, "authenticated revived UDP path {f}", .{raw.from});
-                    if (!pending_udp_switch and transport_mode == .ssh and !ssh_write_closed) {
-                        var req_buf: [8]u8 = undefined;
-                        try appendSshIpc(&transport_mode.ssh.write_buf, alloc, .TransportSwitchRequest, ipc.encodeTransportSwitchRequest(&req_buf, .udp));
-                        pending_udp_switch = true;
+                    if (!pending_udp_switch.active and transport_mode == .ssh and !ssh_write_closed) {
+                        try queueUdpSwitchRequest(&transport_mode.ssh.write_buf, alloc, &pending_udp_switch, now);
                     }
                 }
             }
@@ -2332,6 +2370,24 @@ test "ssh standby fallback threshold" {
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 5 * std.time.ns_per_s, standby));
     try std.testing.expect(shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, standby));
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, null));
+}
+
+test "pending UDP switch retries and times out cleanly" {
+    var pending: PendingUdpSwitch = .{};
+
+    pending.arm(100);
+    try std.testing.expect(pending.active);
+    try std.testing.expect(!pending.shouldRetry(100 + udp_switch_request_retry_ns - 1));
+    try std.testing.expect(pending.shouldRetry(100 + udp_switch_request_retry_ns));
+
+    pending.arm(100 + udp_switch_request_retry_ns);
+    try std.testing.expectEqual(@as(i64, 100), pending.started_at_ns);
+    try std.testing.expectEqual(@as(i64, 100 + udp_switch_request_retry_ns), pending.last_request_ns);
+    try std.testing.expect(!pending.timedOut(100 + udp_switch_request_timeout_ns - 1));
+    try std.testing.expect(pending.timedOut(100 + udp_switch_request_timeout_ns));
+
+    pending.clear();
+    try std.testing.expect(!pending.active);
 }
 
 test "ssh output is buffered until the snapshot baseline is ready" {

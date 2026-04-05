@@ -224,6 +224,7 @@ pub const Client = struct {
 
         try self.maybeRetryPublic(now_ns);
         try self.maybeRetryMap(now_ns);
+        self.maybeFinishRequestCycle();
 
         return changed;
     }
@@ -245,12 +246,10 @@ pub const Client = struct {
                 },
                 .map_udp => |mapping| {
                     self.map_request.markDone();
-                    if (mapping.result_code == .success) {
-                        self.request_cycle_active = false;
-                    }
                     changed = self.state.applyMapping(mapping, now_ns) or changed;
                 },
             }
+            self.maybeFinishRequestCycle();
         }
         return changed;
     }
@@ -313,6 +312,12 @@ pub const Client = struct {
         const interval_ms = retry_schedule_ms[self.map_request.retry_idx];
         self.map_request.retry_idx += 1;
         self.map_request.next_retry_ns = now_ns + @as(i64, interval_ms) * std.time.ns_per_ms;
+    }
+
+    fn maybeFinishRequestCycle(self: *Client) void {
+        if (!self.request_cycle_active) return;
+        if (self.public_request.awaiting or self.map_request.awaiting) return;
+        self.request_cycle_active = false;
     }
 
     fn hasPendingWork(self: *const Client) bool {
@@ -610,4 +615,43 @@ test "mapping state schedules refresh and expires" {
     try std.testing.expect(!state.maybeExpire(1_000 + 119 * std.time.ns_per_s));
     try std.testing.expect(state.maybeExpire(1_000 + 120 * std.time.ns_per_s));
     try std.testing.expect(state.currentCandidate() == null);
+}
+
+test "request cycle clears after retry exhaustion and can restart" {
+    var sock = try udp.UdpSocket.bindEphemeral(posix.AF.INET);
+    defer sock.close();
+
+    var client = Client{
+        .sock = sock,
+        .gateway = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, nat_pmp_port),
+        .internal_port = sock.bound_port,
+        .state = .{
+            .public_ip = .{ 198, 51, 100, 20 },
+            .external_port = 45678,
+            .lifetime_seconds = 120,
+            .refresh_at_ns = 1_000,
+            .expires_at_ns = 120 * std.time.ns_per_s,
+        },
+        .public_request = .{
+            .awaiting = true,
+            .retry_idx = retry_schedule_ms.len,
+            .next_retry_ns = 1_000,
+        },
+        .map_request = .{
+            .awaiting = true,
+            .retry_idx = retry_schedule_ms.len,
+            .next_retry_ns = 1_000,
+        },
+        .request_cycle_active = true,
+    };
+
+    _ = try client.service(1_000);
+    try std.testing.expect(!client.request_cycle_active);
+    try std.testing.expect(!client.public_request.awaiting);
+    try std.testing.expect(!client.map_request.awaiting);
+
+    _ = try client.service(1_001);
+    try std.testing.expect(client.request_cycle_active);
+    try std.testing.expect(client.public_request.awaiting);
+    try std.testing.expect(client.map_request.awaiting);
 }

@@ -16,6 +16,7 @@ const max_control_line = 4096;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 500 * std.time.ns_per_ms;
 const stun_keepalive_ns = 25 * std.time.ns_per_s;
+const ssh_udp_probe_authorization_ns = 5 * std.time.ns_per_s;
 const shutdown_drain_ns = 2 * std.time.ns_per_s;
 const default_probe_timeout_ms: u32 = 3000;
 const standby_candidate_probe_burst: u8 = 2;
@@ -139,6 +140,12 @@ fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
 
 fn durationNsToMsForLog(ns: ?i64) i64 {
     return if (ns) |value| @max(@as(i64, 1), @divFloor(value, std.time.ns_per_ms)) else -1;
+}
+
+fn isFreshSshUdpProbeAuthorization(authenticated_ns: ?i64, now: i64) bool {
+    const proof_ns = authenticated_ns orelse return false;
+    if (now < proof_ns) return false;
+    return (now - proof_ns) <= ssh_udp_probe_authorization_ns;
 }
 
 fn countCandidatesByType(candidates: []const nat.Candidate, ctype: nat.CandidateType) usize {
@@ -1344,6 +1351,9 @@ pub const Gateway = struct {
             }
 
             const now: i64 = @intCast(std.time.nanoTimestamp());
+            if (!isFreshSshUdpProbeAuthorization(self.ssh_udp_probe_authenticated_ns, now)) {
+                self.ssh_udp_probe_authenticated_ns = null;
+            }
             if (self.stun_servers.items.len > 0 and (now - self.last_stun_keepalive_ns) >= stun_keepalive_ns) {
                 self.sendStunKeepalive(now) catch |err| {
                     if (err != error.WouldBlock) return err;
@@ -1360,7 +1370,7 @@ pub const Gateway = struct {
                     if (err != error.WouldBlock) return err;
                 };
             }
-            if (self.ssh_udp_probe_authenticated_ns != null and self.peer.addr != null and self.peer.shouldSendHeartbeat(now, self.config)) {
+            if (isFreshSshUdpProbeAuthorization(self.ssh_udp_probe_authenticated_ns, now) and self.peer.addr != null and self.peer.shouldSendHeartbeat(now, self.config)) {
                 self.sendHeartbeat(now) catch |err| {
                     if (err != error.NoPeerAddress and err != error.WouldBlock) return err;
                 };
@@ -1421,7 +1431,7 @@ pub const Gateway = struct {
             }
             if (!self.running) break;
 
-            if (try self.drainBufferedSshMessages()) {
+            if (try self.drainBufferedSshMessages(now)) {
                 return self.run();
             }
             if (!self.running) break;
@@ -1445,7 +1455,7 @@ pub const Gateway = struct {
                         break;
                     }
 
-                    if (try self.drainBufferedSshMessages()) {
+                    if (try self.drainBufferedSshMessages(now)) {
                         return self.run();
                     }
                     if (!self.running) break;
@@ -1569,12 +1579,12 @@ pub const Gateway = struct {
         }
     }
 
-    fn drainBufferedSshMessages(self: *Gateway) !bool {
+    fn drainBufferedSshMessages(self: *Gateway, now: i64) !bool {
         var ssh = &self.transport.ssh;
         while (ssh.read_buf.next()) |msg| {
             if (msg.header.tag == .TransportSwitchRequest) {
                 const request = ipc.parseTransportSwitchRequest(msg.payload) catch continue;
-                if (request.mode != .udp or self.ssh_udp_probe_authenticated_ns == null) continue;
+                if (request.mode != .udp or !isFreshSshUdpProbeAuthorization(self.ssh_udp_probe_authenticated_ns, now)) continue;
 
                 const snapshot_id = self.beginUdpRepromotion();
                 var ack_buf: [8]u8 = undefined;
@@ -2208,7 +2218,6 @@ test "stun datagrams are ignored without active stun state" {
     try std.testing.expect(!gateway.handleStunDatagram(from, &pkt));
 }
 
-
 test "srflx mapping slots only refresh on material set changes" {
     var slots = [_]?std.net.Address{
         std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60000),
@@ -2246,6 +2255,12 @@ test "ssh UDP probe authentication re-enters recovery mode" {
     gateway.noteSshUdpProbeAuthenticated(123);
     try std.testing.expectEqual(@as(?i64, 123), gateway.ssh_udp_probe_authenticated_ns);
     try std.testing.expect(gateway.peer.recovery_mode);
+}
+
+test "ssh UDP proof freshness requires recent authentication" {
+    try std.testing.expect(isFreshSshUdpProbeAuthorization(100, 100 + ssh_udp_probe_authorization_ns));
+    try std.testing.expect(!isFreshSshUdpProbeAuthorization(100, 100 + ssh_udp_probe_authorization_ns + 1));
+    try std.testing.expect(!isFreshSshUdpProbeAuthorization(null, 100));
 }
 
 test "gateway candidate reprobe mode follows transport intent" {
