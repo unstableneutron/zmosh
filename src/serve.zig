@@ -209,17 +209,6 @@ fn sendCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const nat.Can
     try writeAllFd(fd, line.items);
 }
 
-fn socketFamily(fd: i32) !u16 {
-    var src_addr: posix.sockaddr.storage = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    try posix.getsockname(fd, @ptrCast(&src_addr), &addr_len);
-
-    var addr: std.net.Address = std.mem.zeroes(std.net.Address);
-    const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
-    @memcpy(std.mem.asBytes(&addr)[0..len], std.mem.asBytes(&src_addr)[0..len]);
-    return addr.any.family;
-}
-
 fn loadStunServerSpecs(alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
     var specs = try std.ArrayList([]const u8).initCapacity(alloc, 4);
     if (posix.getenv("ZMX_STUN_SERVERS")) |raw| {
@@ -417,13 +406,13 @@ fn buildSshPromotionReplayPayload(alloc: std.mem.Allocator, channel: transport.C
 fn gatherLocalCandidates(
     alloc: std.mem.Allocator,
     sock: *udp.UdpSocket,
-    socket_family: u16,
+    socket_capability: udp.SocketCapability,
     stun_servers: []const std.net.Address,
     stun_rtt_stats: *nat.TimingStats,
     responsive_stun_servers: *usize,
     initial_srflx_mappings: ?*std.ArrayList(nat.ServerReflexiveMapping),
 ) !std.ArrayList(nat.Candidate) {
-    var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, nat.max_candidates);
+    var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_capability, nat.max_candidates);
     errdefer out.deinit(alloc);
 
     var srflx = try nat.gatherServerReflexiveCandidates(alloc, sock, stun_servers, nat.max_candidates);
@@ -478,22 +467,22 @@ fn sendProbeHeartbeatTo(
 fn startGatewayCandidateReprobe(
     reprobe: *nat.CandidateReprobe,
     alloc: std.mem.Allocator,
-    socket_family: u16,
+    socket_capability: udp.SocketCapability,
     candidates: []const nat.Candidate,
     now: i64,
     persistent: bool,
 ) !bool {
     return if (persistent)
-        reprobe.startPersistent(alloc, socket_family, candidates, now)
+        reprobe.startPersistent(alloc, socket_capability, candidates, now)
     else
-        reprobe.start(alloc, socket_family, candidates, now);
+        reprobe.start(alloc, socket_capability, candidates, now);
 }
 
 fn probeCandidates(
     alloc: std.mem.Allocator,
     sock: *udp.UdpSocket,
     peer: *udp.Peer,
-    socket_family: u16,
+    socket_capability: udp.SocketCapability,
     candidates: []const nat.Candidate,
     reliable_recv: *const transport.RecvState,
     probe_timeout_ns: i64,
@@ -503,7 +492,7 @@ fn probeCandidates(
     var filtered = try std.ArrayList(nat.Candidate).initCapacity(alloc, candidates.len);
     defer filtered.deinit(alloc);
     for (candidates) |cand| {
-        if (!nat.shouldUseCandidate(socket_family, cand.addr)) continue;
+        if (!nat.shouldUseCandidate(socket_capability, cand.addr)) continue;
         if (!nat.isCandidateAddressUsable(cand.addr)) continue;
         try appendUniqueCandidate(&filtered, alloc, cand, nat.max_candidates);
     }
@@ -585,7 +574,7 @@ pub const Gateway = struct {
     reliable_inbox: transport.ReliableInbox,
     output_seq: u32,
     output_epoch: u32,
-    socket_family: u16,
+    socket_capability: udp.SocketCapability,
 
     config: udp.Config,
     running: bool,
@@ -639,13 +628,13 @@ pub const Gateway = struct {
         const key = crypto.generateKey();
         const encoded_key = crypto.keyToBase64(key);
 
-        const socket_family = try socketFamily(udp_sock.getFd());
+        const socket_capability = udp_sock.capability;
         const connect_debug = parseConnectDebugEnv();
         const probe_timeout_ns = parseProbeTimeoutNs();
 
         var stun_specs = try loadStunServerSpecs(alloc);
         defer stun_specs.deinit(alloc);
-        var stun_servers = try nat.resolveStunServers(alloc, socket_family, stun_specs.items);
+        var stun_servers = try nat.resolveStunServers(alloc, socket_capability, stun_specs.items);
         errdefer stun_servers.deinit(alloc);
 
         // Initialize peer (we send to_client, recv to_server from remote client)
@@ -676,7 +665,7 @@ pub const Gateway = struct {
             var local_candidates = try gatherLocalCandidates(
                 alloc,
                 &udp_sock,
-                socket_family,
+                socket_capability,
                 stun_servers.items,
                 &initial_stun_rtt_stats,
                 &responsive_stun_servers,
@@ -710,7 +699,7 @@ pub const Gateway = struct {
                 alloc,
                 &udp_sock,
                 &peer,
-                socket_family,
+                socket_capability,
                 remote_candidates.items,
                 &probe_recv,
                 probe_timeout_ns,
@@ -777,7 +766,7 @@ pub const Gateway = struct {
             .reliable_inbox = reliable_inbox,
             .output_seq = 1,
             .output_epoch = 0,
-            .socket_family = socket_family,
+            .socket_capability = socket_capability,
             .config = config,
             .running = true,
             .last_output_flush_ns = now,
@@ -1000,7 +989,7 @@ pub const Gateway = struct {
     }
 
     fn buildCurrentCandidateSet(self: *Gateway) !std.ArrayList(nat.Candidate) {
-        var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_family, nat.max_candidates);
+        var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_capability, nat.max_candidates);
         errdefer refreshed.deinit(self.alloc);
 
         try appendCurrentSrflxCandidates(&refreshed, self.alloc, self.srflx_mappings.items);
@@ -1115,7 +1104,7 @@ pub const Gateway = struct {
         const started = try startGatewayCandidateReprobe(
             &self.candidate_reprobe,
             self.alloc,
-            self.socket_family,
+            self.socket_capability,
             candidates,
             now,
             self.transport == .ssh,
@@ -2276,13 +2265,13 @@ test "gateway candidate reprobe mode follows transport intent" {
         .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60001), .source = "stun" },
     };
 
-    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, posix.AF.INET, &candidates, 55, false));
+    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, .ipv4_only, &candidates, 55, false));
     try std.testing.expect(!reprobe.persistent);
     try std.testing.expectEqual(@as(i64, 55), reprobe.next_probe_ns);
     try std.testing.expect(reprobe.maybeNextProbeAddr(55) != null);
 
     reprobe.clear();
-    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, posix.AF.INET, &candidates, 77, true));
+    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, .ipv4_only, &candidates, 77, true));
     try std.testing.expect(reprobe.persistent);
     try std.testing.expectEqual(@as(i64, 77), reprobe.next_probe_ns);
 }

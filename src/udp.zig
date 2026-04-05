@@ -97,7 +97,7 @@ fn shouldIgnoreDualStackToggleFailure() bool {
     return builtin.os.tag != .linux;
 }
 
-fn disableIpv6Only(fd: posix.socket_t) !void {
+fn configureIpv6Capability(fd: posix.socket_t) !SocketCapability {
     const v6only: i32 = 0;
     posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6V6OnlySockOpt(), std.mem.asBytes(&v6only)) catch |err| {
         if (!shouldIgnoreDualStackToggleFailure()) return err;
@@ -105,12 +105,28 @@ fn disableIpv6Only(fd: posix.socket_t) !void {
             @tagName(builtin.os.tag),
             @errorName(err),
         });
+        return .ipv6_only;
     };
+    return .dual_stack;
 }
+
+pub const SocketCapability = enum {
+    ipv4_only,
+    ipv6_only,
+    dual_stack,
+
+    pub fn family(self: SocketCapability) u16 {
+        return switch (self) {
+            .ipv4_only => posix.AF.INET,
+            .ipv6_only, .dual_stack => posix.AF.INET6,
+        };
+    }
+};
 
 pub const UdpSocket = struct {
     fd: i32,
     bound_port: u16,
+    capability: SocketCapability,
 
     /// Bind a non-blocking UDP socket to the first available port in [port_start, port_end).
     /// Uses AF.INET6 with dual-stack when possible, falling back to AF.INET.
@@ -129,9 +145,10 @@ pub const UdpSocket = struct {
         );
         errdefer posix.close(fd);
 
-        if (family == posix.AF.INET6) {
-            try disableIpv6Only(fd);
-        }
+        const capability: SocketCapability = if (family == posix.AF.INET6)
+            try configureIpv6Capability(fd)
+        else
+            .ipv4_only;
 
         const bind_addr = if (family == posix.AF.INET6)
             std.net.Address.initIp6(.{0} ** 16, 0, 0, 0)
@@ -140,7 +157,7 @@ pub const UdpSocket = struct {
 
         try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
 
-        var sock = UdpSocket{ .fd = fd, .bound_port = 0 };
+        var sock = UdpSocket{ .fd = fd, .bound_port = 0, .capability = capability };
         sock.bound_port = try sock.getLocalPort();
         return sock;
     }
@@ -152,8 +169,9 @@ pub const UdpSocket = struct {
             0,
         ) catch return null;
 
+        var capability: SocketCapability = if (family == posix.AF.INET6) .ipv6_only else .ipv4_only;
         if (set_v6only) {
-            disableIpv6Only(fd) catch {
+            capability = configureIpv6Capability(fd) catch {
                 posix.close(fd);
                 return null;
             };
@@ -170,7 +188,7 @@ pub const UdpSocket = struct {
                 port,
                 if (family == posix.AF.INET6) "inet6" else "inet",
             });
-            return .{ .fd = fd, .bound_port = port };
+            return .{ .fd = fd, .bound_port = port, .capability = capability };
         }
 
         posix.close(fd);
@@ -458,6 +476,12 @@ test "ipv6 v6only sockopt matches platform" {
     try std.testing.expectEqual(expected, ipv6V6OnlySockOpt());
 }
 
+test "socket capability reports bound family" {
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), SocketCapability.ipv4_only.family());
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), SocketCapability.ipv6_only.family());
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), SocketCapability.dual_stack.family());
+}
+
 /// Bind a non-blocking IPv4-only UDP socket on loopback for testing.
 fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
@@ -466,7 +490,7 @@ fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
     while (port < port_end) : (port += 1) {
         const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
         posix.bind(fd, &addr.any, addr.getOsSockLen()) catch continue;
-        return .{ .fd = fd, .bound_port = port };
+        return .{ .fd = fd, .bound_port = port, .capability = .ipv4_only };
     }
     posix.close(fd);
     return error.AddressInUse;

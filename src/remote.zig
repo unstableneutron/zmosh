@@ -319,10 +319,10 @@ fn sendFramedCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const n
 fn replaceCandidateSet(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(nat.Candidate),
-    socket_family: u16,
+    socket_capability: udp_mod.SocketCapability,
     candidates: []const nat.Candidate,
 ) !void {
-    try nat.replaceCandidateSet(alloc, out, socket_family, candidates, nat.max_candidates);
+    try nat.replaceCandidateSet(alloc, out, socket_capability, candidates, nat.max_candidates);
 }
 
 const CandidateReprobe = nat.CandidateReprobe;
@@ -331,7 +331,7 @@ fn handleUdpStandbyControlMessages(
     alloc: std.mem.Allocator,
     standby_buffer: *std.ArrayList(u8),
     server_candidates: *std.ArrayList(nat.Candidate),
-    socket_family: u16,
+    socket_capability: udp_mod.SocketCapability,
     reprobe: *CandidateReprobe,
     peer: *udp_mod.Peer,
     now: i64,
@@ -349,8 +349,8 @@ fn handleUdpStandbyControlMessages(
             };
             defer candidates.deinit(alloc);
 
-            try replaceCandidateSet(alloc, server_candidates, socket_family, candidates.items);
-            if (try reprobe.start(alloc, socket_family, server_candidates.items, now)) {
+            try replaceCandidateSet(alloc, server_candidates, socket_capability, candidates.items);
+            if (try reprobe.start(alloc, socket_capability, server_candidates.items, now)) {
                 peer.enterRecoveryMode(now);
                 connectDebug(connect_debug, "received refreshed server candidates over standby SSH ({d})", .{reprobe.candidates.items.len});
             } else {
@@ -376,15 +376,15 @@ fn resolveHostAddress(alloc: std.mem.Allocator, host: []const u8, port: u16) !st
 fn gatherLocalCandidates(
     alloc: std.mem.Allocator,
     sock: *udp_mod.UdpSocket,
-    socket_family: u16,
+    socket_capability: udp_mod.SocketCapability,
     stun_servers: []const []const u8,
     stun_rtt_stats: *nat.TimingStats,
     responsive_stun_servers: *usize,
 ) !std.ArrayList(nat.Candidate) {
-    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, nat.max_candidates);
+    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_capability, nat.max_candidates);
     errdefer candidates.deinit(alloc);
 
-    var stun_addrs = try nat.resolveStunServers(alloc, socket_family, stun_servers);
+    var stun_addrs = try nat.resolveStunServers(alloc, socket_capability, stun_servers);
     defer stun_addrs.deinit(alloc);
 
     var srflx = try nat.gatherServerReflexiveCandidates(alloc, sock, stun_addrs.items, nat.max_candidates);
@@ -459,7 +459,7 @@ fn probeAndSelectTransport(
     var local_candidates = try gatherLocalCandidates(
         alloc,
         udp_sock,
-        fallback_addr.any.family,
+        udp_sock.capability,
         options.stun_servers,
         &local_stun_rtt_stats,
         &responsive_stun_servers,
@@ -480,7 +480,7 @@ fn probeAndSelectTransport(
     defer remote_candidates.deinit(alloc);
 
     for (session.server_candidates.items) |candidate| {
-        if (!nat.shouldUseCandidate(fallback_addr.any.family, candidate.addr)) continue;
+        if (!nat.shouldUseCandidate(udp_sock.capability, candidate.addr)) continue;
         if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
         try appendUniqueCandidate(&remote_candidates, alloc, candidate, nat.max_candidates);
     }
@@ -1390,7 +1390,7 @@ fn applyUdpRepromotionState(
 
 fn handleClientNetworkChange(
     alloc: std.mem.Allocator,
-    socket_family: u16,
+    socket_capability: udp_mod.SocketCapability,
     peer: *udp_mod.Peer,
     sock: *udp_mod.UdpSocket,
     reliable_recv: *const transport.RecvState,
@@ -1409,7 +1409,7 @@ fn handleClientNetworkChange(
     var refreshed_candidates = gatherLocalCandidates(
         alloc,
         sock,
-        socket_family,
+        socket_capability,
         stun_servers,
         &refreshed_stun_stats,
         &responsive_stun_servers,
@@ -1467,9 +1467,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     defer session.deinit(alloc);
 
     const fallback_addr = try resolveHostAddress(alloc, session.host, session.port);
-    const socket_family = fallback_addr.any.family;
 
-    var udp_sock = try udp_mod.UdpSocket.bindEphemeral(socket_family);
+    var udp_sock = try udp_mod.UdpSocket.bindEphemeral(fallback_addr.any.family);
+    const socket_capability = udp_sock.capability;
     defer udp_sock.close();
 
     var peer = udp_mod.Peer.init(session.key, .to_server);
@@ -1578,7 +1578,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         },
         .ssh => |*s| {
             try appendSshIpc(&s.write_buf, alloc, .Init, std.mem.asBytes(&init));
-            _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, last_ack_send_ns);
+            _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, last_ack_send_ns);
         },
     }
 
@@ -1650,7 +1650,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &pending_ssh_detach,
                     )) {
                         pending_udp_switch.clear();
-                        _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
+                        _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
                         continue;
                     }
 
@@ -1695,7 +1695,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     continue;
                 }
                 pending_udp_switch.clear();
-                _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
+                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
                 continue;
             }
         } else if (transport_mode == .ssh) {
@@ -1797,7 +1797,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 .udp => {
                     handleClientNetworkChange(
                         alloc,
-                        socket_family,
+                        socket_capability,
                         &peer,
                         &udp_sock,
                         &reliable_recv,
@@ -1818,7 +1818,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     var refreshed_candidates = gatherLocalCandidates(
                         alloc,
                         &udp_sock,
-                        socket_family,
+                        socket_capability,
                         options.stun_servers,
                         &refreshed_stun_stats,
                         &responsive_stun_servers,
@@ -1863,7 +1863,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     }
 
                     pending_udp_switch.clear();
-                    _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, netmon_now);
+                    _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, netmon_now);
                 },
             }
         }
@@ -1918,7 +1918,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         }
 
                         if (standby_ssh != null) {
-                            try handleUdpStandbyControlMessages(alloc, buffer, &session.server_candidates, socket_family, &standby_reprobe, &peer, now, options.connect_debug);
+                            try handleUdpStandbyControlMessages(alloc, buffer, &session.server_candidates, socket_capability, &standby_reprobe, &peer, now, options.connect_debug);
                         }
                     },
                     .framed => |*read_buf| {
@@ -1938,8 +1938,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                     if (msg.header.tag != .CandidateRefresh) continue;
                                     var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                     defer candidates.deinit(alloc);
-                                    try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
-                                    if (try standby_reprobe.start(alloc, socket_family, session.server_candidates.items, now)) {
+                                    try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items);
+                                    if (try standby_reprobe.start(alloc, socket_capability, session.server_candidates.items, now)) {
                                         peer.enterRecoveryMode(now);
                                         connectDebug(options.connect_debug, "received refreshed server candidates over framed standby SSH ({d})", .{standby_reprobe.candidates.items.len});
                                     }
@@ -2162,8 +2162,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                             if (msg.header.tag == .CandidateRefresh) {
                                 var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                 defer candidates.deinit(alloc);
-                                try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
-                                _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
+                                try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items);
+                                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
                                 connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                 continue;
                             }
@@ -2195,8 +2195,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                     if (msg.header.tag == .CandidateRefresh) {
                                         var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                         defer candidates.deinit(alloc);
-                                        try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
-                                        _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
+                                        try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items);
+                                        _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
                                         connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                         continue;
                                     }
@@ -2485,7 +2485,7 @@ test "standby candidate reprobe filters reset and select refreshed path" {
     var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
 
-    try std.testing.expect(try reprobe.start(alloc, posix.AF.INET, &refreshed, 0));
+    try std.testing.expect(try reprobe.start(alloc, .ipv4_only, &refreshed, 0));
     try std.testing.expectEqual(@as(usize, 2), reprobe.candidates.items.len);
     try std.testing.expect(reprobe.candidates.items[0].ctype == .host);
     try std.testing.expect(reprobe.candidates.items[1].ctype == .srflx);
@@ -2512,7 +2512,7 @@ test "ssh candidate reprobe persists across probe cycles" {
     var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
 
-    try std.testing.expect(try reprobe.startPersistent(alloc, posix.AF.INET, &refreshed, 0));
+    try std.testing.expect(try reprobe.startPersistent(alloc, .ipv4_only, &refreshed, 0));
 
     var probe_now: i64 = 0;
     var sends: usize = 0;
@@ -2539,7 +2539,7 @@ test "ssh candidate reprobe accepts authenticated peer-reflexive path" {
     var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
 
-    try std.testing.expect(try reprobe.startPersistent(alloc, posix.AF.INET, &refreshed, 0));
+    try std.testing.expect(try reprobe.startPersistent(alloc, .ipv4_only, &refreshed, 0));
     _ = reprobe.maybeNextProbeAddr(0).?;
 
     const peer_reflexive = std.net.Address.initIp4(.{ 203, 0, 113, 44 }, 62044);
@@ -2565,7 +2565,7 @@ test "standby UDP control messages start refreshed reprobes" {
     var server_candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, 1);
     defer server_candidates.deinit(alloc);
 
-    try handleUdpStandbyControlMessages(alloc, &standby_buffer, &server_candidates, posix.AF.INET, &reprobe, &peer, 123, false);
+    try handleUdpStandbyControlMessages(alloc, &standby_buffer, &server_candidates, .ipv4_only, &reprobe, &peer, 123, false);
     try std.testing.expectEqual(@as(usize, 0), standby_buffer.items.len);
     try std.testing.expectEqual(@as(usize, 1), reprobe.candidates.items.len);
     try std.testing.expectEqual(@as(usize, 1), server_candidates.items.len);

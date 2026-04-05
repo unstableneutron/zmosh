@@ -168,7 +168,7 @@ pub fn parseHostPort(spec: []const u8, default_port: u16) !HostPort {
 
 pub fn resolveStunServers(
     alloc: std.mem.Allocator,
-    socket_family: u16,
+    socket_capability: udp.SocketCapability,
     server_specs: []const []const u8,
 ) !std.ArrayList(std.net.Address) {
     const specs = if (server_specs.len > 0) server_specs else default_stun_servers[0..];
@@ -182,7 +182,7 @@ pub fn resolveStunServers(
         defer list.deinit();
 
         for (list.addrs) |addr| {
-            if (!shouldUseCandidate(socket_family, addr)) continue;
+            if (!shouldUseCandidate(socket_capability, addr)) continue;
 
             var exists = false;
             for (out.items) |existing| {
@@ -390,10 +390,12 @@ fn parseXorMappedAddress(value: []const u8, txn_id: [12]u8) !Candidate {
     return error.InvalidStunResponse;
 }
 
-pub fn shouldUseCandidate(socket_family: u16, addr: std.net.Address) bool {
-    if (socket_family == posix.AF.INET and addr.any.family != posix.AF.INET) return false;
-    if (socket_family == posix.AF.INET6 and addr.any.family != posix.AF.INET and addr.any.family != posix.AF.INET6) return false;
-    return addr.any.family == posix.AF.INET or addr.any.family == posix.AF.INET6;
+pub fn shouldUseCandidate(socket_capability: udp.SocketCapability, addr: std.net.Address) bool {
+    return switch (socket_capability) {
+        .ipv4_only => addr.any.family == posix.AF.INET,
+        .ipv6_only => addr.any.family == posix.AF.INET6,
+        .dual_stack => addr.any.family == posix.AF.INET or addr.any.family == posix.AF.INET6,
+    };
 }
 
 fn shouldIgnoreInterface(name: []const u8) bool {
@@ -465,7 +467,7 @@ pub fn appendUniqueCandidate(list: *std.ArrayList(Candidate), alloc: std.mem.All
 pub fn gatherHostCandidates(
     alloc: std.mem.Allocator,
     local_port: u16,
-    socket_family: u16,
+    socket_capability: udp.SocketCapability,
     max_candidates_limit: usize,
 ) !std.ArrayList(Candidate) {
     var out = try std.ArrayList(Candidate).initCapacity(alloc, 8);
@@ -485,7 +487,7 @@ pub fn gatherHostCandidates(
 
         const fam: u16 = ifa.ifa_addr.*.sa_family;
         if (fam == posix.AF.INET) {
-            if (!shouldUseCandidate(socket_family, std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0))) continue;
+            if (!shouldUseCandidate(socket_capability, std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0))) continue;
 
             const in_ptr: *const c.struct_sockaddr_in = @ptrCast(@alignCast(ifa.ifa_addr));
             const addr_u32 = std.mem.bigToNative(u32, in_ptr.sin_addr.s_addr);
@@ -503,7 +505,7 @@ pub fn gatherHostCandidates(
                 .source = "ifaddr",
             });
         } else if (fam == posix.AF.INET6) {
-            if (socket_family == posix.AF.INET) continue;
+            if (!shouldUseCandidate(socket_capability, std.net.Address.initIp6(.{0} ** 16, 0, 0, 0))) continue;
 
             const in6_ptr: *const c.struct_sockaddr_in6 = @ptrCast(@alignCast(ifa.ifa_addr));
             const ip: [16]u8 = @as(*const [16]u8, @ptrCast(&in6_ptr.sin6_addr)).*;
@@ -561,13 +563,13 @@ pub fn sortAndTruncateCandidates(candidates: *std.ArrayList(Candidate), max_cand
 pub fn replaceCandidateSet(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(Candidate),
-    socket_family: u16,
+    socket_capability: udp.SocketCapability,
     candidates: []const Candidate,
     max_candidates_limit: usize,
 ) !void {
     out.clearRetainingCapacity();
     for (candidates) |candidate| {
-        if (!shouldUseCandidate(socket_family, candidate.addr)) continue;
+        if (!shouldUseCandidate(socket_capability, candidate.addr)) continue;
         if (!isCandidateAddressUsable(candidate.addr)) continue;
         try appendUniqueCandidate(out, alloc, candidate);
     }
@@ -649,32 +651,32 @@ pub const CandidateReprobe = struct {
     pub fn start(
         self: *CandidateReprobe,
         alloc: std.mem.Allocator,
-        socket_family: u16,
+        socket_capability: udp.SocketCapability,
         refreshed_candidates: []const Candidate,
         now: i64,
     ) !bool {
-        return self.startWithMode(alloc, socket_family, refreshed_candidates, now, false);
+        return self.startWithMode(alloc, socket_capability, refreshed_candidates, now, false);
     }
 
     pub fn startPersistent(
         self: *CandidateReprobe,
         alloc: std.mem.Allocator,
-        socket_family: u16,
+        socket_capability: udp.SocketCapability,
         refreshed_candidates: []const Candidate,
         now: i64,
     ) !bool {
-        return self.startWithMode(alloc, socket_family, refreshed_candidates, now, true);
+        return self.startWithMode(alloc, socket_capability, refreshed_candidates, now, true);
     }
 
     fn startWithMode(
         self: *CandidateReprobe,
         alloc: std.mem.Allocator,
-        socket_family: u16,
+        socket_capability: udp.SocketCapability,
         refreshed_candidates: []const Candidate,
         now: i64,
         persistent: bool,
     ) !bool {
-        try replaceCandidateSet(alloc, &self.candidates, socket_family, refreshed_candidates, max_candidates);
+        try replaceCandidateSet(alloc, &self.candidates, socket_capability, refreshed_candidates, max_candidates);
         self.probe.reset(self.candidates.items);
         self.next_probe_ns = now;
         self.persistent = persistent;
@@ -901,6 +903,56 @@ test "probe state progresses and locks on auth recv" {
     state.onAuthenticatedRecv(std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 61000));
     try std.testing.expect(state.isComplete());
     try std.testing.expect(state.nextProbeAddr() == null);
+}
+
+test "socket capability filters address families" {
+    const v4 = std.net.Address.initIp4(.{ 203, 0, 113, 10 }, 60000);
+    const v6 = std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 60000, 0, 0);
+
+    try std.testing.expect(shouldUseCandidate(.ipv4_only, v4));
+    try std.testing.expect(!shouldUseCandidate(.ipv4_only, v6));
+    try std.testing.expect(!shouldUseCandidate(.ipv6_only, v4));
+    try std.testing.expect(shouldUseCandidate(.ipv6_only, v6));
+    try std.testing.expect(shouldUseCandidate(.dual_stack, v4));
+    try std.testing.expect(shouldUseCandidate(.dual_stack, v6));
+}
+
+test "resolveStunServers filters addresses by socket capability" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const specs = [_][]const u8{
+        "127.0.0.1:3478",
+        "[::1]:3478",
+    };
+
+    var ipv6_only = try resolveStunServers(alloc, .ipv6_only, &specs);
+    defer ipv6_only.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ipv6_only.items.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), ipv6_only.items[0].any.family);
+
+    var dual_stack = try resolveStunServers(alloc, .dual_stack, &specs);
+    defer dual_stack.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), dual_stack.items.len);
+}
+
+test "replaceCandidateSet honors socket capability" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var out = try std.ArrayList(Candidate).initCapacity(alloc, 2);
+    defer out.deinit(alloc);
+
+    const candidates = [_]Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 10 }, 60000), .source = "host-v4" },
+        .{ .ctype = .host, .addr = std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 60001, 0, 0), .source = "host-v6" },
+    };
+
+    try replaceCandidateSet(alloc, &out, .ipv6_only, &candidates, max_candidates);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), out.items[0].addr.any.family);
 }
 
 test "interface family filtering keeps utun overlays" {
