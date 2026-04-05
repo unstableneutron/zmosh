@@ -110,6 +110,38 @@ pub const RemoteTransport = union(enum) {
     }
 };
 
+const StandbySsh = struct {
+    read_fd: i32,
+    write_fd: i32,
+    control: union(enum) {
+        line: std.ArrayList(u8),
+        framed: ipc.SocketBuffer,
+    },
+
+    fn initLine(alloc: std.mem.Allocator, pipes: SshBootstrap) !StandbySsh {
+        return .{
+            .read_fd = pipes.stdout_fd,
+            .write_fd = pipes.stdin_fd,
+            .control = .{ .line = try std.ArrayList(u8).initCapacity(alloc, 128) },
+        };
+    }
+
+    fn deinit(self: *StandbySsh, alloc: std.mem.Allocator, close_fds: bool) void {
+        if (close_fds) {
+            if (self.read_fd == self.write_fd) {
+                posix.close(self.read_fd);
+            } else {
+                posix.close(self.read_fd);
+                posix.close(self.write_fd);
+            }
+        }
+        switch (self.control) {
+            .line => |*buffer| buffer.deinit(alloc),
+            .framed => |*read_buf| read_buf.deinit(),
+        }
+    }
+};
+
 const Connect2Json = struct {
     v: u8,
     key: []const u8,
@@ -236,29 +268,15 @@ fn sendUse(fd: i32, mode: []const u8) !void {
 }
 
 fn sendCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const nat.Candidate) !void {
-    var wire_list = try std.ArrayList(nat.CandidateWire).initCapacity(alloc, candidates.len);
-    defer wire_list.deinit(alloc);
-    var owned_endpoints = try std.ArrayList([]u8).initCapacity(alloc, candidates.len);
-    defer {
-        for (owned_endpoints.items) |ep| alloc.free(ep);
-        owned_endpoints.deinit(alloc);
-    }
+    const json_payload = try nat.encodeCandidatesPayloadJson(alloc, candidates);
+    defer alloc.free(json_payload);
 
-    for (candidates) |cand| {
-        const endpoint = try nat.endpointForAddressAlloc(alloc, cand.addr);
-        try owned_endpoints.append(alloc, endpoint);
-        try wire_list.append(alloc, .{
-            .ctype = cand.ctype,
-            .endpoint = endpoint,
-            .source = cand.source,
-        });
-    }
-
-    const payload = nat.Candidates2Payload{ .candidates = wire_list.items };
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-    try builder.writer.print("ZMX_CANDIDATES2 {f}\n", .{std.json.fmt(payload, .{})});
-    try writeAllFd(fd, builder.writer.buffered());
+    var line = try std.ArrayList(u8).initCapacity(alloc, "ZMX_CANDIDATES2 \n".len + json_payload.len);
+    defer line.deinit(alloc);
+    try line.appendSlice(alloc, "ZMX_CANDIDATES2 ");
+    try line.appendSlice(alloc, json_payload);
+    try line.append(alloc, '\n');
+    try writeAllFd(fd, line.items);
 }
 
 fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.Allocator, candidate: nat.Candidate, max_candidates: usize) !void {
@@ -271,50 +289,66 @@ fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.All
 
 fn parseCandidatesLine(alloc: std.mem.Allocator, line: []const u8) !std.ArrayList(nat.Candidate) {
     if (!std.mem.startsWith(u8, line, "ZMX_CANDIDATES2 ")) return error.InvalidControlMessage;
-    const json_payload = line["ZMX_CANDIDATES2 ".len..];
-
-    var parsed = try std.json.parseFromSlice(Candidates2Json, alloc, json_payload, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-
-    var out = try std.ArrayList(nat.Candidate).initCapacity(alloc, parsed.value.candidates.len);
-    errdefer out.deinit(alloc);
-    for (parsed.value.candidates) |wire| {
-        const candidate = try nat.wireToCandidate(wire);
-        if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
-        try out.append(alloc, candidate);
-    }
-    return out;
+    return nat.parseCandidatesPayloadJson(alloc, line["ZMX_CANDIDATES2 ".len..]);
 }
 
-const StandbyCandidateReprobe = struct {
+fn sendFramedMessage(fd: i32, alloc: std.mem.Allocator, tag: ipc.Tag, payload: []const u8) !void {
+    var msg = try std.ArrayList(u8).initCapacity(alloc, @sizeOf(ipc.Header) + payload.len);
+    defer msg.deinit(alloc);
+    try ipc.appendMessage(alloc, &msg, tag, payload);
+    try writeAllFd(fd, msg.items);
+}
+
+fn sendFramedCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const nat.Candidate) !void {
+    const json_payload = try nat.encodeCandidatesPayloadJson(alloc, candidates);
+    defer alloc.free(json_payload);
+    try sendFramedMessage(fd, alloc, .CandidateRefresh, json_payload);
+}
+
+fn replaceCandidateSet(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(nat.Candidate),
+    socket_family: u16,
+    candidates: []const nat.Candidate,
+) !void {
+    out.clearRetainingCapacity();
+    for (candidates) |candidate| {
+        if (!nat.shouldUseCandidate(socket_family, candidate.addr)) continue;
+        if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
+        try appendUniqueCandidate(out, alloc, candidate, 8);
+    }
+    nat.sortCandidatesByPriority(out.items);
+}
+
+const CandidateReprobe = struct {
     candidates: std.ArrayList(nat.Candidate) = .empty,
     probe: nat.ProbeState = .{ .candidates = &[_]nat.Candidate{} },
     next_probe_ns: i64 = 0,
 
-    fn deinit(self: *StandbyCandidateReprobe, alloc: std.mem.Allocator) void {
+    fn deinit(self: *CandidateReprobe, alloc: std.mem.Allocator) void {
         self.candidates.deinit(alloc);
     }
 
+    fn clear(self: *CandidateReprobe) void {
+        self.candidates.clearRetainingCapacity();
+        self.probe.reset(self.candidates.items);
+        self.next_probe_ns = 0;
+    }
+
     fn start(
-        self: *StandbyCandidateReprobe,
+        self: *CandidateReprobe,
         alloc: std.mem.Allocator,
         socket_family: u16,
         refreshed_candidates: []const nat.Candidate,
         now: i64,
     ) !bool {
-        self.candidates.clearRetainingCapacity();
-        for (refreshed_candidates) |candidate| {
-            if (!nat.shouldUseCandidate(socket_family, candidate.addr)) continue;
-            if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
-            try appendUniqueCandidate(&self.candidates, alloc, candidate, 8);
-        }
-        nat.sortCandidatesByPriority(self.candidates.items);
+        try replaceCandidateSet(alloc, &self.candidates, socket_family, refreshed_candidates);
         self.probe.reset(self.candidates.items);
         self.next_probe_ns = now;
         return self.candidates.items.len > 0;
     }
 
-    fn maybeNextProbeAddr(self: *StandbyCandidateReprobe, now: i64) ?std.net.Address {
+    fn maybeNextProbeAddr(self: *CandidateReprobe, now: i64) ?std.net.Address {
         if (self.probe.isComplete()) return null;
         if (now < self.next_probe_ns) return null;
 
@@ -323,12 +357,12 @@ const StandbyCandidateReprobe = struct {
         return addr;
     }
 
-    fn pollDelayMs(self: *const StandbyCandidateReprobe, now: i64) ?i64 {
+    fn pollDelayMs(self: *const CandidateReprobe, now: i64) ?i64 {
         if (self.probe.isComplete()) return null;
         return @divFloor(@max(@as(i64, 0), self.next_probe_ns - now), std.time.ns_per_ms);
     }
 
-    fn onAuthenticatedRecv(self: *StandbyCandidateReprobe, from: std.net.Address) bool {
+    fn onAuthenticatedRecv(self: *CandidateReprobe, from: std.net.Address) bool {
         for (self.candidates.items) |candidate| {
             if (!nat.isAddressEqual(candidate.addr, from)) continue;
             const selected_before = self.probe.selected;
@@ -342,8 +376,9 @@ const StandbyCandidateReprobe = struct {
 fn handleUdpStandbyControlMessages(
     alloc: std.mem.Allocator,
     standby_buffer: *std.ArrayList(u8),
+    server_candidates: *std.ArrayList(nat.Candidate),
     socket_family: u16,
-    reprobe: *StandbyCandidateReprobe,
+    reprobe: *CandidateReprobe,
     peer: *udp_mod.Peer,
     now: i64,
     connect_debug: bool,
@@ -360,7 +395,8 @@ fn handleUdpStandbyControlMessages(
             };
             defer candidates.deinit(alloc);
 
-            if (try reprobe.start(alloc, socket_family, candidates.items, now)) {
+            try replaceCandidateSet(alloc, server_candidates, socket_family, candidates.items);
+            if (try reprobe.start(alloc, socket_family, server_candidates.items, now)) {
                 peer.enterRecoveryMode(now);
                 connectDebug(connect_debug, "received refreshed server candidates over standby SSH ({d})", .{reprobe.candidates.items.len});
             } else {
@@ -893,7 +929,7 @@ fn closeSshBootstrap(pipes: SshBootstrap) void {
     }
 }
 
-fn shouldSwitchToStandbySsh(now: i64, disconnected_since_ns: ?i64, standby_ssh: ?SshBootstrap) bool {
+fn shouldSwitchToStandbySsh(now: i64, disconnected_since_ns: ?i64, standby_ssh: ?StandbySsh) bool {
     if (standby_ssh == null) return false;
     const since = disconnected_since_ns orelse return false;
     return (now - since) >= ssh_fallback_after_disconnected_ns;
@@ -1173,41 +1209,102 @@ fn waitForUseAck(fd: i32, alloc: std.mem.Allocator, mode: []const u8, buffered: 
     }
 }
 
-fn switchToStandbySsh(
-    alloc: std.mem.Allocator,
-    transport_mode: *RemoteTransport,
-    standby_ssh: *?SshBootstrap,
-    standby_buffer: *std.ArrayList(u8),
-) !void {
-    const pipes = standby_ssh.* orelse return error.MissingSshPipes;
-    try sendUse(pipes.stdin_fd, "ssh");
+fn waitForTransportSwitchAckFramed(
+    fd: i32,
+    desired_mode: ipc.TransportMode,
+    read_buf: *ipc.SocketBuffer,
+) !ipc.TransportSwitchAck {
+    const deadline_ms = @as(i64, @intCast(std.time.milliTimestamp())) + use_ack_timeout_ms;
+    while (true) {
+        while (read_buf.next()) |msg| {
+            if (msg.header.tag != .TransportSwitchAck) continue;
+            const ack = try ipc.parseTransportSwitchAck(msg.payload);
+            if (ack.mode == desired_mode) return ack;
+        }
 
-    try waitForUseAck(pipes.stdout_fd, alloc, "ssh", standby_buffer);
+        const now_ms = @as(i64, @intCast(std.time.milliTimestamp()));
+        if (now_ms >= deadline_ms) return error.UseAckTimeout;
 
-    var read_buf = try ipc.SocketBuffer.init(alloc);
-    errdefer read_buf.deinit();
-    if (standby_buffer.items.len > 0) {
-        try read_buf.buf.appendSlice(read_buf.alloc, standby_buffer.items);
-        standby_buffer.clearRetainingCapacity();
+        const wait_ms = @min(@as(i64, 200), deadline_ms - now_ms);
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&fds, @intCast(@max(@as(i64, 1), wait_ms))) catch |err| {
+            if (err == error.Interrupted) continue;
+            return err;
+        };
+
+        if (fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return error.UnexpectedEof;
+        if (fds[0].revents & posix.POLL.HUP != 0 and fds[0].revents & posix.POLL.IN == 0) return error.UnexpectedEof;
+        if (fds[0].revents & posix.POLL.IN == 0) continue;
+
+        const n = read_buf.read(fd) catch |err| {
+            if (err == error.WouldBlock) continue;
+            return err;
+        };
+        if (n == 0) return error.UnexpectedEof;
+    }
+}
+
+fn activateStandbySsh(alloc: std.mem.Allocator, transport_mode: *RemoteTransport, standby_ssh: *?StandbySsh) !void {
+    var standby = standby_ssh.* orelse return error.MissingSshPipes;
+    standby_ssh.* = null;
+    errdefer standby.deinit(alloc, true);
+
+    var read_buf: ipc.SocketBuffer = undefined;
+    switch (standby.control) {
+        .line => |*buffer| {
+            read_buf = try ipc.SocketBuffer.init(alloc);
+            errdefer read_buf.deinit();
+            if (buffer.items.len > 0) {
+                try read_buf.buf.appendSlice(read_buf.alloc, buffer.items);
+            }
+            buffer.deinit(alloc);
+        },
+        .framed => |*buffer| {
+            read_buf = buffer.*;
+        },
     }
 
     var write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
     errdefer write_buf.deinit(alloc);
 
     transport_mode.* = .{ .ssh = .{
-        .read_fd = pipes.stdout_fd,
-        .write_fd = pipes.stdin_fd,
+        .read_fd = standby.read_fd,
+        .write_fd = standby.write_fd,
         .read_buf = read_buf,
         .write_buf = write_buf,
     } };
-    standby_ssh.* = null;
+}
+
+fn switchToStandbySsh(
+    alloc: std.mem.Allocator,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?StandbySsh,
+) !void {
+    var standby = &(standby_ssh.* orelse return error.MissingSshPipes);
+    switch (standby.control) {
+        .line => |*buffer| {
+            try sendUse(standby.write_fd, "ssh");
+            try waitForUseAck(standby.read_fd, alloc, "ssh", buffer);
+        },
+        .framed => |*read_buf| {
+            var req_buf: [8]u8 = undefined;
+            try sendFramedMessage(
+                standby.write_fd,
+                alloc,
+                .TransportSwitchRequest,
+                ipc.encodeTransportSwitchRequest(&req_buf, .ssh),
+            );
+            _ = try waitForTransportSwitchAckFramed(standby.read_fd, .ssh, read_buf);
+        },
+    }
+
+    try activateStandbySsh(alloc, transport_mode, standby_ssh);
 }
 
 fn performSshFallback(
     alloc: std.mem.Allocator,
     transport_mode: *RemoteTransport,
-    standby_ssh: *?SshBootstrap,
-    standby_buffer: *std.ArrayList(u8),
+    standby_ssh: *?StandbySsh,
     reliable_send: *transport.ReliableSend,
     active_snapshot_id: *?u32,
     awaiting_ssh_snapshot: *bool,
@@ -1225,9 +1322,9 @@ fn performSshFallback(
 ) !bool {
     if (standby_ssh.* == null) return false;
 
-    switchToStandbySsh(alloc, transport_mode, standby_ssh, standby_buffer) catch |err| {
+    switchToStandbySsh(alloc, transport_mode, standby_ssh) catch |err| {
         connectDebug(connect_debug, "failed to switch to SSH fallback: {s}", .{@errorName(err)});
-        disableStandby(standby_ssh, standby_buffer);
+        disableStandby(standby_ssh, alloc);
         return false;
     };
 
@@ -1262,12 +1359,44 @@ fn performSshFallback(
     return true;
 }
 
-fn disableStandby(standby_ssh: *?SshBootstrap, standby_buffer: *std.ArrayList(u8)) void {
-    if (standby_ssh.*) |pipes| {
-        closeSshBootstrap(pipes);
+fn disableStandby(standby_ssh: *?StandbySsh, alloc: std.mem.Allocator) void {
+    if (standby_ssh.*) |*standby| {
+        standby.deinit(alloc, true);
         standby_ssh.* = null;
     }
-    standby_buffer.clearRetainingCapacity();
+}
+
+fn takeActiveSshAsStandby(alloc: std.mem.Allocator, transport_mode: *RemoteTransport) !StandbySsh {
+    if (transport_mode.* != .ssh) return error.InvalidTransportMode;
+
+    const standby = StandbySsh{
+        .read_fd = transport_mode.ssh.read_fd,
+        .write_fd = transport_mode.ssh.write_fd,
+        .control = .{ .framed = transport_mode.ssh.read_buf },
+    };
+    transport_mode.ssh.write_buf.deinit(alloc);
+    return standby;
+}
+
+fn applyUdpRepromotionState(
+    snapshot_id: u32,
+    active_snapshot_id: *?u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    pending_output_epoch: *?u32,
+    resync_pending: *bool,
+    current_output_epoch: *u32,
+) void {
+    active_snapshot_id.* = null;
+    awaiting_ssh_snapshot.* = false;
+    expected_ssh_snapshot_id.* = null;
+    stdout_buf.clearRetainingCapacity();
+    deferred_output_buf.clearRetainingCapacity();
+    pending_output_epoch.* = null;
+    resync_pending.* = false;
+    current_output_epoch.* = snapshot_id;
 }
 
 fn handleClientNetworkChange(
@@ -1276,8 +1405,7 @@ fn handleClientNetworkChange(
     peer: *udp_mod.Peer,
     sock: *udp_mod.UdpSocket,
     reliable_recv: *const transport.RecvState,
-    standby_ssh: *?SshBootstrap,
-    standby_buffer: *std.ArrayList(u8),
+    standby_ssh: *?StandbySsh,
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     connect_debug: bool,
@@ -1310,11 +1438,15 @@ fn handleClientNetworkChange(
         ack_dirty.* = false;
     }
 
-    if (standby_ssh.*) |pipes| {
+    if (standby_ssh.*) |*standby| {
         if (refreshed_candidates) |candidates| {
-            sendCandidates(pipes.stdin_fd, alloc, candidates.items) catch |err| {
+            const send_result = switch (standby.control) {
+                .line => sendCandidates(standby.write_fd, alloc, candidates.items),
+                .framed => sendFramedCandidates(standby.write_fd, alloc, candidates.items),
+            };
+            send_result catch |err| {
                 connectDebug(connect_debug, "failed to send refreshed candidates over standby SSH: {s}", .{@errorName(err)});
-                disableStandby(standby_ssh, standby_buffer);
+                disableStandby(standby_ssh, alloc);
             };
         }
     }
@@ -1377,25 +1509,26 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var transport_mode: RemoteTransport = .{ .udp = .{ .sock = &udp_sock, .peer = &peer } };
     defer transport_mode.deinit(alloc);
 
-    var standby_ssh: ?SshBootstrap = null;
-    defer if (standby_ssh) |pipes| closeSshBootstrap(pipes);
-    var standby_buffer: std.ArrayList(u8) = .empty;
-    defer standby_buffer.deinit(alloc);
-    var standby_reprobe: StandbyCandidateReprobe = .{};
+    var standby_ssh: ?StandbySsh = null;
+    defer if (standby_ssh) |*standby| standby.deinit(alloc, true);
+    var standby_reprobe: CandidateReprobe = .{};
     defer standby_reprobe.deinit(alloc);
+    var ssh_reprobe: CandidateReprobe = .{};
+    defer ssh_reprobe.deinit(alloc);
     var network_monitor = netmon.NetworkMonitor.init(alloc);
     defer network_monitor.deinit();
 
     const decision = try probeAndSelectTransport(alloc, &session, options, fallback_addr, &udp_sock, &peer, &reliable_recv);
     if (decision == .udp and session.ssh != null) {
-        try sendUse(session.ssh.?.stdin_fd, "udp");
-        standby_ssh = session.ssh;
+        standby_ssh = try StandbySsh.initLine(alloc, session.ssh.?);
         session.ssh = null;
-        standby_buffer.clearRetainingCapacity();
+        try sendUse(standby_ssh.?.write_fd, "udp");
         connectDebug(options.connect_debug, "selected UDP transport with SSH standby", .{});
     } else if (decision == .ssh) {
         if (session.ssh == null) return error.MissingSshPipes;
-        try switchToStandbySsh(alloc, &transport_mode, &session.ssh, &standby_buffer);
+        standby_ssh = try StandbySsh.initLine(alloc, session.ssh.?);
+        session.ssh = null;
+        try switchToStandbySsh(alloc, &transport_mode, &standby_ssh);
         _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: using SSH tunnel (no UDP connectivity)\r\n") catch {};
         connectDebug(options.connect_debug, "selected SSH transport", .{});
     }
@@ -1420,6 +1553,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var ssh_write_closed = false;
     var current_output_epoch: u32 = 0;
     var pending_output_epoch: ?u32 = null;
+    var pending_udp_switch = false;
 
     const size = getTerminalSize();
     const init_snapshot_id = switch (transport_mode) {
@@ -1435,6 +1569,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         },
         .ssh => |*s| {
             try appendSshIpc(&s.write_buf, alloc, .Init, std.mem.asBytes(&init));
+            _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, last_ack_send_ns);
         },
     }
 
@@ -1448,7 +1583,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Resize, std.mem.asBytes(&new_size), now);
                 },
                 .ssh => |*s| {
-                    try appendSshIpc(&s.write_buf, alloc, .Resize, std.mem.asBytes(&new_size));
+                    if (!pending_udp_switch) {
+                        try appendSshIpc(&s.write_buf, alloc, .Resize, std.mem.asBytes(&new_size));
+                    }
                 },
             }
         }
@@ -1480,7 +1617,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         alloc,
                         &transport_mode,
                         &standby_ssh,
-                        &standby_buffer,
                         &reliable_send,
                         &active_snapshot_id,
                         &awaiting_ssh_snapshot,
@@ -1496,6 +1632,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &was_disconnected,
                         &pending_ssh_detach,
                     )) {
+                        pending_udp_switch = false;
+                        _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
                         continue;
                     }
 
@@ -1522,7 +1660,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     alloc,
                     &transport_mode,
                     &standby_ssh,
-                    &standby_buffer,
                     &reliable_send,
                     &active_snapshot_id,
                     &awaiting_ssh_snapshot,
@@ -1540,7 +1677,17 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 ))) {
                     continue;
                 }
+                pending_udp_switch = false;
+                _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
                 continue;
+            }
+        } else if (transport_mode == .ssh) {
+            if (!pending_udp_switch) {
+                if (ssh_reprobe.maybeNextProbeAddr(now)) |addr| {
+                    sendProbeHeartbeatTo(&peer, &udp_sock, addr, &reliable_recv) catch |err| {
+                        if (err != error.WouldBlock) return err;
+                    };
+                }
             }
         }
 
@@ -1562,10 +1709,17 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         }
         poll_count += 1;
 
+        var udp_probe_idx: ?usize = null;
+        if (transport_mode == .ssh) {
+            udp_probe_idx = poll_count;
+            poll_fds[poll_count] = .{ .fd = udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
+            poll_count += 1;
+        }
+
         var standby_read_idx: ?usize = null;
         if (transport_mode == .udp and standby_ssh != null) {
             standby_read_idx = poll_count;
-            poll_fds[poll_count] = .{ .fd = standby_ssh.?.stdout_fd, .events = posix.POLL.IN, .revents = 0 };
+            poll_fds[poll_count] = .{ .fd = standby_ssh.?.read_fd, .events = posix.POLL.IN, .revents = 0 };
             poll_count += 1;
         }
 
@@ -1604,8 +1758,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             if (standby_reprobe.pollDelayMs(now)) |reprobe_ms| {
                 poll_timeout = @min(poll_timeout, reprobe_ms);
             }
-        } else if (pending_ssh_detach and transport_mode.ssh.write_buf.items.len > 0) {
-            poll_timeout = @min(poll_timeout, @as(i64, 20));
+        } else {
+            if (pending_ssh_detach and transport_mode.ssh.write_buf.items.len > 0) {
+                poll_timeout = @min(poll_timeout, @as(i64, 20));
+            }
+            if (!pending_udp_switch) {
+                if (ssh_reprobe.pollDelayMs(now)) |reprobe_ms| {
+                    poll_timeout = @min(poll_timeout, reprobe_ms);
+                }
+            }
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
 
@@ -1625,7 +1786,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     &udp_sock,
                     &reliable_recv,
                     &standby_ssh,
-                    &standby_buffer,
                     &last_ack_send_ns,
                     &ack_dirty,
                     options.connect_debug,
@@ -1654,42 +1814,74 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
 
         if (standby_read_idx) |idx| {
             if (poll_fds[idx].revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-                disableStandby(&standby_ssh, &standby_buffer);
+                disableStandby(&standby_ssh, alloc);
             }
 
-            if (standby_ssh != null and poll_fds[idx].revents & posix.POLL.IN != 0) {
-                while (true) {
-                    var drain_buf: [256]u8 = undefined;
-                    const n = posix.read(standby_ssh.?.stdout_fd, &drain_buf) catch |err| {
-                        if (err == error.WouldBlock) break;
-                        disableStandby(&standby_ssh, &standby_buffer);
-                        break;
-                    };
-                    if (n == 0) {
-                        disableStandby(&standby_ssh, &standby_buffer);
-                        break;
-                    }
+            if (standby_ssh) |*standby| {
+                switch (standby.control) {
+                    .line => |*buffer| {
+                        if (poll_fds[idx].revents & posix.POLL.IN != 0) {
+                            while (true) {
+                                var drain_buf: [256]u8 = undefined;
+                                const n = posix.read(standby.read_fd, &drain_buf) catch |err| {
+                                    if (err == error.WouldBlock) break;
+                                    disableStandby(&standby_ssh, alloc);
+                                    break;
+                                };
+                                if (n == 0) {
+                                    disableStandby(&standby_ssh, alloc);
+                                    break;
+                                }
 
-                    if (standby_buffer.items.len + n > max_standby_buffer) {
-                        standby_buffer.clearRetainingCapacity();
-                    }
-                    standby_buffer.appendSlice(alloc, drain_buf[0..n]) catch {
-                        disableStandby(&standby_ssh, &standby_buffer);
-                        break;
-                    };
+                                if (buffer.items.len + n > max_standby_buffer) {
+                                    buffer.clearRetainingCapacity();
+                                }
+                                buffer.appendSlice(alloc, drain_buf[0..n]) catch {
+                                    disableStandby(&standby_ssh, alloc);
+                                    break;
+                                };
+                            }
+                        }
+
+                        if (standby_ssh != null) {
+                            try handleUdpStandbyControlMessages(alloc, buffer, &session.server_candidates, socket_family, &standby_reprobe, &peer, now, options.connect_debug);
+                        }
+                    },
+                    .framed => |*read_buf| {
+                        if (poll_fds[idx].revents & posix.POLL.IN != 0) {
+                            while (true) {
+                                const n = read_buf.read(standby.read_fd) catch |err| {
+                                    if (err == error.WouldBlock) break;
+                                    disableStandby(&standby_ssh, alloc);
+                                    break;
+                                };
+                                if (n == 0) {
+                                    disableStandby(&standby_ssh, alloc);
+                                    break;
+                                }
+
+                                while (read_buf.next()) |msg| {
+                                    if (msg.header.tag != .CandidateRefresh) continue;
+                                    var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
+                                    defer candidates.deinit(alloc);
+                                    try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
+                                    if (try standby_reprobe.start(alloc, socket_family, session.server_candidates.items, now)) {
+                                        peer.enterRecoveryMode(now);
+                                        connectDebug(options.connect_debug, "received refreshed server candidates over framed standby SSH ({d})", .{standby_reprobe.candidates.items.len});
+                                    }
+                                }
+                            }
+                        }
+                    },
                 }
             }
 
-            if (standby_ssh != null) {
-                try handleUdpStandbyControlMessages(alloc, &standby_buffer, socket_family, &standby_reprobe, &peer, now, options.connect_debug);
-            }
-
             if (standby_ssh != null and poll_fds[idx].revents & posix.POLL.HUP != 0 and poll_fds[idx].revents & posix.POLL.IN == 0) {
-                disableStandby(&standby_ssh, &standby_buffer);
+                disableStandby(&standby_ssh, alloc);
             }
         }
 
-        if (!pending_ssh_detach and poll_fds[stdin_idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+        if (!pending_ssh_detach and !(transport_mode == .ssh and pending_udp_switch) and poll_fds[stdin_idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
             var input_raw: [4096]u8 = undefined;
             const n_opt: ?usize = posix.read(posix.STDIN_FILENO, &input_raw) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk null;
@@ -1725,6 +1917,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
+        var udp_repromotion_snapshot_id: ?u32 = null;
         const transport_read_ready = switch (transport_mode) {
             .udp => poll_fds[transport_read_idx].revents & posix.POLL.IN != 0,
             .ssh => |s| poll_fds[transport_read_idx].revents & posix.POLL.IN != 0 or s.read_buf.buf.items.len > 0,
@@ -1890,28 +2083,110 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     }
                 },
                 .ssh => |*s| {
-                    while (s.read_buf.next()) |msg| {
-                        try handleSshMessage(alloc, &s.write_buf, msg, &reliable_inbox, &reliable_recv, &stdout_buf, &deferred_output_buf, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &next_ssh_snapshot_id, &ssh_snapshot_restarts, &session_ended, &session_end_deadline_ns, now);
-                    }
-
-                    if (poll_fds[transport_read_idx].revents & posix.POLL.IN != 0) {
-                        while (true) {
-                            const n = s.read_buf.read(s.read_fd) catch |err| {
-                                if (err == error.WouldBlock) break;
-                                return err;
-                            };
-                            if (n == 0) {
-                                ssh_eof = true;
-                                break;
+                    ssh_messages: {
+                        while (s.read_buf.next()) |msg| {
+                            if (msg.header.tag == .CandidateRefresh) {
+                                var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
+                                defer candidates.deinit(alloc);
+                                try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
+                                _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
+                                connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
+                                continue;
+                            }
+                            if (msg.header.tag == .TransportSwitchAck and pending_udp_switch) {
+                                const ack = ipc.parseTransportSwitchAck(msg.payload) catch continue;
+                                if (ack.mode == .udp) {
+                                    udp_repromotion_snapshot_id = ack.baseline_snapshot_id;
+                                    pending_udp_switch = false;
+                                    break :ssh_messages;
+                                }
+                                continue;
                             }
 
-                            while (s.read_buf.next()) |msg| {
-                                try handleSshMessage(alloc, &s.write_buf, msg, &reliable_inbox, &reliable_recv, &stdout_buf, &deferred_output_buf, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &next_ssh_snapshot_id, &ssh_snapshot_restarts, &session_ended, &session_end_deadline_ns, now);
+                            try handleSshMessage(alloc, &s.write_buf, msg, &reliable_inbox, &reliable_recv, &stdout_buf, &deferred_output_buf, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &next_ssh_snapshot_id, &ssh_snapshot_restarts, &session_ended, &session_end_deadline_ns, now);
+                        }
+
+                        if (poll_fds[transport_read_idx].revents & posix.POLL.IN != 0) {
+                            while (true) {
+                                const n = s.read_buf.read(s.read_fd) catch |err| {
+                                    if (err == error.WouldBlock) break;
+                                    return err;
+                                };
+                                if (n == 0) {
+                                    ssh_eof = true;
+                                    break :ssh_messages;
+                                }
+
+                                while (s.read_buf.next()) |msg| {
+                                    if (msg.header.tag == .CandidateRefresh) {
+                                        var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
+                                        defer candidates.deinit(alloc);
+                                        try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
+                                        _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
+                                        connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
+                                        continue;
+                                    }
+                                    if (msg.header.tag == .TransportSwitchAck and pending_udp_switch) {
+                                        const ack = ipc.parseTransportSwitchAck(msg.payload) catch continue;
+                                        if (ack.mode == .udp) {
+                                            udp_repromotion_snapshot_id = ack.baseline_snapshot_id;
+                                            pending_udp_switch = false;
+                                            break :ssh_messages;
+                                        }
+                                        continue;
+                                    }
+
+                                    try handleSshMessage(alloc, &s.write_buf, msg, &reliable_inbox, &reliable_recv, &stdout_buf, &deferred_output_buf, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &next_ssh_snapshot_id, &ssh_snapshot_restarts, &session_ended, &session_end_deadline_ns, now);
+                                }
                             }
                         }
                     }
                 },
             }
+        }
+
+        if (transport_mode == .ssh and udp_probe_idx != null and poll_fds[udp_probe_idx.?].revents & posix.POLL.IN != 0) {
+            while (true) {
+                var raw_buf: [9000]u8 = undefined;
+                const raw = try udp_sock.recvRaw(&raw_buf) orelse break;
+
+                var decrypt_buf: [9000]u8 = undefined;
+                const prev_addr = peer.addr;
+                const decoded = try peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf);
+                peer.addr = prev_addr;
+                if (decoded == null) continue;
+
+                if (ssh_reprobe.onAuthenticatedRecv(raw.from)) {
+                    peer.addr = raw.from;
+                    connectDebug(options.connect_debug, "authenticated revived UDP path {f}", .{raw.from});
+                    if (!pending_udp_switch and transport_mode == .ssh and !ssh_write_closed) {
+                        var req_buf: [8]u8 = undefined;
+                        try appendSshIpc(&transport_mode.ssh.write_buf, alloc, .TransportSwitchRequest, ipc.encodeTransportSwitchRequest(&req_buf, .udp));
+                        pending_udp_switch = true;
+                    }
+                }
+            }
+        }
+
+        if (udp_repromotion_snapshot_id) |snapshot_id| {
+            const promoted_standby = try takeActiveSshAsStandby(alloc, &transport_mode);
+            standby_ssh = promoted_standby;
+            standby_reprobe.clear();
+            transport_mode = .{ .udp = .{ .sock = &udp_sock, .peer = &peer } };
+            ssh_eof = false;
+            ssh_write_closed = false;
+            pending_ssh_detach = false;
+            pending_ssh_detach_ns = null;
+            ssh_snapshot_restarts = 0;
+            applyUdpRepromotionState(snapshot_id, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &stdout_buf, &deferred_output_buf, &pending_output_epoch, &resync_pending, &current_output_epoch);
+
+            const resumed_size = getTerminalSize();
+            const resumed_init = ipc.Init{ .rows = resumed_size.rows, .cols = resumed_size.cols, .snapshot_id = snapshot_id };
+            var init_buf: [64]u8 = undefined;
+            const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&resumed_init), &init_buf);
+            try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, now);
+            connectDebug(options.connect_debug, "switched active transport back to UDP", .{});
+            continue;
         }
 
         if (ssh_write_idx) |idx| {
@@ -2017,11 +2292,11 @@ test "parseConnect2Line keeps explicit bootstrap port" {
 
 test "ssh standby fallback threshold" {
     const now: i64 = 20 * std.time.ns_per_s;
-    const pipes = SshBootstrap{ .stdin_fd = 1, .stdout_fd = 2 };
+    const standby = StandbySsh{ .read_fd = 1, .write_fd = 2, .control = .{ .line = .empty } };
 
-    try std.testing.expect(!shouldSwitchToStandbySsh(now, null, pipes));
-    try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 5 * std.time.ns_per_s, pipes));
-    try std.testing.expect(shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, pipes));
+    try std.testing.expect(!shouldSwitchToStandbySsh(now, null, standby));
+    try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 5 * std.time.ns_per_s, standby));
+    try std.testing.expect(shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, standby));
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, null));
 }
 
@@ -2074,6 +2349,37 @@ test "ssh replay strips Init while preserving later reliable IPC" {
     try std.testing.expect(hdr.tag == .Detach);
 }
 
+test "udp re-promotion state reset clears SSH baseline bookkeeping" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 16);
+    defer stdout_buf.deinit(alloc);
+    var deferred_output_buf = try std.ArrayList(u8).initCapacity(alloc, 16);
+    defer deferred_output_buf.deinit(alloc);
+    try stdout_buf.appendSlice(alloc, "old");
+    try deferred_output_buf.appendSlice(alloc, "deferred");
+
+    var active_snapshot_id: ?u32 = 1;
+    var awaiting_ssh_snapshot = true;
+    var expected_ssh_snapshot_id: ?u32 = 7;
+    var pending_output_epoch: ?u32 = 9;
+    var resync_pending = true;
+    var current_output_epoch: u32 = 3;
+
+    applyUdpRepromotionState(42, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &stdout_buf, &deferred_output_buf, &pending_output_epoch, &resync_pending, &current_output_epoch);
+
+    try std.testing.expect(active_snapshot_id == null);
+    try std.testing.expect(!awaiting_ssh_snapshot);
+    try std.testing.expect(expected_ssh_snapshot_id == null);
+    try std.testing.expectEqual(@as(usize, 0), stdout_buf.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deferred_output_buf.items.len);
+    try std.testing.expect(pending_output_epoch == null);
+    try std.testing.expect(!resync_pending);
+    try std.testing.expectEqual(@as(u32, 42), current_output_epoch);
+}
+
 test "standby candidate reprobe filters reset and select refreshed path" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -2086,7 +2392,7 @@ test "standby candidate reprobe filters reset and select refreshed path" {
         .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 20 }, 60002), .source = "dup" },
     };
 
-    var reprobe: StandbyCandidateReprobe = .{};
+    var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
 
     try std.testing.expect(try reprobe.start(alloc, posix.AF.INET, &refreshed, 0));
@@ -2114,13 +2420,16 @@ test "standby UDP control messages start refreshed reprobes" {
         "ZMX_CANDIDATES2 {\"candidates\":[{\"ctype\":\"host\",\"endpoint\":\"203.0.113.10:60000\",\"source\":\"ifaddr\"}]}\n",
     );
 
-    var reprobe: StandbyCandidateReprobe = .{};
+    var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
     var peer = udp_mod.Peer.init([_]u8{0} ** crypto.key_length, .to_server);
+    var server_candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, 1);
+    defer server_candidates.deinit(alloc);
 
-    try handleUdpStandbyControlMessages(alloc, &standby_buffer, posix.AF.INET, &reprobe, &peer, 123, false);
+    try handleUdpStandbyControlMessages(alloc, &standby_buffer, &server_candidates, posix.AF.INET, &reprobe, &peer, 123, false);
     try std.testing.expectEqual(@as(usize, 0), standby_buffer.items.len);
     try std.testing.expectEqual(@as(usize, 1), reprobe.candidates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), server_candidates.items.len);
     try std.testing.expectEqual(@as(i64, 123), reprobe.next_probe_ns);
     try std.testing.expect(peer.recovery_mode);
 }

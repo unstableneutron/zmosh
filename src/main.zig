@@ -1559,7 +1559,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
-                        .Output, .Ack, .SessionEnd, .Snapshot, .ReliableReplay => {},
+                        .Output, .Ack, .SessionEnd, .Snapshot, .ReliableReplay, .CandidateRefresh, .TransportSwitchRequest, .TransportSwitchAck => {},
                     }
                 }
             }

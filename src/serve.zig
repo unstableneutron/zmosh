@@ -80,7 +80,10 @@ const GatewayTransport = union(enum) {
 const StandbySsh = struct {
     read_fd: i32,
     write_fd: i32,
-    control_buf: std.ArrayList(u8),
+    control: union(enum) {
+        line: std.ArrayList(u8),
+        framed: ipc.SocketBuffer,
+    },
 
     fn deinit(self: *StandbySsh, alloc: std.mem.Allocator, close_fds: bool) void {
         if (close_fds) {
@@ -91,7 +94,10 @@ const StandbySsh = struct {
                 posix.close(self.write_fd);
             }
         }
-        self.control_buf.deinit(alloc);
+        switch (self.control) {
+            .line => |*buffer| buffer.deinit(alloc),
+            .framed => |*read_buf| read_buf.deinit(),
+        }
     }
 };
 
@@ -172,29 +178,15 @@ fn sendUseAck(fd: i32, mode: []const u8) !void {
 }
 
 fn sendCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const nat.Candidate) !void {
-    var wire_list = try std.ArrayList(nat.CandidateWire).initCapacity(alloc, candidates.len);
-    defer wire_list.deinit(alloc);
-    var owned_endpoints = try std.ArrayList([]u8).initCapacity(alloc, candidates.len);
-    defer {
-        for (owned_endpoints.items) |ep| alloc.free(ep);
-        owned_endpoints.deinit(alloc);
-    }
+    const json_payload = try nat.encodeCandidatesPayloadJson(alloc, candidates);
+    defer alloc.free(json_payload);
 
-    for (candidates) |cand| {
-        const endpoint = try nat.endpointForAddressAlloc(alloc, cand.addr);
-        try owned_endpoints.append(alloc, endpoint);
-        try wire_list.append(alloc, .{
-            .ctype = cand.ctype,
-            .endpoint = endpoint,
-            .source = cand.source,
-        });
-    }
-
-    const payload = nat.Candidates2Payload{ .candidates = wire_list.items };
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-    try builder.writer.print("ZMX_CANDIDATES2 {f}\n", .{std.json.fmt(payload, .{})});
-    try writeAllFd(fd, builder.writer.buffered());
+    var line = try std.ArrayList(u8).initCapacity(alloc, "ZMX_CANDIDATES2 \n".len + json_payload.len);
+    defer line.deinit(alloc);
+    try line.appendSlice(alloc, "ZMX_CANDIDATES2 ");
+    try line.appendSlice(alloc, json_payload);
+    try line.append(alloc, '\n');
+    try writeAllFd(fd, line.items);
 }
 
 fn socketFamily(fd: i32) !u16 {
@@ -294,19 +286,7 @@ fn sendConnect2(
 
 fn parseCandidatesLine(alloc: std.mem.Allocator, line: []const u8) !std.ArrayList(nat.Candidate) {
     if (!std.mem.startsWith(u8, line, "ZMX_CANDIDATES2 ")) return error.InvalidControlMessage;
-    const json_payload = line["ZMX_CANDIDATES2 ".len..];
-
-    var parsed = try std.json.parseFromSlice(Candidates2Json, alloc, json_payload, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-
-    var out = try std.ArrayList(nat.Candidate).initCapacity(alloc, parsed.value.candidates.len);
-    errdefer out.deinit(alloc);
-    for (parsed.value.candidates) |wire| {
-        const candidate = try nat.wireToCandidate(wire);
-        if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
-        try out.append(alloc, candidate);
-    }
-    return out;
+    return nat.parseCandidatesPayloadJson(alloc, line["ZMX_CANDIDATES2 ".len..]);
 }
 
 fn parseUseLine(line: []const u8) !UseMode {
@@ -320,6 +300,19 @@ fn parseStandbyControlLine(alloc: std.mem.Allocator, line: []const u8) !StandbyC
         return .{ .candidates = try parseCandidatesLine(alloc, line) };
     }
     return .{ .use = try parseUseLine(line) };
+}
+
+fn sendFramedMessage(fd: i32, alloc: std.mem.Allocator, tag: ipc.Tag, payload: []const u8) !void {
+    var msg = try std.ArrayList(u8).initCapacity(alloc, @sizeOf(ipc.Header) + payload.len);
+    defer msg.deinit(alloc);
+    try ipc.appendMessage(alloc, &msg, tag, payload);
+    try writeAllFd(fd, msg.items);
+}
+
+fn sendFramedCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const nat.Candidate) !void {
+    const json_payload = try nat.encodeCandidatesPayloadJson(alloc, candidates);
+    defer alloc.free(json_payload);
+    try sendFramedMessage(fd, alloc, .CandidateRefresh, json_payload);
 }
 
 fn buildSshPromotionReplayPayload(alloc: std.mem.Allocator, channel: transport.Channel, payload: []const u8) !?[]u8 {
@@ -519,6 +512,7 @@ pub const Gateway = struct {
     stun_state: ?nat.StunState,
     last_stun_keepalive_ns: i64,
     last_srflx: ?std.net.Address,
+    ssh_udp_probe_authenticated_ns: ?i64,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -595,7 +589,7 @@ pub const Gateway = struct {
                 standby_ssh = .{
                     .read_fd = posix.STDIN_FILENO,
                     .write_fd = posix.STDOUT_FILENO,
-                    .control_buf = try std.ArrayList(u8).initCapacity(alloc, 128),
+                    .control = .{ .line = try std.ArrayList(u8).initCapacity(alloc, 128) },
                 };
             } else {
                 try sendUseAck(posix.STDOUT_FILENO, "ssh");
@@ -661,6 +655,7 @@ pub const Gateway = struct {
             .stun_state = null,
             .last_stun_keepalive_ns = now,
             .last_srflx = initial_srflx,
+            .ssh_udp_probe_authenticated_ns = null,
         };
     }
 
@@ -836,8 +831,6 @@ pub const Gateway = struct {
     }
 
     fn sendStandbyCandidateRefresh(self: *Gateway, srflx_addr: std.net.Address) !void {
-        if (self.standby_ssh == null) return;
-
         var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_family, 8);
         defer refreshed.deinit(self.alloc);
         try appendUniqueCandidate(&refreshed, self.alloc, .{
@@ -847,11 +840,25 @@ pub const Gateway = struct {
         }, 8);
         nat.sortCandidatesByPriority(refreshed.items);
 
-        sendCandidates(self.standby_ssh.?.write_fd, self.alloc, refreshed.items) catch |err| {
-            self.standby_ssh.?.deinit(self.alloc, true);
-            self.standby_ssh = null;
-            return err;
-        };
+        if (self.standby_ssh) |*standby| {
+            const send_result = switch (standby.control) {
+                .line => sendCandidates(standby.write_fd, self.alloc, refreshed.items),
+                .framed => sendFramedCandidates(standby.write_fd, self.alloc, refreshed.items),
+            };
+            send_result catch |err| {
+                standby.deinit(self.alloc, true);
+                self.standby_ssh = null;
+                return err;
+            };
+            return;
+        }
+
+        if (self.transport == .ssh) {
+            const json_payload = try nat.encodeCandidatesPayloadJson(self.alloc, refreshed.items);
+            defer self.alloc.free(json_payload);
+            try self.ensureSshWriteCapacity(@sizeOf(ipc.Header) + json_payload.len);
+            try ipc.appendMessage(self.alloc, &self.transport.ssh.write_buf, .CandidateRefresh, json_payload);
+        }
     }
 
     fn handleStunDatagram(self: *Gateway, from: std.net.Address, data: []const u8) bool {
@@ -878,6 +885,27 @@ pub const Gateway = struct {
             self.stun_state = null;
         }
         return true;
+    }
+
+    fn beginUdpRepromotion(self: *Gateway) u32 {
+        self.snapshot_id +%= 1;
+        self.snapshot_in_flight_id = self.snapshot_id;
+        self.output_epoch = self.snapshot_id;
+        self.output_coalesce_buf.clearRetainingCapacity();
+        self.ssh_udp_probe_authenticated_ns = null;
+        return self.snapshot_id;
+    }
+
+    fn takeActiveSshToStandby(self: *Gateway) !StandbySsh {
+        if (self.transport != .ssh) return error.InvalidTransportMode;
+
+        const standby = StandbySsh{
+            .read_fd = self.transport.ssh.read_fd,
+            .write_fd = self.transport.ssh.write_fd,
+            .control = .{ .framed = self.transport.ssh.read_buf },
+        };
+        self.transport.ssh.write_buf.deinit(self.alloc);
+        return standby;
     }
 
     fn handleStandbyCandidateRefresh(self: *Gateway, candidates: []const nat.Candidate, now: i64) !void {
@@ -922,62 +950,116 @@ pub const Gateway = struct {
             return false;
         }
 
-        while (true) {
-            var tmp: [256]u8 = undefined;
-            const n = posix.read(self.standby_ssh.?.read_fd, &tmp) catch |err| {
-                if (err == error.WouldBlock) break;
-                log.warn("standby ssh control read failed: {s}", .{@errorName(err)});
-                self.standby_ssh.?.deinit(self.alloc, true);
-                self.standby_ssh = null;
-                return false;
-            };
-            if (n == 0) {
-                log.info("standby ssh control reached EOF", .{});
-                self.standby_ssh.?.deinit(self.alloc, true);
-                self.standby_ssh = null;
-                return false;
-            }
-
-            var standby = &self.standby_ssh.?;
-            try standby.control_buf.appendSlice(self.alloc, tmp[0..n]);
-            if (standby.control_buf.items.len > max_control_line) {
-                log.warn("standby ssh control line too long; disabling fallback channel", .{});
-                standby.deinit(self.alloc, true);
-                self.standby_ssh = null;
-                return false;
-            }
-        }
-
-        while (self.standby_ssh != null) {
-            var standby = &self.standby_ssh.?;
-            const nl_idx = std.mem.indexOfScalar(u8, standby.control_buf.items, '\n') orelse break;
-            const line = std.mem.trimRight(u8, standby.control_buf.items[0..nl_idx], "\r\n");
-            var msg = parseStandbyControlLine(self.alloc, line) catch {
-                log.warn("invalid standby ssh control message: {s}", .{line});
-                try standby.control_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
-                continue;
-            };
-            defer msg.deinit(self.alloc);
-            try standby.control_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
-
-            switch (msg) {
-                .use => |mode| {
-                    if (mode == .ssh) {
-                        sendUseAck(standby.write_fd, "ssh") catch {
-                            standby.deinit(self.alloc, true);
-                            self.standby_ssh = null;
-                            return false;
-                        };
-                        try self.promoteStandbyToSsh();
-                        return true;
-                    }
-                },
-                .candidates => |candidates| {
-                    self.handleStandbyCandidateRefresh(candidates.items, @intCast(std.time.nanoTimestamp())) catch |err| {
-                        log.warn("standby candidate refresh failed: {s}", .{@errorName(err)});
+        var standby = &self.standby_ssh.?;
+        switch (standby.control) {
+            .line => |*buffer| {
+                while (true) {
+                    var tmp: [256]u8 = undefined;
+                    const n = posix.read(standby.read_fd, &tmp) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        log.warn("standby ssh control read failed: {s}", .{@errorName(err)});
+                        standby.deinit(self.alloc, true);
+                        self.standby_ssh = null;
+                        return false;
                     };
-                },
-            }
+                    if (n == 0) {
+                        log.info("standby ssh control reached EOF", .{});
+                        standby.deinit(self.alloc, true);
+                        self.standby_ssh = null;
+                        return false;
+                    }
+
+                    try buffer.appendSlice(self.alloc, tmp[0..n]);
+                    if (buffer.items.len > max_control_line) {
+                        log.warn("standby ssh control line too long; disabling fallback channel", .{});
+                        standby.deinit(self.alloc, true);
+                        self.standby_ssh = null;
+                        return false;
+                    }
+                }
+
+                while (self.standby_ssh != null) {
+                    standby = &self.standby_ssh.?;
+                    const line_buf = &standby.control.line;
+                    const nl_idx = std.mem.indexOfScalar(u8, line_buf.items, '\n') orelse break;
+                    const line = std.mem.trimRight(u8, line_buf.items[0..nl_idx], "\r\n");
+                    var msg = parseStandbyControlLine(self.alloc, line) catch {
+                        log.warn("invalid standby ssh control message: {s}", .{line});
+                        try line_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
+                        continue;
+                    };
+                    defer msg.deinit(self.alloc);
+                    try line_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
+
+                    switch (msg) {
+                        .use => |mode| {
+                            if (mode == .ssh) {
+                                sendUseAck(standby.write_fd, "ssh") catch {
+                                    standby.deinit(self.alloc, true);
+                                    self.standby_ssh = null;
+                                    return false;
+                                };
+                                try self.promoteStandbyToSsh();
+                                return true;
+                            }
+                        },
+                        .candidates => |candidates| {
+                            self.handleStandbyCandidateRefresh(candidates.items, @intCast(std.time.nanoTimestamp())) catch |err| {
+                                log.warn("standby candidate refresh failed: {s}", .{@errorName(err)});
+                            };
+                        },
+                    }
+                }
+            },
+            .framed => |*read_buf| {
+                while (true) {
+                    const n = read_buf.read(standby.read_fd) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        log.warn("standby ssh framed control read failed: {s}", .{@errorName(err)});
+                        standby.deinit(self.alloc, true);
+                        self.standby_ssh = null;
+                        return false;
+                    };
+                    if (n == 0) {
+                        log.info("standby ssh framed control reached EOF", .{});
+                        standby.deinit(self.alloc, true);
+                        self.standby_ssh = null;
+                        return false;
+                    }
+                }
+
+                while (self.standby_ssh != null) {
+                    standby = &self.standby_ssh.?;
+                    const msg = standby.control.framed.next() orelse break;
+                    switch (msg.header.tag) {
+                        .CandidateRefresh => {
+                            var candidates = nat.parseCandidatesPayloadJson(self.alloc, msg.payload) catch continue;
+                            defer candidates.deinit(self.alloc);
+                            self.handleStandbyCandidateRefresh(candidates.items, @intCast(std.time.nanoTimestamp())) catch |err| {
+                                log.warn("standby framed candidate refresh failed: {s}", .{@errorName(err)});
+                            };
+                        },
+                        .TransportSwitchRequest => {
+                            const request = ipc.parseTransportSwitchRequest(msg.payload) catch continue;
+                            if (request.mode != .ssh) continue;
+                            var ack_buf: [8]u8 = undefined;
+                            sendFramedMessage(
+                                standby.write_fd,
+                                self.alloc,
+                                .TransportSwitchAck,
+                                ipc.encodeTransportSwitchAck(&ack_buf, .ssh, 0),
+                            ) catch {
+                                standby.deinit(self.alloc, true);
+                                self.standby_ssh = null;
+                                return false;
+                            };
+                            try self.promoteStandbyToSsh();
+                            return true;
+                        },
+                        else => {},
+                    }
+                }
+            },
         }
 
         if (self.standby_ssh != null and revents & posix.POLL.HUP != 0) {
@@ -996,10 +1078,19 @@ pub const Gateway = struct {
         var close_fds = true;
         defer standby.deinit(self.alloc, close_fds);
 
-        var read_buf = try ipc.SocketBuffer.init(self.alloc);
-        errdefer read_buf.deinit();
-        if (standby.control_buf.items.len > 0) {
-            try read_buf.buf.appendSlice(read_buf.alloc, standby.control_buf.items);
+        var read_buf: ipc.SocketBuffer = undefined;
+        switch (standby.control) {
+            .line => |*buffer| {
+                read_buf = try ipc.SocketBuffer.init(self.alloc);
+                errdefer read_buf.deinit();
+                if (buffer.items.len > 0) {
+                    try read_buf.buf.appendSlice(read_buf.alloc, buffer.items);
+                }
+            },
+            .framed => |*buffer| {
+                read_buf = buffer.*;
+                standby.control = .{ .line = .empty };
+            },
         }
 
         var write_buf = try std.ArrayList(u8).initCapacity(self.alloc, 4096);
@@ -1015,6 +1106,7 @@ pub const Gateway = struct {
         self.ssh_baseline_snapshot_id = null;
         self.ssh_baseline_pending = true;
         self.last_resync_request_ns = 0;
+        self.ssh_udp_probe_authenticated_ns = null;
 
         var pending_replay = try self.reliable_send.collectPendingReliableFrames(self.alloc);
         defer pending_replay.deinit(self.alloc);
@@ -1034,7 +1126,7 @@ pub const Gateway = struct {
         close_fds = false;
     }
 
-    fn runSsh(self: *Gateway) !void {
+    fn runSsh(self: *Gateway) anyerror!void {
         var ssh = &self.transport.ssh;
         var ssh_read_eof = false;
         var ssh_write_closed = false;
@@ -1046,14 +1138,32 @@ pub const Gateway = struct {
                 break;
             }
 
-            var poll_fds: [3]posix.pollfd = undefined;
-            var poll_count: usize = 2;
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            if (self.stun_servers.items.len > 0 and (now - self.last_stun_keepalive_ns) >= stun_keepalive_ns) {
+                self.sendStunKeepalive(now) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+            }
+            if (self.stun_state) |*stun_state| {
+                stun_state.maybeRetry(&self.udp_sock, now) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
+            }
+            if (self.ssh_udp_probe_authenticated_ns != null and self.peer.addr != null and self.peer.shouldSendHeartbeat(now, self.config)) {
+                self.sendHeartbeat(now) catch |err| {
+                    if (err != error.NoPeerAddress and err != error.WouldBlock) return err;
+                };
+            }
+
+            var poll_fds: [4]posix.pollfd = undefined;
+            var poll_count: usize = 3;
 
             poll_fds[0] = .{ .fd = ssh.read_fd, .events = if (ssh_read_eof) 0 else posix.POLL.IN, .revents = 0 };
 
             var unix_events: i16 = if (daemon_eof) 0 else posix.POLL.IN;
             if (!daemon_eof and self.unix_write_buf.items.len > 0) unix_events |= posix.POLL.OUT;
             poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
+            poll_fds[2] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
 
             var ssh_write_idx: ?usize = null;
             if (!ssh_write_closed and ssh.write_buf.items.len > 0) {
@@ -1069,6 +1179,7 @@ pub const Gateway = struct {
 
             const ssh_read_revents = poll_fds[0].revents;
             const unix_revents = poll_fds[1].revents;
+            const udp_revents = poll_fds[2].revents;
             var ssh_write_revents: i16 = 0;
 
             if (!ssh_read_eof and ssh_read_revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
@@ -1086,7 +1197,9 @@ pub const Gateway = struct {
             }
             if (!self.running) break;
 
-            try self.drainBufferedSshMessages();
+            if (try self.drainBufferedSshMessages()) {
+                return self.run();
+            }
             if (!self.running) break;
 
             if (!ssh_read_eof and poll_fds[0].revents & posix.POLL.IN != 0) {
@@ -1102,8 +1215,34 @@ pub const Gateway = struct {
                         break;
                     }
 
-                    try self.drainBufferedSshMessages();
+                    if (try self.drainBufferedSshMessages()) {
+                        return self.run();
+                    }
                     if (!self.running) break;
+                }
+            }
+
+            if (udp_revents & posix.POLL.IN != 0) {
+                while (true) {
+                    var raw_buf: [9000]u8 = undefined;
+                    const raw = try self.udp_sock.recvRaw(&raw_buf) orelse break;
+
+                    if (self.handleStunDatagram(raw.from, raw.data)) {
+                        continue;
+                    }
+
+                    var decrypt_buf: [9000]u8 = undefined;
+                    const decoded = try self.peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf) orelse continue;
+                    self.ssh_udp_probe_authenticated_ns = @intCast(std.time.nanoTimestamp());
+
+                    const packet = transport.parsePacket(decoded) catch {
+                        self.sendHeartbeat(@intCast(std.time.nanoTimestamp())) catch {};
+                        continue;
+                    };
+                    if (self.reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
+                        self.peer.reportRtt(rtt_us);
+                    }
+                    self.sendHeartbeat(@intCast(std.time.nanoTimestamp())) catch {};
                 }
             }
 
@@ -1197,9 +1336,45 @@ pub const Gateway = struct {
         }
     }
 
-    fn drainBufferedSshMessages(self: *Gateway) !void {
+    fn drainBufferedSshMessages(self: *Gateway) !bool {
         var ssh = &self.transport.ssh;
         while (ssh.read_buf.next()) |msg| {
+            if (msg.header.tag == .TransportSwitchRequest) {
+                const request = ipc.parseTransportSwitchRequest(msg.payload) catch continue;
+                if (request.mode != .udp or self.ssh_udp_probe_authenticated_ns == null) continue;
+
+                const snapshot_id = self.beginUdpRepromotion();
+                var ack_buf: [8]u8 = undefined;
+                try self.ensureSshWriteCapacity(@sizeOf(ipc.Header) + @sizeOf(ipc.TransportSwitchAck));
+                try ipc.appendMessage(
+                    self.alloc,
+                    &ssh.write_buf,
+                    .TransportSwitchAck,
+                    ipc.encodeTransportSwitchAck(&ack_buf, .udp, snapshot_id),
+                );
+                try writeAllFd(ssh.write_fd, ssh.write_buf.items);
+                ssh.write_buf.clearRetainingCapacity();
+
+                const standby = try self.takeActiveSshToStandby();
+                self.standby_ssh = standby;
+                self.transport = .udp;
+                self.ssh_baseline_snapshot_id = null;
+                self.ssh_baseline_pending = false;
+                self.last_resync_request_ns = 0;
+                return true;
+            }
+
+            if (msg.header.tag == .CandidateRefresh) {
+                var candidates = nat.parseCandidatesPayloadJson(self.alloc, msg.payload) catch continue;
+                defer candidates.deinit(self.alloc);
+                self.handleStandbyCandidateRefresh(candidates.items, @intCast(std.time.nanoTimestamp())) catch |err| {
+                    log.warn("active ssh candidate refresh failed: {s}", .{@errorName(err)});
+                    self.running = false;
+                    break;
+                };
+                continue;
+            }
+
             if (msg.header.tag == .ReliableReplay) {
                 const replay = ipc.parseReliableReplay(msg.payload) catch continue;
                 const channel = std.meta.intToEnum(transport.Channel, replay.channel) catch continue;
@@ -1247,6 +1422,7 @@ pub const Gateway = struct {
                 break;
             };
         }
+        return false;
     }
 
     fn computePollTimeoutMs(self: *Gateway, now: i64) i32 {
@@ -1785,6 +1961,21 @@ test "stun datagrams are ignored without active stun state" {
     std.mem.writeInt(u32, pkt[4..8], nat.stun_magic_cookie, .big);
 
     try std.testing.expect(!gateway.handleStunDatagram(from, &pkt));
+}
+
+test "udp re-promotion reserves a fresh baseline snapshot" {
+    var gateway: Gateway = undefined;
+    gateway.snapshot_id = 7;
+    gateway.snapshot_in_flight_id = null;
+    gateway.output_epoch = 3;
+    gateway.output_coalesce_buf = .empty;
+    gateway.ssh_udp_probe_authenticated_ns = 99;
+
+    const snapshot_id = gateway.beginUdpRepromotion();
+    try std.testing.expectEqual(@as(u32, 8), snapshot_id);
+    try std.testing.expectEqual(@as(?u32, 8), gateway.snapshot_in_flight_id);
+    try std.testing.expectEqual(@as(u32, 8), gateway.output_epoch);
+    try std.testing.expect(gateway.ssh_udp_probe_authenticated_ns == null);
 }
 
 test "ssh promotion replay drops stale snapshots but preserves later reliable IPC" {

@@ -45,6 +45,46 @@ pub const Candidates2Payload = struct {
     candidates: []CandidateWire,
 };
 
+pub fn encodeCandidatesPayloadJson(alloc: std.mem.Allocator, candidates: []const Candidate) ![]u8 {
+    var wire_list = try std.ArrayList(CandidateWire).initCapacity(alloc, candidates.len);
+    defer wire_list.deinit(alloc);
+    var owned_endpoints = try std.ArrayList([]u8).initCapacity(alloc, candidates.len);
+    defer {
+        for (owned_endpoints.items) |ep| alloc.free(ep);
+        owned_endpoints.deinit(alloc);
+    }
+
+    for (candidates) |candidate| {
+        const endpoint = try endpointForAddressAlloc(alloc, candidate.addr);
+        try owned_endpoints.append(alloc, endpoint);
+        try wire_list.append(alloc, .{
+            .ctype = candidate.ctype,
+            .endpoint = endpoint,
+            .source = candidate.source,
+        });
+    }
+
+    const payload = Candidates2Payload{ .candidates = wire_list.items };
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    errdefer builder.deinit();
+    try builder.writer.print("{f}", .{std.json.fmt(payload, .{})});
+    return builder.toOwnedSlice();
+}
+
+pub fn parseCandidatesPayloadJson(alloc: std.mem.Allocator, json_payload: []const u8) !std.ArrayList(Candidate) {
+    var parsed = try std.json.parseFromSlice(Candidates2Payload, alloc, json_payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var out = try std.ArrayList(Candidate).initCapacity(alloc, parsed.value.candidates.len);
+    errdefer out.deinit(alloc);
+    for (parsed.value.candidates) |wire| {
+        const candidate = try wireToCandidate(wire);
+        if (!isCandidateAddressUsable(candidate.addr)) continue;
+        try out.append(alloc, candidate);
+    }
+    return out;
+}
+
 pub fn endpointForAddressAlloc(alloc: std.mem.Allocator, addr: std.net.Address) ![]u8 {
     return std.fmt.allocPrint(alloc, "{f}", .{addr});
 }
@@ -567,6 +607,29 @@ test "probe state progresses and locks on auth recv" {
     state.onAuthenticatedRecv(std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 61000));
     try std.testing.expect(state.isComplete());
     try std.testing.expect(state.nextProbeAddr() == null);
+}
+
+test "candidate payload json round trip" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const candidates = [_]Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 10 }, 60000), .source = "ifaddr" },
+        .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 7 }, 60001), .source = "stun" },
+    };
+
+    const json_payload = try encodeCandidatesPayloadJson(alloc, &candidates);
+    defer alloc.free(json_payload);
+
+    var parsed = try parseCandidatesPayloadJson(alloc, json_payload);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.items.len);
+    try std.testing.expect(parsed.items[0].ctype == .host);
+    try std.testing.expectEqual(@as(u16, 60000), parsed.items[0].addr.getPort());
+    try std.testing.expect(parsed.items[1].ctype == .srflx);
+    try std.testing.expectEqual(@as(u16, 60001), parsed.items[1].addr.getPort());
 }
 
 test "probe state reset swaps candidates and clears progress" {
