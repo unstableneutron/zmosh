@@ -71,13 +71,20 @@ pub const TimingStats = struct {
     }
 };
 
+pub const ServerReflexiveMapping = struct {
+    server_addr: std.net.Address,
+    candidate: Candidate,
+};
+
 pub const SrflxGatherResult = struct {
     candidates: std.ArrayList(Candidate),
+    server_mappings: std.ArrayList(ServerReflexiveMapping),
     responsive_servers: usize = 0,
     rtt_stats: TimingStats = .{},
 
     pub fn deinit(self: *SrflxGatherResult, alloc: std.mem.Allocator) void {
         self.candidates.deinit(alloc);
+        self.server_mappings.deinit(alloc);
     }
 };
 
@@ -238,6 +245,7 @@ pub fn isStunPacket(server_addr: std.net.Address, from: std.net.Address, data: [
 pub const StunState = struct {
     txn_id: [12]u8,
     server_addr: std.net.Address,
+    server_idx: usize,
     sent_ns: i64 = 0,
     retries: u8 = 0,
     result: ?Candidate = null,
@@ -246,12 +254,13 @@ pub const StunState = struct {
     waiting_response: bool = false,
     next_retry_ns: i64 = 0,
 
-    pub fn init(server_addr: std.net.Address) StunState {
+    pub fn init(server_addr: std.net.Address, server_idx: usize) StunState {
         var txn_id: [12]u8 = undefined;
         std.crypto.random.bytes(&txn_id);
         return .{
             .txn_id = txn_id,
             .server_addr = server_addr,
+            .server_idx = server_idx,
         };
     }
 
@@ -516,23 +525,14 @@ pub fn gatherHostCandidates(
 fn candidatePriority(candidate: Candidate) u8 {
     return switch (candidate.ctype) {
         .host => switch (candidate.addr.any.family) {
-            posix.AF.INET6 => if (isIp6UniqueLocal(candidate.addr.in6.sa.addr)) 4 else 0,
-            posix.AF.INET => blk: {
-                const addr_u32 = std.mem.bigToNative(u32, candidate.addr.in.sa.addr);
-                const ip = [4]u8{
-                    @truncate(addr_u32 >> 24),
-                    @truncate(addr_u32 >> 16),
-                    @truncate(addr_u32 >> 8),
-                    @truncate(addr_u32),
-                };
-                break :blk if (isIp4Privateish(ip)) 5 else 1;
-            },
-            else => 7,
+            posix.AF.INET6 => if (isIp6UniqueLocal(candidate.addr.in6.sa.addr)) 3 else 0,
+            posix.AF.INET => 3,
+            else => 5,
         },
         .srflx => switch (candidate.addr.any.family) {
-            posix.AF.INET6 => 2,
-            posix.AF.INET => 3,
-            else => 6,
+            posix.AF.INET6 => 1,
+            posix.AF.INET => 2,
+            else => 4,
         },
     };
 }
@@ -741,8 +741,10 @@ pub fn gatherServerReflexiveCandidates(
 ) !SrflxGatherResult {
     var result = SrflxGatherResult{
         .candidates = try std.ArrayList(Candidate).initCapacity(alloc, stun_servers.len),
+        .server_mappings = try std.ArrayList(ServerReflexiveMapping).initCapacity(alloc, stun_servers.len),
     };
     errdefer result.candidates.deinit(alloc);
+    errdefer result.server_mappings.deinit(alloc);
 
     if (stun_servers.len == 0) return result;
 
@@ -750,7 +752,7 @@ pub fn gatherServerReflexiveCandidates(
     defer alloc.free(states);
 
     for (stun_servers, 0..) |server_addr, idx| {
-        states[idx] = StunState.init(server_addr);
+        states[idx] = StunState.init(server_addr, idx);
         states[idx].sendRequest(sock) catch {};
     }
 
@@ -790,6 +792,10 @@ pub fn gatherServerReflexiveCandidates(
                         result.responsive_servers += 1;
                         if (state.last_rtt_ns) |rtt_ns| result.rtt_stats.observe(rtt_ns);
                         try appendUniqueCandidate(&result.candidates, alloc, parsed.?);
+                        try result.server_mappings.append(alloc, .{
+                            .server_addr = state.server_addr,
+                            .candidate = parsed.?,
+                        });
                     }
                     break;
                 }
@@ -850,7 +856,7 @@ test "isStunPacket validates source and cookie" {
 
 test "stun parse xor-mapped-address ipv4" {
     const server = std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 3478);
-    var state = StunState.init(server);
+    var state = StunState.init(server, 0);
     state.txn_id = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
 
     // Build Binding Success with XOR-MAPPED-ADDRESS for 203.0.113.7:54321.
@@ -946,7 +952,7 @@ test "probe state reset swaps candidates and clears progress" {
     try std.testing.expect(isAddressEqual(next, second_candidates[0].addr));
 }
 
-test "candidate sorting keeps globally useful paths ahead of local hosts" {
+test "candidate sorting prefers global ipv6, then srflx, then other hosts" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -964,9 +970,9 @@ test "candidate sorting keeps globally useful paths ahead of local hosts" {
     try std.testing.expectEqual(@as(usize, 3), candidates.items.len);
     try std.testing.expect(candidates.items[0].ctype == .host);
     try std.testing.expect(candidates.items[0].addr.any.family == posix.AF.INET6);
-    try std.testing.expect(candidates.items[1].ctype == .host);
-    try std.testing.expect(candidates.items[1].addr.any.family == posix.AF.INET);
-    try std.testing.expect(candidates.items[2].ctype == .srflx);
+    try std.testing.expect(candidates.items[1].ctype == .srflx);
+    try std.testing.expect(candidates.items[2].ctype == .srflx or candidates.items[2].ctype == .host);
+    try std.testing.expect(candidates.items[2].ctype != .host or candidates.items[2].addr.any.family == posix.AF.INET);
 }
 
 test "adaptive probe timeout grows for slow observed RTT" {

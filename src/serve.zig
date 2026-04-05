@@ -5,6 +5,7 @@ const udp = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
 const nat = @import("nat.zig");
+const portmap = @import("portmap.zig");
 
 const log = std.log.scoped(.serve);
 
@@ -246,11 +247,70 @@ fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.All
     try nat.appendUniqueCandidate(list, alloc, candidate);
 }
 
-fn findServerReflexiveCandidate(candidates: []const nat.Candidate) ?std.net.Address {
-    for (candidates) |candidate| {
-        if (candidate.ctype == .srflx) return candidate.addr;
+fn containsAddressExcept(slots: []const ?std.net.Address, skip_idx: ?usize, addr: std.net.Address) bool {
+    for (slots, 0..) |slot, idx| {
+        if (skip_idx != null and idx == skip_idx.?) continue;
+        if (slot) |existing| {
+            if (nat.isAddressEqual(existing, addr)) return true;
+        }
     }
-    return null;
+    return false;
+}
+
+fn updateSrflxMappingSlot(slots: []?std.net.Address, server_idx: usize, addr: std.net.Address) bool {
+    if (server_idx >= slots.len) return false;
+
+    const old_addr = slots[server_idx];
+    if (old_addr) |existing| {
+        if (nat.isAddressEqual(existing, addr)) return false;
+    }
+
+    const removed_unique = if (old_addr) |existing|
+        !containsAddressExcept(slots, server_idx, existing)
+    else
+        false;
+    const added_unique = !containsAddressExcept(slots, server_idx, addr);
+
+    slots[server_idx] = addr;
+    return removed_unique or added_unique;
+}
+
+fn buildSrflxMappingSlots(
+    alloc: std.mem.Allocator,
+    stun_servers: []const std.net.Address,
+    initial_mappings: []const nat.ServerReflexiveMapping,
+) !std.ArrayList(?std.net.Address) {
+    var slots = try std.ArrayList(?std.net.Address).initCapacity(alloc, stun_servers.len);
+    errdefer slots.deinit(alloc);
+
+    for (stun_servers) |_| {
+        try slots.append(alloc, null);
+    }
+
+    for (initial_mappings) |mapping| {
+        for (stun_servers, 0..) |server_addr, idx| {
+            if (!nat.isAddressEqual(server_addr, mapping.server_addr)) continue;
+            slots.items[idx] = mapping.candidate.addr;
+            break;
+        }
+    }
+
+    return slots;
+}
+
+fn appendCurrentSrflxCandidates(
+    list: *std.ArrayList(nat.Candidate),
+    alloc: std.mem.Allocator,
+    slots: []const ?std.net.Address,
+) !void {
+    for (slots) |slot| {
+        const addr = slot orelse continue;
+        try appendUniqueCandidate(list, alloc, .{
+            .ctype = .srflx,
+            .addr = addr,
+            .source = "stun",
+        }, nat.max_candidates);
+    }
 }
 
 fn sendConnect2(
@@ -354,6 +414,7 @@ fn gatherLocalCandidates(
     stun_servers: []const std.net.Address,
     stun_rtt_stats: *nat.TimingStats,
     responsive_stun_servers: *usize,
+    initial_srflx_mappings: ?*std.ArrayList(nat.ServerReflexiveMapping),
 ) !std.ArrayList(nat.Candidate) {
     var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, nat.max_candidates);
     errdefer out.deinit(alloc);
@@ -363,6 +424,10 @@ fn gatherLocalCandidates(
 
     stun_rtt_stats.* = srflx.rtt_stats;
     responsive_stun_servers.* = srflx.responsive_servers;
+
+    if (initial_srflx_mappings) |mappings| {
+        try mappings.appendSlice(alloc, srflx.server_mappings.items);
+    }
 
     for (srflx.candidates.items) |candidate| {
         try appendUniqueCandidate(&out, alloc, candidate, nat.max_candidates);
@@ -535,7 +600,8 @@ pub const Gateway = struct {
     stun_server_idx: usize,
     stun_state: ?nat.StunState,
     last_stun_keepalive_ns: i64,
-    last_srflx: ?std.net.Address,
+    srflx_mappings: std.ArrayList(?std.net.Address),
+    portmap_client: ?portmap.Client,
     ssh_udp_probe_authenticated_ns: ?i64,
     candidate_reprobe: nat.CandidateReprobe,
     connect_debug: bool,
@@ -581,16 +647,23 @@ pub const Gateway = struct {
         errdefer transport_mode.deinit(alloc);
         var standby_ssh: ?StandbySsh = null;
         errdefer if (standby_ssh) |*standby| standby.deinit(alloc, true);
-        var initial_srflx: ?std.net.Address = null;
         var initial_stun_rtt_stats: nat.TimingStats = .{};
         var responsive_stun_servers: usize = 0;
         const bootstrap_v2 = std.mem.eql(u8, posix.getenv("ZMX_BOOTSTRAP") orelse "", "2");
+        var portmap_client: ?portmap.Client = if (bootstrap_v2)
+            try portmap.Client.bootstrap(alloc, udp_sock.bound_port)
+        else
+            null;
+        errdefer if (portmap_client) |*client| client.deinit();
 
         connectDebug(connect_debug, "bootstrap_v2={} probe_timeout_ms={d} stun_servers={d}", .{
             bootstrap_v2,
             @divFloor(probe_timeout_ns, std.time.ns_per_ms),
             stun_servers.items.len,
         });
+
+        var initial_srflx_mappings = try std.ArrayList(nat.ServerReflexiveMapping).initCapacity(alloc, stun_servers.items.len);
+        defer initial_srflx_mappings.deinit(alloc);
 
         if (bootstrap_v2) {
             var local_candidates = try gatherLocalCandidates(
@@ -600,9 +673,15 @@ pub const Gateway = struct {
                 stun_servers.items,
                 &initial_stun_rtt_stats,
                 &responsive_stun_servers,
+                &initial_srflx_mappings,
             );
             defer local_candidates.deinit(alloc);
-            initial_srflx = findServerReflexiveCandidate(local_candidates.items);
+            if (portmap_client) |*client| {
+                if (client.currentCandidate()) |candidate| {
+                    try appendUniqueCandidate(&local_candidates, alloc, candidate, nat.max_candidates);
+                    nat.sortAndTruncateCandidates(&local_candidates, nat.max_candidates);
+                }
+            }
 
             connectDebug(connect_debug, "local candidates host={d} srflx={d} responsive_stun={d} stun_rtt_ms(min/max)={d}/{d}", .{
                 countCandidatesByType(local_candidates.items, .host),
@@ -665,6 +744,9 @@ pub const Gateway = struct {
             posix.close(posix.STDOUT_FILENO);
         }
 
+        var srflx_mappings = try buildSrflxMappingSlots(alloc, stun_servers.items, initial_srflx_mappings.items);
+        errdefer srflx_mappings.deinit(alloc);
+
         const unix_read_buf = try ipc.SocketBuffer.init(alloc);
         const unix_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
         const output_coalesce_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
@@ -707,7 +789,8 @@ pub const Gateway = struct {
             .stun_server_idx = 0,
             .stun_state = null,
             .last_stun_keepalive_ns = now,
-            .last_srflx = initial_srflx,
+            .srflx_mappings = srflx_mappings,
+            .portmap_client = portmap_client,
             .ssh_udp_probe_authenticated_ns = null,
             .candidate_reprobe = .{},
             .connect_debug = connect_debug,
@@ -776,9 +859,10 @@ pub const Gateway = struct {
                     if (err != error.WouldBlock) return err;
                 };
             }
+            try self.servicePortmap(now);
 
             // Build poll fds
-            var poll_fds: [3]posix.pollfd = undefined;
+            var poll_fds: [4]posix.pollfd = undefined;
             var poll_count: usize = 2;
             poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
 
@@ -795,6 +879,15 @@ pub const Gateway = struct {
                 poll_count += 1;
             }
 
+            var portmap_idx: ?usize = null;
+            if (self.portmap_client) |*client| {
+                if (client.wantsPoll()) {
+                    portmap_idx = poll_count;
+                    poll_fds[poll_count] = .{ .fd = client.sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
+                    poll_count += 1;
+                }
+            }
+
             const poll_timeout = self.computePollTimeoutMs(now);
             _ = posix.poll(poll_fds[0..poll_count], poll_timeout) catch |err| {
                 if (err == error.Interrupted) continue;
@@ -804,6 +897,11 @@ pub const Gateway = struct {
             if (standby_idx) |idx| {
                 if (try self.handleStandbySshEvents(poll_fds[idx].revents)) {
                     return self.runSsh();
+                }
+            }
+            if (portmap_idx) |idx| {
+                if (poll_fds[idx].revents & posix.POLL.IN != 0) {
+                    try self.handlePortmapDatagrams(@intCast(std.time.nanoTimestamp()));
                 }
             }
 
@@ -889,20 +987,31 @@ pub const Gateway = struct {
         const idx = self.stun_server_idx % self.stun_servers.items.len;
         const server = self.stun_servers.items[idx];
         self.stun_server_idx = (idx + 1) % self.stun_servers.items.len;
-        self.stun_state = nat.StunState.init(server);
+        self.stun_state = nat.StunState.init(server, idx);
         try self.stun_state.?.sendRequest(&self.udp_sock);
         self.last_stun_keepalive_ns = now;
     }
 
-    fn sendStandbyCandidateRefresh(self: *Gateway, srflx_addr: std.net.Address) !void {
+    fn buildCurrentCandidateSet(self: *Gateway) !std.ArrayList(nat.Candidate) {
         var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_family, nat.max_candidates);
-        defer refreshed.deinit(self.alloc);
-        try appendUniqueCandidate(&refreshed, self.alloc, .{
-            .ctype = .srflx,
-            .addr = srflx_addr,
-            .source = "stun",
-        }, nat.max_candidates);
+        errdefer refreshed.deinit(self.alloc);
+
+        try appendCurrentSrflxCandidates(&refreshed, self.alloc, self.srflx_mappings.items);
+        if (self.portmap_client) |*client| {
+            if (client.currentCandidate()) |candidate| {
+                try appendUniqueCandidate(&refreshed, self.alloc, candidate, nat.max_candidates);
+            }
+        }
+
         nat.sortAndTruncateCandidates(&refreshed, nat.max_candidates);
+        return refreshed;
+    }
+
+    fn sendCurrentCandidateRefresh(self: *Gateway) !void {
+        if (self.standby_ssh == null and self.transport != .ssh) return;
+
+        var refreshed = try self.buildCurrentCandidateSet();
+        defer refreshed.deinit(self.alloc);
 
         if (self.standby_ssh) |*standby| {
             const send_result = switch (standby.control) {
@@ -925,6 +1034,26 @@ pub const Gateway = struct {
         }
     }
 
+    fn servicePortmap(self: *Gateway, now: i64) !void {
+        if (self.portmap_client) |*client| {
+            if (try client.service(now)) {
+                self.sendCurrentCandidateRefresh() catch |err| {
+                    log.warn("failed to send refreshed candidates after NAT-PMP update: {s}", .{@errorName(err)});
+                };
+            }
+        }
+    }
+
+    fn handlePortmapDatagrams(self: *Gateway, now: i64) !void {
+        if (self.portmap_client) |*client| {
+            if (try client.handleReadable(now)) {
+                self.sendCurrentCandidateRefresh() catch |err| {
+                    log.warn("failed to send refreshed candidates after NAT-PMP response: {s}", .{@errorName(err)});
+                };
+            }
+        }
+    }
+
     fn handleStunDatagram(self: *Gateway, from: std.net.Address, data: []const u8) bool {
         const state = &(self.stun_state orelse return false);
         if (!state.waiting_response) return false;
@@ -932,18 +1061,12 @@ pub const Gateway = struct {
 
         const parsed = state.handleResponse(data) catch return true;
         if (parsed) |candidate| {
-            const mapping_changed = if (self.last_srflx) |old|
-                !nat.isAddressEqual(old, candidate.addr)
-            else
-                false;
-
-            if (mapping_changed) {
-                log.warn("stun mapping changed old={f} new={f}", .{ self.last_srflx.?, candidate.addr });
-                self.sendStandbyCandidateRefresh(candidate.addr) catch |err| {
+            if (updateSrflxMappingSlot(self.srflx_mappings.items, state.server_idx, candidate.addr)) {
+                connectDebug(self.connect_debug, "stun mapping set changed server_idx={d} candidate={f}", .{ state.server_idx, candidate.addr });
+                self.sendCurrentCandidateRefresh() catch |err| {
                     log.warn("failed to send refreshed standby candidates: {s}", .{@errorName(err)});
                 };
             }
-            self.last_srflx = candidate.addr;
         }
         if (!state.waiting_response) {
             self.stun_state = null;
@@ -1231,6 +1354,7 @@ pub const Gateway = struct {
                     if (err != error.WouldBlock) return err;
                 };
             }
+            try self.servicePortmap(now);
             if (self.candidate_reprobe.maybeNextProbeAddr(now)) |addr| {
                 sendProbeHeartbeatTo(&self.peer, &self.udp_sock, addr, &self.reliable_recv) catch |err| {
                     if (err != error.WouldBlock) return err;
@@ -1242,7 +1366,7 @@ pub const Gateway = struct {
                 };
             }
 
-            var poll_fds: [4]posix.pollfd = undefined;
+            var poll_fds: [5]posix.pollfd = undefined;
             var poll_count: usize = 3;
 
             poll_fds[0] = .{ .fd = ssh.read_fd, .events = if (ssh_read_eof) 0 else posix.POLL.IN, .revents = 0 };
@@ -1257,6 +1381,15 @@ pub const Gateway = struct {
                 ssh_write_idx = poll_count;
                 poll_fds[poll_count] = .{ .fd = ssh.write_fd, .events = posix.POLL.OUT, .revents = 0 };
                 poll_count += 1;
+            }
+
+            var portmap_idx: ?usize = null;
+            if (self.portmap_client) |*client| {
+                if (client.wantsPoll()) {
+                    portmap_idx = poll_count;
+                    poll_fds[poll_count] = .{ .fd = client.sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
+                    poll_count += 1;
+                }
             }
 
             var poll_timeout: i64 = 250;
@@ -1292,6 +1425,12 @@ pub const Gateway = struct {
                 return self.run();
             }
             if (!self.running) break;
+
+            if (portmap_idx) |idx| {
+                if (poll_fds[idx].revents & posix.POLL.IN != 0) {
+                    try self.handlePortmapDatagrams(@intCast(std.time.nanoTimestamp()));
+                }
+            }
 
             if (!ssh_read_eof and poll_fds[0].revents & posix.POLL.IN != 0) {
                 while (true) {
@@ -1539,6 +1678,12 @@ pub const Gateway = struct {
 
         if (self.candidate_reprobe.pollDelayMs(now)) |reprobe_ms| {
             timeout = @min(timeout, reprobe_ms);
+        }
+
+        if (self.portmap_client) |*client| {
+            if (client.pollDelayMs(now)) |portmap_ms| {
+                timeout = @min(timeout, portmap_ms);
+            }
         }
 
         if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
@@ -1966,6 +2111,8 @@ pub const Gateway = struct {
         self.reliable_send.deinit();
         self.transport.deinit(self.alloc);
         self.stun_servers.deinit(self.alloc);
+        self.srflx_mappings.deinit(self.alloc);
+        if (self.portmap_client) |*client| client.deinit();
         self.candidate_reprobe.deinit(self.alloc);
     }
 };
@@ -2053,13 +2200,25 @@ test "standby control parser accepts candidate refresh messages" {
 test "stun datagrams are ignored without active stun state" {
     var gateway: Gateway = undefined;
     gateway.stun_state = null;
-    gateway.last_srflx = null;
 
     const from = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 3478);
     var pkt: [20]u8 = [_]u8{0} ** 20;
     std.mem.writeInt(u32, pkt[4..8], nat.stun_magic_cookie, .big);
 
     try std.testing.expect(!gateway.handleStunDatagram(from, &pkt));
+}
+
+
+test "srflx mapping slots only refresh on material set changes" {
+    var slots = [_]?std.net.Address{
+        std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60000),
+        std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60000),
+        null,
+    };
+
+    try std.testing.expect(!updateSrflxMappingSlot(&slots, 1, std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60000)));
+    try std.testing.expect(!updateSrflxMappingSlot(&slots, 1, std.net.Address.initIp4(.{ 198, 51, 100, 21 }, 60000)));
+    try std.testing.expect(updateSrflxMappingSlot(&slots, 0, std.net.Address.initIp4(.{ 198, 51, 100, 22 }, 60000)));
 }
 
 test "udp re-promotion reserves a fresh baseline snapshot" {
