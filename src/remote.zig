@@ -1541,10 +1541,87 @@ fn handleAsyncSrflxDatagram(
         .ignored => false,
         .handled => true,
         .changed => blk: {
-            try sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug);
+            sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug) catch |err| {
+                connectDebug(connect_debug, "failed to send refreshed local candidates after async srflx update: {s}", .{@errorName(err)});
+            };
             break :blk true;
         },
     };
+}
+
+const UdpSnapshotChunkResult = enum {
+    ignored,
+    applied,
+    needs_resync,
+};
+
+fn handleUdpSnapshotChunk(
+    alloc: std.mem.Allocator,
+    snapshot: ipc.Snapshot,
+    snapshot_bytes: []const u8,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    active_snapshot_id: *?u32,
+    pending_output_epoch: *?u32,
+    resync_pending: *bool,
+    resync_backoff_ns: *i64,
+    current_output_epoch: *u32,
+) !UdpSnapshotChunkResult {
+    const preserve_pending_output = pending_output_epoch.* != null and pending_output_epoch.*.? == snapshot.id;
+
+    if (active_snapshot_id.*) |current| {
+        if (snapshot.id < current) {
+            return .ignored;
+        }
+        if (snapshot.id > current) {
+            stdout_buf.clearRetainingCapacity();
+            if (!preserve_pending_output) {
+                deferred_output_buf.clearRetainingCapacity();
+                pending_output_epoch.* = null;
+            }
+            active_snapshot_id.* = snapshot.id;
+        }
+    } else {
+        stdout_buf.clearRetainingCapacity();
+        if (!preserve_pending_output) {
+            deferred_output_buf.clearRetainingCapacity();
+            pending_output_epoch.* = null;
+        }
+        active_snapshot_id.* = snapshot.id;
+    }
+
+    if (pending_output_epoch.*) |pending_epoch| {
+        if (pending_epoch != snapshot.id) {
+            deferred_output_buf.clearRetainingCapacity();
+            pending_output_epoch.* = null;
+        }
+    }
+
+    if (stdout_buf.items.len + snapshot_bytes.len > max_stdout_buf) {
+        stdout_buf.clearRetainingCapacity();
+        deferred_output_buf.clearRetainingCapacity();
+        pending_output_epoch.* = null;
+        return .needs_resync;
+    }
+
+    resync_pending.* = false;
+    current_output_epoch.* = snapshot.id;
+    resync_backoff_ns.* = initial_resync_backoff_ns;
+    try stdout_buf.appendSlice(alloc, snapshot_bytes);
+    if (!snapshot.isFinal()) return .applied;
+
+    active_snapshot_id.* = null;
+    if (stdout_buf.items.len + deferred_output_buf.items.len > max_stdout_buf) {
+        stdout_buf.clearRetainingCapacity();
+        deferred_output_buf.clearRetainingCapacity();
+        pending_output_epoch.* = null;
+        return .needs_resync;
+    }
+
+    try stdout_buf.appendSlice(alloc, deferred_output_buf.items);
+    deferred_output_buf.clearRetainingCapacity();
+    pending_output_epoch.* = null;
+    return .applied;
 }
 
 fn applyUdpRepromotionState(
@@ -2182,54 +2259,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                                 } else if (hdr.tag == .Snapshot and payload.len >= @sizeOf(ipc.Snapshot)) {
                                                     const snapshot = std.mem.bytesToValue(ipc.Snapshot, payload[0..@sizeOf(ipc.Snapshot)]);
                                                     const snapshot_bytes = payload[@sizeOf(ipc.Snapshot)..];
-                                                    if (active_snapshot_id) |current| {
-                                                        if (snapshot.id < current) {
-                                                            offset += msg_len;
-                                                            continue;
-                                                        }
-                                                        if (snapshot.id > current) {
-                                                            stdout_buf.clearRetainingCapacity();
-                                                            deferred_output_buf.clearRetainingCapacity();
-                                                            pending_output_epoch = null;
-                                                            active_snapshot_id = snapshot.id;
-                                                        }
-                                                    } else {
-                                                        stdout_buf.clearRetainingCapacity();
-                                                        deferred_output_buf.clearRetainingCapacity();
-                                                        pending_output_epoch = null;
-                                                        active_snapshot_id = snapshot.id;
-                                                    }
-
-                                                    if (pending_output_epoch) |pending_epoch| {
-                                                        if (pending_epoch != snapshot.id) {
-                                                            deferred_output_buf.clearRetainingCapacity();
-                                                            pending_output_epoch = null;
-                                                        }
-                                                    }
-
-                                                    if (stdout_buf.items.len + snapshot_bytes.len > max_stdout_buf) {
-                                                        stdout_buf.clearRetainingCapacity();
-                                                        deferred_output_buf.clearRetainingCapacity();
-                                                        pending_output_epoch = null;
-                                                        try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now);
-                                                    } else {
-                                                        resync_pending = false;
-                                                        current_output_epoch = snapshot.id;
-                                                        resync_backoff_ns = initial_resync_backoff_ns;
-                                                        try stdout_buf.appendSlice(alloc, snapshot_bytes);
-                                                        if (snapshot.isFinal()) {
-                                                            active_snapshot_id = null;
-                                                            if (stdout_buf.items.len + deferred_output_buf.items.len > max_stdout_buf) {
-                                                                stdout_buf.clearRetainingCapacity();
-                                                                deferred_output_buf.clearRetainingCapacity();
-                                                                pending_output_epoch = null;
-                                                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now);
-                                                            } else {
-                                                                try stdout_buf.appendSlice(alloc, deferred_output_buf.items);
-                                                                deferred_output_buf.clearRetainingCapacity();
-                                                                pending_output_epoch = null;
-                                                            }
-                                                        }
+                                                    switch (try handleUdpSnapshotChunk(alloc, snapshot, snapshot_bytes, &stdout_buf, &deferred_output_buf, &active_snapshot_id, &pending_output_epoch, &resync_pending, &resync_backoff_ns, &current_output_epoch)) {
+                                                        .ignored, .applied => {},
+                                                        .needs_resync => try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, &resync_backoff_ns, &resync_pending, now),
                                                     }
                                                 } else if (hdr.tag == .SessionEnd) {
                                                     session_ended = true;
@@ -2597,6 +2629,68 @@ test "udp re-promotion state waits for the fresh baseline epoch" {
     try std.testing.expectEqual(@as(u32, 42), current_output_epoch);
 }
 
+test "udp re-promotion preserves deferred output until the final snapshot chunk" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 32);
+    defer stdout_buf.deinit(alloc);
+    var deferred_output_buf = try std.ArrayList(u8).initCapacity(alloc, 32);
+    defer deferred_output_buf.deinit(alloc);
+
+    var active_snapshot_id: ?u32 = 1;
+    var awaiting_ssh_snapshot = true;
+    var expected_ssh_snapshot_id: ?u32 = 7;
+    var pending_output_epoch: ?u32 = 9;
+    var resync_pending = true;
+    var current_output_epoch: u32 = 3;
+    var resync_backoff_ns: i64 = 0;
+
+    applyUdpRepromotionState(42, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &stdout_buf, &deferred_output_buf, &pending_output_epoch, &resync_pending, &current_output_epoch);
+    try deferred_output_buf.appendSlice(alloc, "tail");
+
+    try std.testing.expectEqual(
+        UdpSnapshotChunkResult.applied,
+        try handleUdpSnapshotChunk(
+            alloc,
+            .{ .id = 42, .flags = 0 },
+            "snap-",
+            &stdout_buf,
+            &deferred_output_buf,
+            &active_snapshot_id,
+            &pending_output_epoch,
+            &resync_pending,
+            &resync_backoff_ns,
+            &current_output_epoch,
+        ),
+    );
+    try std.testing.expectEqual(@as(?u32, 42), active_snapshot_id);
+    try std.testing.expectEqual(@as(?u32, 42), pending_output_epoch);
+    try std.testing.expectEqualStrings("snap-", stdout_buf.items);
+    try std.testing.expectEqualStrings("tail", deferred_output_buf.items);
+
+    try std.testing.expectEqual(
+        UdpSnapshotChunkResult.applied,
+        try handleUdpSnapshotChunk(
+            alloc,
+            .{ .id = 42, .flags = 0x1 },
+            "base",
+            &stdout_buf,
+            &deferred_output_buf,
+            &active_snapshot_id,
+            &pending_output_epoch,
+            &resync_pending,
+            &resync_backoff_ns,
+            &current_output_epoch,
+        ),
+    );
+    try std.testing.expect(active_snapshot_id == null);
+    try std.testing.expect(pending_output_epoch == null);
+    try std.testing.expectEqualStrings("snap-basetail", stdout_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), deferred_output_buf.items.len);
+}
+
 test "standby candidate reprobe filters reset and select refreshed path" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -2700,6 +2794,25 @@ test "standby UDP control messages start refreshed reprobes" {
     try std.testing.expect(peer.recovery_mode);
 }
 
+fn buildSrflxSuccessResponse(state: *const nat.StunState, ip: [4]u8, port: u16) [32]u8 {
+    var msg: [32]u8 = [_]u8{0} ** 32;
+    std.mem.writeInt(u16, msg[0..2], 0x0101, .big);
+    std.mem.writeInt(u16, msg[2..4], 12, .big);
+    std.mem.writeInt(u32, msg[4..8], nat.stun_magic_cookie, .big);
+    msg[8..20].* = state.txn_id;
+    std.mem.writeInt(u16, msg[20..22], 0x0020, .big);
+    std.mem.writeInt(u16, msg[22..24], 8, .big);
+    msg[24] = 0;
+    msg[25] = 0x01;
+
+    const x_port = port ^ @as(u16, @truncate(nat.stun_magic_cookie >> 16));
+    std.mem.writeInt(u16, msg[26..28], x_port, .big);
+
+    const ip_u32 = std.mem.readInt(u32, &ip, .big);
+    std.mem.writeInt(u32, msg[28..32], ip_u32 ^ nat.stun_magic_cookie, .big);
+    return msg;
+}
+
 test "async srflx refresh updates local candidates after a STUN response" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -2719,23 +2832,9 @@ test "async srflx refresh updates local candidates after a STUN response" {
     try std.testing.expectEqual(@as(usize, 0), countCandidatesByType(initial.items, .srflx));
 
     const state = &refresh.states.items[0];
-    var msg: [32]u8 = [_]u8{0} ** 32;
-    std.mem.writeInt(u16, msg[0..2], 0x0101, .big);
-    std.mem.writeInt(u16, msg[2..4], 12, .big);
-    std.mem.writeInt(u32, msg[4..8], nat.stun_magic_cookie, .big);
-    msg[8..20].* = state.txn_id;
-    std.mem.writeInt(u16, msg[20..22], 0x0020, .big);
-    std.mem.writeInt(u16, msg[22..24], 8, .big);
-    msg[24] = 0;
-    msg[25] = 0x01;
-
-    const port: u16 = 54321;
-    const x_port = port ^ @as(u16, @truncate(nat.stun_magic_cookie >> 16));
-    std.mem.writeInt(u16, msg[26..28], x_port, .big);
-
     const ip = [4]u8{ 203, 0, 113, 7 };
-    const ip_u32 = std.mem.readInt(u32, &ip, .big);
-    std.mem.writeInt(u32, msg[28..32], ip_u32 ^ nat.stun_magic_cookie, .big);
+    const port: u16 = 54321;
+    const msg = buildSrflxSuccessResponse(state, ip, port);
 
     try std.testing.expect(refresh.handleDatagram(state.server_addr, &msg) == .changed);
 
@@ -2750,6 +2849,42 @@ test "async srflx refresh updates local candidates after a STUN response" {
         if (saw_srflx) break;
     }
     try std.testing.expect(saw_srflx);
+}
+
+test "async srflx refresh send failures disable standby without aborting UDP" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var refresh = try AsyncSrflxRefresh.init(alloc, .ipv4_only, &[_][]const u8{"127.0.0.1:3478"});
+    defer refresh.deinit(alloc);
+
+    var sock = try udp_mod.UdpSocket.bindEphemeral(posix.AF.INET);
+    defer sock.close();
+
+    try std.testing.expect(try refresh.start(alloc, &sock));
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[1]);
+    var standby_ssh: ?StandbySsh = .{
+        .read_fd = pipe_fds[0],
+        .write_fd = pipe_fds[0],
+        .control = .{ .line = .empty },
+    };
+    defer if (standby_ssh) |*standby| standby.deinit(alloc, true);
+
+    var peer = udp_mod.Peer.init([_]u8{0} ** crypto.key_length, .to_server);
+    var transport_mode: RemoteTransport = .{ .udp = .{ .sock = &sock, .peer = &peer } };
+
+    const state = &refresh.states.items[0];
+    const msg = buildSrflxSuccessResponse(state, .{ 203, 0, 113, 9 }, 54322);
+
+    try std.testing.expect(try handleAsyncSrflxDatagram(alloc, .ipv4_only, &sock, &transport_mode, &standby_ssh, &refresh, state.server_addr, &msg, false));
+    try std.testing.expect(standby_ssh == null);
+    switch (transport_mode) {
+        .udp => {},
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "session name validation" {
