@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const udp = @import("udp.zig");
+const crypto = @import("crypto.zig");
 
 const c = @cImport({
     @cInclude("ifaddrs.h");
@@ -734,6 +735,37 @@ pub const CandidateReprobe = struct {
     }
 };
 
+pub const ReprobeDecodeResult = struct {
+    plaintext: []u8,
+    selected: bool,
+};
+
+pub fn decodeReprobeDatagram(
+    peer: *udp.Peer,
+    reprobe: *CandidateReprobe,
+    raw: []const u8,
+    from: std.net.Address,
+    buf: []u8,
+    allow_peer_reflexive: bool,
+) !?ReprobeDecodeResult {
+    if (!reprobe.isActive()) {
+        const plaintext = try peer.decodeAndUpdate(raw, from, buf) orelse return null;
+        return .{ .plaintext = plaintext, .selected = false };
+    }
+
+    const prev_addr = peer.addr;
+    const plaintext = try peer.decodeAndUpdate(raw, from, buf) orelse return null;
+    const selected = if (allow_peer_reflexive)
+        reprobe.onAuthenticatedRecvPeerReflexive(from)
+    else
+        reprobe.onAuthenticatedRecv(from);
+    if (!selected) {
+        peer.addr = prev_addr;
+    }
+
+    return .{ .plaintext = plaintext, .selected = selected };
+}
+
 pub fn gatherServerReflexiveCandidates(
     alloc: std.mem.Allocator,
     sock: *udp.UdpSocket,
@@ -1008,6 +1040,43 @@ test "probe state reset swaps candidates and clears progress" {
     try std.testing.expect(state.selected == null);
     const next = state.nextProbeAddr().?;
     try std.testing.expect(isAddressEqual(next, second_candidates[0].addr));
+}
+
+test "decode reprobe datagram preserves peer address until selection" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const key: crypto.Key = [_]u8{0x42} ** crypto.key_length;
+    const old_addr = std.net.Address.initIp4(.{ 203, 0, 113, 9 }, 60000);
+    const selected_addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 61000);
+
+    var peer = udp.Peer.init(key, .to_server);
+    peer.addr = old_addr;
+
+    var reprobe: CandidateReprobe = .{};
+    defer reprobe.deinit(alloc);
+
+    const candidates = [_]Candidate{
+        .{ .ctype = .srflx, .addr = selected_addr, .source = "stun" },
+    };
+    try std.testing.expect(try reprobe.start(alloc, .ipv4_only, &candidates, 0));
+
+    var first_buf: [64]u8 = undefined;
+    const first_raw = try crypto.encodeDatagram(key, .to_client, 0, "first", &first_buf);
+    var decrypt_buf: [64]u8 = undefined;
+    const stray_addr = std.net.Address.initIp4(.{ 203, 0, 113, 77 }, 62000);
+    const first = (try decodeReprobeDatagram(&peer, &reprobe, first_raw, stray_addr, &decrypt_buf, false)).?;
+    try std.testing.expectEqualStrings("first", first.plaintext);
+    try std.testing.expect(!first.selected);
+    try std.testing.expect(isAddressEqual(old_addr, peer.addr.?));
+
+    var second_buf: [64]u8 = undefined;
+    const second_raw = try crypto.encodeDatagram(key, .to_client, 1, "second", &second_buf);
+    const second = (try decodeReprobeDatagram(&peer, &reprobe, second_raw, selected_addr, &decrypt_buf, false)).?;
+    try std.testing.expectEqualStrings("second", second.plaintext);
+    try std.testing.expect(second.selected);
+    try std.testing.expect(isAddressEqual(selected_addr, peer.addr.?));
 }
 
 test "candidate sorting prefers global ipv6, then srflx, then other hosts" {

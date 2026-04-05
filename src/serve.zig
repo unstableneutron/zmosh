@@ -923,11 +923,11 @@ pub const Gateway = struct {
                     }
 
                     var decrypt_buf: [9000]u8 = undefined;
-                    const decoded = try self.peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf) orelse continue;
-                    if (self.candidate_reprobe.onAuthenticatedRecv(raw.from)) {
+                    const decoded = try nat.decodeReprobeDatagram(&self.peer, &self.candidate_reprobe, raw.data, raw.from, &decrypt_buf, false) orelse continue;
+                    if (decoded.selected) {
                         connectDebug(self.connect_debug, "authenticated refreshed client UDP path {f}", .{raw.from});
                     }
-                    try self.handleTransportPacket(decoded, now);
+                    try self.handleTransportPacket(decoded.plaintext, now);
                 }
             }
 

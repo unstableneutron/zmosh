@@ -327,6 +327,119 @@ fn replaceCandidateSet(
 
 const CandidateReprobe = nat.CandidateReprobe;
 
+const AsyncSrflxRefresh = struct {
+    stun_servers: std.ArrayList(std.net.Address),
+    mappings: std.ArrayList(?std.net.Address),
+    states: std.ArrayList(nat.StunState),
+
+    const DatagramEvent = enum {
+        ignored,
+        handled,
+        changed,
+    };
+
+    fn init(
+        alloc: std.mem.Allocator,
+        socket_capability: udp_mod.SocketCapability,
+        stun_server_specs: []const []const u8,
+    ) !AsyncSrflxRefresh {
+        var stun_servers = try nat.resolveStunServers(alloc, socket_capability, stun_server_specs);
+        errdefer stun_servers.deinit(alloc);
+
+        var mappings = try std.ArrayList(?std.net.Address).initCapacity(alloc, stun_servers.items.len);
+        errdefer mappings.deinit(alloc);
+        try mappings.resize(alloc, stun_servers.items.len);
+        for (mappings.items) |*slot| slot.* = null;
+
+        return .{
+            .stun_servers = stun_servers,
+            .mappings = mappings,
+            .states = try std.ArrayList(nat.StunState).initCapacity(alloc, stun_servers.items.len),
+        };
+    }
+
+    fn deinit(self: *AsyncSrflxRefresh, alloc: std.mem.Allocator) void {
+        self.stun_servers.deinit(alloc);
+        self.mappings.deinit(alloc);
+        self.states.deinit(alloc);
+    }
+
+    fn start(self: *AsyncSrflxRefresh, alloc: std.mem.Allocator, sock: *udp_mod.UdpSocket) !bool {
+        self.states.clearRetainingCapacity();
+        if (self.mappings.items.len != self.stun_servers.items.len) {
+            try self.mappings.resize(alloc, self.stun_servers.items.len);
+        }
+        for (self.mappings.items) |*slot| slot.* = null;
+
+        for (self.stun_servers.items, 0..) |server_addr, idx| {
+            var state = nat.StunState.init(server_addr, idx);
+            state.sendRequest(sock) catch {};
+            try self.states.append(alloc, state);
+        }
+
+        return self.states.items.len > 0;
+    }
+
+    fn maybeRetry(self: *AsyncSrflxRefresh, sock: *udp_mod.UdpSocket, now: i64) !void {
+        for (self.states.items) |*state| {
+            state.maybeRetry(sock, now) catch |err| {
+                if (err == error.WouldBlock) continue;
+                return err;
+            };
+        }
+    }
+
+    fn pollDelayMs(self: *const AsyncSrflxRefresh, now: i64) ?i64 {
+        var next_retry_ns: ?i64 = null;
+        for (self.states.items) |state| {
+            if (!state.waiting_response or state.result != null) continue;
+            next_retry_ns = if (next_retry_ns) |existing| @min(existing, state.next_retry_ns) else state.next_retry_ns;
+        }
+        const retry_ns = next_retry_ns orelse return null;
+        return @divFloor(@max(@as(i64, 0), retry_ns - now), std.time.ns_per_ms);
+    }
+
+    fn handleDatagram(self: *AsyncSrflxRefresh, from: std.net.Address, data: []const u8) DatagramEvent {
+        for (self.states.items) |*state| {
+            if (!state.waiting_response or state.result != null) continue;
+            if (!nat.isStunPacket(state.server_addr, from, data)) continue;
+
+            const parsed = state.handleResponse(data) catch return .handled;
+            if (parsed) |candidate| {
+                const existing = self.mappings.items[state.server_idx];
+                if (existing == null or !nat.isAddressEqual(existing.?, candidate.addr)) {
+                    self.mappings.items[state.server_idx] = candidate.addr;
+                    return .changed;
+                }
+            }
+            return .handled;
+        }
+        return .ignored;
+    }
+
+    fn buildCandidateSet(
+        self: *const AsyncSrflxRefresh,
+        alloc: std.mem.Allocator,
+        bound_port: u16,
+        socket_capability: udp_mod.SocketCapability,
+    ) !std.ArrayList(nat.Candidate) {
+        var candidates = try nat.gatherHostCandidates(alloc, bound_port, socket_capability, nat.max_candidates);
+        errdefer candidates.deinit(alloc);
+
+        for (self.mappings.items) |maybe_addr| {
+            const addr = maybe_addr orelse continue;
+            try appendUniqueCandidate(&candidates, alloc, .{
+                .ctype = .srflx,
+                .addr = addr,
+                .source = "stun",
+            }, nat.max_candidates);
+        }
+
+        nat.sortAndTruncateCandidates(&candidates, nat.max_candidates);
+        return candidates;
+    }
+};
+
 fn handleUdpStandbyControlMessages(
     alloc: std.mem.Allocator,
     standby_buffer: *std.ArrayList(u8),
@@ -1367,6 +1480,73 @@ fn takeActiveSshAsStandby(alloc: std.mem.Allocator, transport_mode: *RemoteTrans
     return standby;
 }
 
+fn sendLocalCandidateRefresh(
+    alloc: std.mem.Allocator,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?StandbySsh,
+    candidates: []const nat.Candidate,
+) !void {
+    switch (transport_mode.*) {
+        .udp => {
+            if (standby_ssh.*) |*standby| {
+                const send_result = switch (standby.control) {
+                    .line => sendCandidates(standby.write_fd, alloc, candidates),
+                    .framed => sendFramedCandidates(standby.write_fd, alloc, candidates),
+                };
+                send_result catch |err| {
+                    disableStandby(standby_ssh, alloc);
+                    return err;
+                };
+            }
+        },
+        .ssh => |*s| {
+            const json_payload = try nat.encodeCandidatesPayloadJson(alloc, candidates);
+            defer alloc.free(json_payload);
+            try appendSshIpc(&s.write_buf, alloc, .CandidateRefresh, json_payload);
+        },
+    }
+}
+
+fn sendCurrentLocalCandidateRefresh(
+    alloc: std.mem.Allocator,
+    socket_capability: udp_mod.SocketCapability,
+    sock: *udp_mod.UdpSocket,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?StandbySsh,
+    srflx_refresh: *const AsyncSrflxRefresh,
+    connect_debug: bool,
+) !void {
+    var refreshed_candidates = try srflx_refresh.buildCandidateSet(alloc, sock.bound_port, socket_capability);
+    defer refreshed_candidates.deinit(alloc);
+
+    connectDebug(connect_debug, "refreshed local candidates host={d} srflx={d}", .{
+        countCandidatesByType(refreshed_candidates.items, .host),
+        countCandidatesByType(refreshed_candidates.items, .srflx),
+    });
+    try sendLocalCandidateRefresh(alloc, transport_mode, standby_ssh, refreshed_candidates.items);
+}
+
+fn handleAsyncSrflxDatagram(
+    alloc: std.mem.Allocator,
+    socket_capability: udp_mod.SocketCapability,
+    sock: *udp_mod.UdpSocket,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?StandbySsh,
+    srflx_refresh: *AsyncSrflxRefresh,
+    from: std.net.Address,
+    data: []const u8,
+    connect_debug: bool,
+) !bool {
+    return switch (srflx_refresh.handleDatagram(from, data)) {
+        .ignored => false,
+        .handled => true,
+        .changed => blk: {
+            try sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug);
+            break :blk true;
+        },
+    };
+}
+
 fn applyUdpRepromotionState(
     snapshot_id: u32,
     active_snapshot_id: *?u32,
@@ -1383,7 +1563,7 @@ fn applyUdpRepromotionState(
     expected_ssh_snapshot_id.* = null;
     stdout_buf.clearRetainingCapacity();
     deferred_output_buf.clearRetainingCapacity();
-    pending_output_epoch.* = null;
+    pending_output_epoch.* = snapshot_id;
     resync_pending.* = false;
     current_output_epoch.* = snapshot_id;
 }
@@ -1394,8 +1574,9 @@ fn handleClientNetworkChange(
     peer: *udp_mod.Peer,
     sock: *udp_mod.UdpSocket,
     reliable_recv: *const transport.RecvState,
+    transport_mode: *RemoteTransport,
     standby_ssh: *?StandbySsh,
-    stun_servers: []const []const u8,
+    srflx_refresh: *AsyncSrflxRefresh,
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     connect_debug: bool,
@@ -1404,30 +1585,17 @@ fn handleClientNetworkChange(
     connectDebug(connect_debug, "local network change detected", .{});
     peer.enterRecoveryMode(now);
 
-    var refreshed_stun_stats: nat.TimingStats = .{};
-    var responsive_stun_servers: usize = 0;
-    var refreshed_candidates = gatherLocalCandidates(
-        alloc,
-        sock,
-        socket_capability,
-        stun_servers,
-        &refreshed_stun_stats,
-        &responsive_stun_servers,
-    ) catch |err| blk: {
-        connectDebug(connect_debug, "failed to refresh local candidates after network change: {s}", .{@errorName(err)});
-        break :blk null;
+    const started_srflx_refresh = srflx_refresh.start(alloc, sock) catch |err| blk: {
+        connectDebug(connect_debug, "failed to start async srflx refresh after network change: {s}", .{@errorName(err)});
+        break :blk false;
     };
-    defer if (refreshed_candidates) |*candidates| candidates.deinit(alloc);
-
-    if (refreshed_candidates) |candidates| {
-        connectDebug(connect_debug, "refreshed local candidates host={d} srflx={d} responsive_stun={d} stun_rtt_ms(min/max)={d}/{d}", .{
-            countCandidatesByType(candidates.items, .host),
-            countCandidatesByType(candidates.items, .srflx),
-            responsive_stun_servers,
-            durationNsToMsForLog(refreshed_stun_stats.min_ns),
-            durationNsToMsForLog(refreshed_stun_stats.max_ns),
-        });
+    if (started_srflx_refresh) {
+        connectDebug(connect_debug, "refreshing server-reflexive candidates asynchronously via {d} STUN servers", .{srflx_refresh.stun_servers.items.len});
     }
+
+    sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug) catch |err| {
+        connectDebug(connect_debug, "failed to send refreshed local candidates after network change: {s}", .{@errorName(err)});
+    };
 
     var sent_any_heartbeat = false;
     if (peer.addr) |last_peer_addr| {
@@ -1445,19 +1613,6 @@ fn handleClientNetworkChange(
     if (sent_any_heartbeat) {
         last_ack_send_ns.* = now;
         ack_dirty.* = false;
-    }
-
-    if (standby_ssh.*) |*standby| {
-        if (refreshed_candidates) |candidates| {
-            const send_result = switch (standby.control) {
-                .line => sendCandidates(standby.write_fd, alloc, candidates.items),
-                .framed => sendFramedCandidates(standby.write_fd, alloc, candidates.items),
-            };
-            send_result catch |err| {
-                connectDebug(connect_debug, "failed to send refreshed candidates over standby SSH: {s}", .{@errorName(err)});
-                disableStandby(standby_ssh, alloc);
-            };
-        }
     }
 }
 
@@ -1526,6 +1681,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     defer ssh_reprobe.deinit(alloc);
     var network_monitor = netmon.NetworkMonitor.init(alloc);
     defer network_monitor.deinit();
+    var async_srflx_refresh = try AsyncSrflxRefresh.init(alloc, socket_capability, options.stun_servers);
+    defer async_srflx_refresh.deinit(alloc);
 
     const decision = try probeAndSelectTransport(alloc, &session, options, fallback_addr, &udp_sock, &peer, &reliable_recv);
     if (decision == .udp and session.ssh != null) {
@@ -1592,6 +1749,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             try queueUdpSwitchRequest(&transport_mode.ssh.write_buf, alloc, &pending_udp_switch, now);
             connectDebug(options.connect_debug, "retrying pending UDP switch request", .{});
         }
+
+        try async_srflx_refresh.maybeRetry(&udp_sock, now);
 
         if (sigwinch_received.swap(false, .acq_rel)) {
             const new_size = getTerminalSize();
@@ -1783,6 +1942,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
         poll_timeout = @min(poll_timeout, @as(i64, network_monitor.pollTimeoutMs(now)));
+        if (async_srflx_refresh.pollDelayMs(now)) |srflx_refresh_ms| {
+            poll_timeout = @min(poll_timeout, srflx_refresh_ms);
+        }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
@@ -1801,67 +1963,30 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &peer,
                         &udp_sock,
                         &reliable_recv,
+                        &transport_mode,
                         &standby_ssh,
-                        options.stun_servers,
+                        &async_srflx_refresh,
                         &last_ack_send_ns,
                         &ack_dirty,
                         options.connect_debug,
                         netmon_now,
                     );
                 },
-                .ssh => |*s| {
-                    connectDebug(options.connect_debug, "local network change detected", .{});
-                    peer.enterRecoveryMode(netmon_now);
-
-                    var refreshed_stun_stats: nat.TimingStats = .{};
-                    var responsive_stun_servers: usize = 0;
-                    var refreshed_candidates = gatherLocalCandidates(
+                .ssh => {
+                    handleClientNetworkChange(
                         alloc,
-                        &udp_sock,
                         socket_capability,
-                        options.stun_servers,
-                        &refreshed_stun_stats,
-                        &responsive_stun_servers,
-                    ) catch |err| blk: {
-                        connectDebug(options.connect_debug, "failed to refresh local candidates after network change: {s}", .{@errorName(err)});
-                        break :blk null;
-                    };
-                    defer if (refreshed_candidates) |*candidates| candidates.deinit(alloc);
-
-                    if (refreshed_candidates) |candidates| {
-                        connectDebug(options.connect_debug, "refreshed local candidates host={d} srflx={d} responsive_stun={d} stun_rtt_ms(min/max)={d}/{d}", .{
-                            countCandidatesByType(candidates.items, .host),
-                            countCandidatesByType(candidates.items, .srflx),
-                            responsive_stun_servers,
-                            durationNsToMsForLog(refreshed_stun_stats.min_ns),
-                            durationNsToMsForLog(refreshed_stun_stats.max_ns),
-                        });
-                    }
-
-                    var sent_any_heartbeat = false;
-                    if (peer.addr) |last_peer_addr| {
-                        var burst: u8 = 0;
-                        while (burst < network_change_heartbeat_burst) : (burst += 1) {
-                            sendProbeHeartbeatTo(&peer, &udp_sock, last_peer_addr, &reliable_recv) catch |err| {
-                                if (err == error.WouldBlock) break;
-                                connectDebug(options.connect_debug, "failed to send recovery heartbeat burst: {s}", .{@errorName(err)});
-                                break;
-                            };
-                            sent_any_heartbeat = true;
-                        }
-                    }
-
-                    if (sent_any_heartbeat) {
-                        last_ack_send_ns = netmon_now;
-                        ack_dirty = false;
-                    }
-
-                    if (refreshed_candidates) |candidates| {
-                        const json_payload = try nat.encodeCandidatesPayloadJson(alloc, candidates.items);
-                        defer alloc.free(json_payload);
-                        try appendSshIpc(&s.write_buf, alloc, .CandidateRefresh, json_payload);
-                    }
-
+                        &peer,
+                        &udp_sock,
+                        &reliable_recv,
+                        &transport_mode,
+                        &standby_ssh,
+                        &async_srflx_refresh,
+                        &last_ack_send_ns,
+                        &ack_dirty,
+                        options.connect_debug,
+                        netmon_now,
+                    );
                     pending_udp_switch.clear();
                     _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, netmon_now);
                 },
@@ -2000,18 +2125,20 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             switch (transport_mode) {
                 .udp => {
                     while (true) {
-                        var decrypt_buf: [9000]u8 = undefined;
-                        const recv_result = try peer.recv(&udp_sock, &decrypt_buf);
-                        const result = recv_result orelse break;
+                        var raw_buf: [9000]u8 = undefined;
+                        const raw = try udp_sock.recvRaw(&raw_buf) orelse break;
 
-                        if (standby_reprobe.onAuthenticatedRecv(result.from)) {
-                            if (peer.addr == null or !nat.isAddressEqual(peer.addr.?, result.from)) {
-                                connectDebug(options.connect_debug, "switched active UDP peer to refreshed candidate {f}", .{result.from});
-                            }
-                            peer.addr = result.from;
+                        if (try handleAsyncSrflxDatagram(alloc, socket_capability, &udp_sock, &transport_mode, &standby_ssh, &async_srflx_refresh, raw.from, raw.data, options.connect_debug)) {
+                            continue;
                         }
 
-                        const packet = transport.parsePacket(result.data) catch continue;
+                        var decrypt_buf: [9000]u8 = undefined;
+                        const decoded = try nat.decodeReprobeDatagram(&peer, &standby_reprobe, raw.data, raw.from, &decrypt_buf, false) orelse continue;
+                        if (decoded.selected) {
+                            connectDebug(options.connect_debug, "switched active UDP peer to refreshed candidate {f}", .{raw.from});
+                        }
+
+                        const packet = transport.parsePacket(decoded.plaintext) catch continue;
                         if (reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
                             peer.reportRtt(rtt_us);
                         }
@@ -2224,14 +2351,13 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 var raw_buf: [9000]u8 = undefined;
                 const raw = try udp_sock.recvRaw(&raw_buf) orelse break;
 
-                var decrypt_buf: [9000]u8 = undefined;
-                const prev_addr = peer.addr;
-                const decoded = try peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf);
-                peer.addr = prev_addr;
-                if (decoded == null) continue;
+                if (try handleAsyncSrflxDatagram(alloc, socket_capability, &udp_sock, &transport_mode, &standby_ssh, &async_srflx_refresh, raw.from, raw.data, options.connect_debug)) {
+                    continue;
+                }
 
-                if (ssh_reprobe.onAuthenticatedRecvPeerReflexive(raw.from)) {
-                    peer.addr = raw.from;
+                var decrypt_buf: [9000]u8 = undefined;
+                const decoded = try nat.decodeReprobeDatagram(&peer, &ssh_reprobe, raw.data, raw.from, &decrypt_buf, true) orelse continue;
+                if (decoded.selected) {
                     connectDebug(options.connect_debug, "authenticated revived UDP path {f}", .{raw.from});
                     if (!pending_udp_switch.active and transport_mode == .ssh and !ssh_write_closed) {
                         try queueUdpSwitchRequest(&transport_mode.ssh.write_buf, alloc, &pending_udp_switch, now);
@@ -2439,7 +2565,7 @@ test "ssh replay strips Init while preserving later reliable IPC" {
     try std.testing.expect(hdr.tag == .Detach);
 }
 
-test "udp re-promotion state reset clears SSH baseline bookkeeping" {
+test "udp re-promotion state waits for the fresh baseline epoch" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -2465,7 +2591,8 @@ test "udp re-promotion state reset clears SSH baseline bookkeeping" {
     try std.testing.expect(expected_ssh_snapshot_id == null);
     try std.testing.expectEqual(@as(usize, 0), stdout_buf.items.len);
     try std.testing.expectEqual(@as(usize, 0), deferred_output_buf.items.len);
-    try std.testing.expect(pending_output_epoch == null);
+    try std.testing.expectEqual(@as(?u32, 42), pending_output_epoch);
+    try std.testing.expect(active_snapshot_id == null and pending_output_epoch.? == 42);
     try std.testing.expect(!resync_pending);
     try std.testing.expectEqual(@as(u32, 42), current_output_epoch);
 }
@@ -2571,6 +2698,58 @@ test "standby UDP control messages start refreshed reprobes" {
     try std.testing.expectEqual(@as(usize, 1), server_candidates.items.len);
     try std.testing.expectEqual(@as(i64, 123), reprobe.next_probe_ns);
     try std.testing.expect(peer.recovery_mode);
+}
+
+test "async srflx refresh updates local candidates after a STUN response" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var refresh = try AsyncSrflxRefresh.init(alloc, .ipv4_only, &[_][]const u8{"127.0.0.1:3478"});
+    defer refresh.deinit(alloc);
+
+    var sock = try udp_mod.UdpSocket.bindEphemeral(posix.AF.INET);
+    defer sock.close();
+
+    try std.testing.expect(try refresh.start(alloc, &sock));
+    try std.testing.expectEqual(@as(usize, 1), refresh.states.items.len);
+
+    var initial = try refresh.buildCandidateSet(alloc, sock.bound_port, .ipv4_only);
+    defer initial.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), countCandidatesByType(initial.items, .srflx));
+
+    const state = &refresh.states.items[0];
+    var msg: [32]u8 = [_]u8{0} ** 32;
+    std.mem.writeInt(u16, msg[0..2], 0x0101, .big);
+    std.mem.writeInt(u16, msg[2..4], 12, .big);
+    std.mem.writeInt(u32, msg[4..8], nat.stun_magic_cookie, .big);
+    msg[8..20].* = state.txn_id;
+    std.mem.writeInt(u16, msg[20..22], 0x0020, .big);
+    std.mem.writeInt(u16, msg[22..24], 8, .big);
+    msg[24] = 0;
+    msg[25] = 0x01;
+
+    const port: u16 = 54321;
+    const x_port = port ^ @as(u16, @truncate(nat.stun_magic_cookie >> 16));
+    std.mem.writeInt(u16, msg[26..28], x_port, .big);
+
+    const ip = [4]u8{ 203, 0, 113, 7 };
+    const ip_u32 = std.mem.readInt(u32, &ip, .big);
+    std.mem.writeInt(u32, msg[28..32], ip_u32 ^ nat.stun_magic_cookie, .big);
+
+    try std.testing.expect(refresh.handleDatagram(state.server_addr, &msg) == .changed);
+
+    var updated = try refresh.buildCandidateSet(alloc, sock.bound_port, .ipv4_only);
+    defer updated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), countCandidatesByType(updated.items, .srflx));
+
+    var saw_srflx = false;
+    for (updated.items) |candidate| {
+        if (candidate.ctype != .srflx) continue;
+        saw_srflx = nat.isAddressEqual(candidate.addr, std.net.Address.initIp4(ip, port));
+        if (saw_srflx) break;
+    }
+    try std.testing.expect(saw_srflx);
 }
 
 test "session name validation" {
