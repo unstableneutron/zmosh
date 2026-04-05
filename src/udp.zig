@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const posix = std.posix;
 const crypto = @import("crypto.zig");
@@ -18,6 +19,56 @@ fn copySockaddrToAddress(src_addr: posix.sockaddr.storage, addr_len: posix.sockl
         std.mem.asBytes(&src_addr)[0..len],
     );
     return addr;
+}
+
+fn mapUdpSendErrno(err: posix.E) ?posix.SendToError {
+    return switch (err) {
+        .ACCES => error.AccessDenied,
+        // Linux can report EPERM for firewall-filtered UDP sends (for example,
+        // iptables/nftables rules). Treat it like a transient send failure so
+        // recovery/fallback logic can keep running instead of crashing inside
+        // std.posix.sendto's unexpectedErrno path.
+        .PERM => error.WouldBlock,
+        .AGAIN => error.WouldBlock,
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .INVAL => error.UnreachableAddress,
+        .MSGSIZE => error.MessageTooBig,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .PIPE => error.BrokenPipe,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
+        .LOOP => error.SymLinkLoop,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .HOSTUNREACH, .NETUNREACH => error.NetworkUnreachable,
+        .NOTCONN => error.SocketNotConnected,
+        .NETDOWN => error.NetworkSubsystemFailed,
+        .SUCCESS, .INTR => null,
+        else => null,
+    };
+}
+
+fn sendToCompat(
+    sockfd: posix.socket_t,
+    buf: []const u8,
+    flags: u32,
+    dest_addr: ?*const posix.sockaddr,
+    addrlen: posix.socklen_t,
+) posix.SendToError!usize {
+    if (builtin.os.tag == .windows) {
+        return posix.sendto(sockfd, buf, flags, dest_addr, addrlen);
+    }
+
+    while (true) {
+        const rc = posix.system.sendto(sockfd, buf.ptr, buf.len, flags, dest_addr, addrlen);
+        const err = posix.errno(rc);
+        if (err == .SUCCESS) return @intCast(rc);
+        if (err == .INTR) continue;
+        if (mapUdpSendErrno(err)) |mapped| return mapped;
+        return posix.unexpectedErrno(err);
+    }
 }
 
 pub const Config = struct {
@@ -118,7 +169,7 @@ pub const UdpSocket = struct {
     }
 
     pub fn sendTo(self: *UdpSocket, data: []const u8, addr: std.net.Address) !void {
-        _ = posix.sendto(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        _ = sendToCompat(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             else => return err,
         };
@@ -390,6 +441,10 @@ fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
 fn testPollReady(fd: i32) !void {
     var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     _ = try posix.poll(&poll_fds, 1000);
+}
+
+test "UDP send errno EPERM is treated as transient send failure" {
+    try std.testing.expectEqual(error.WouldBlock, mapUdpSendErrno(.PERM).?);
 }
 
 test "UdpSocket bind in port range" {
