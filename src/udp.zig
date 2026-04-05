@@ -85,6 +85,29 @@ pub const PeerState = enum {
     dead,
 };
 
+fn ipv6V6OnlySockOpt() u32 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.ws2_32.IPV6_V6ONLY,
+        .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly => 27,
+        else => std.os.linux.IPV6.V6ONLY,
+    };
+}
+
+fn shouldIgnoreDualStackToggleFailure() bool {
+    return builtin.os.tag != .linux;
+}
+
+fn disableIpv6Only(fd: posix.socket_t) !void {
+    const v6only: i32 = 0;
+    posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6V6OnlySockOpt(), std.mem.asBytes(&v6only)) catch |err| {
+        if (!shouldIgnoreDualStackToggleFailure()) return err;
+        log.warn("failed to disable IPV6_V6ONLY on {s}; continuing with IPv6-only socket: {s}", .{
+            @tagName(builtin.os.tag),
+            @errorName(err),
+        });
+    };
+}
+
 pub const UdpSocket = struct {
     fd: i32,
     bound_port: u16,
@@ -107,8 +130,7 @@ pub const UdpSocket = struct {
         errdefer posix.close(fd);
 
         if (family == posix.AF.INET6) {
-            const v6only: i32 = 0;
-            try posix.setsockopt(fd, posix.IPPROTO.IPV6, std.os.linux.IPV6.V6ONLY, std.mem.asBytes(&v6only));
+            try disableIpv6Only(fd);
         }
 
         const bind_addr = if (family == posix.AF.INET6)
@@ -131,8 +153,7 @@ pub const UdpSocket = struct {
         ) catch return null;
 
         if (set_v6only) {
-            const v6only: i32 = 0;
-            posix.setsockopt(fd, posix.IPPROTO.IPV6, std.os.linux.IPV6.V6ONLY, std.mem.asBytes(&v6only)) catch {
+            disableIpv6Only(fd) catch {
                 posix.close(fd);
                 return null;
             };
@@ -423,6 +444,19 @@ pub const Peer = struct {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "dual-stack toggle failure policy is strict only on linux" {
+    try std.testing.expectEqual(builtin.os.tag != .linux, shouldIgnoreDualStackToggleFailure());
+}
+
+test "ipv6 v6only sockopt matches platform" {
+    const expected: u32 = switch (builtin.os.tag) {
+        .windows => std.os.windows.ws2_32.IPV6_V6ONLY,
+        .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly => 27,
+        else => std.os.linux.IPV6.V6ONLY,
+    };
+    try std.testing.expectEqual(expected, ipv6V6OnlySockOpt());
+}
 
 /// Bind a non-blocking IPv4-only UDP socket on loopback for testing.
 fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
