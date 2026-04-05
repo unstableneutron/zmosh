@@ -324,6 +324,7 @@ const CandidateReprobe = struct {
     candidates: std.ArrayList(nat.Candidate) = .empty,
     probe: nat.ProbeState = .{ .candidates = &[_]nat.Candidate{} },
     next_probe_ns: i64 = 0,
+    persistent: bool = false,
 
     fn deinit(self: *CandidateReprobe, alloc: std.mem.Allocator) void {
         self.candidates.deinit(alloc);
@@ -333,6 +334,7 @@ const CandidateReprobe = struct {
         self.candidates.clearRetainingCapacity();
         self.probe.reset(self.candidates.items);
         self.next_probe_ns = 0;
+        self.persistent = false;
     }
 
     fn start(
@@ -342,34 +344,82 @@ const CandidateReprobe = struct {
         refreshed_candidates: []const nat.Candidate,
         now: i64,
     ) !bool {
+        return self.startWithMode(alloc, socket_family, refreshed_candidates, now, false);
+    }
+
+    fn startPersistent(
+        self: *CandidateReprobe,
+        alloc: std.mem.Allocator,
+        socket_family: u16,
+        refreshed_candidates: []const nat.Candidate,
+        now: i64,
+    ) !bool {
+        return self.startWithMode(alloc, socket_family, refreshed_candidates, now, true);
+    }
+
+    fn startWithMode(
+        self: *CandidateReprobe,
+        alloc: std.mem.Allocator,
+        socket_family: u16,
+        refreshed_candidates: []const nat.Candidate,
+        now: i64,
+        persistent: bool,
+    ) !bool {
         try replaceCandidateSet(alloc, &self.candidates, socket_family, refreshed_candidates);
         self.probe.reset(self.candidates.items);
         self.next_probe_ns = now;
+        self.persistent = persistent;
         return self.candidates.items.len > 0;
     }
 
+    fn isActive(self: *const CandidateReprobe) bool {
+        if (self.candidates.items.len == 0) return false;
+        if (self.probe.selected != null) return false;
+        return self.persistent or !self.probe.isComplete();
+    }
+
     fn maybeNextProbeAddr(self: *CandidateReprobe, now: i64) ?std.net.Address {
-        if (self.probe.isComplete()) return null;
+        if (!self.isActive()) return null;
         if (now < self.next_probe_ns) return null;
 
-        const addr = self.probe.nextProbeAddr() orelse return null;
+        var addr = self.probe.nextProbeAddr();
+        if (addr == null and self.persistent) {
+            self.probe.reset(self.candidates.items);
+            addr = self.probe.nextProbeAddr();
+        }
+
+        const next_addr = addr orelse return null;
         self.next_probe_ns = now + @as(i64, self.probe.interval_ms) * std.time.ns_per_ms;
-        return addr;
+        return next_addr;
     }
 
     fn pollDelayMs(self: *const CandidateReprobe, now: i64) ?i64 {
-        if (self.probe.isComplete()) return null;
+        if (!self.isActive()) return null;
         return @divFloor(@max(@as(i64, 0), self.next_probe_ns - now), std.time.ns_per_ms);
     }
 
     fn onAuthenticatedRecv(self: *CandidateReprobe, from: std.net.Address) bool {
-        for (self.candidates.items) |candidate| {
-            if (!nat.isAddressEqual(candidate.addr, from)) continue;
-            const selected_before = self.probe.selected;
-            self.probe.onAuthenticatedRecv(from);
-            return selected_before == null and self.probe.selected != null;
+        return self.onAuthenticatedRecvMode(from, false);
+    }
+
+    fn onAuthenticatedRecvPeerReflexive(self: *CandidateReprobe, from: std.net.Address) bool {
+        return self.onAuthenticatedRecvMode(from, true);
+    }
+
+    fn onAuthenticatedRecvMode(self: *CandidateReprobe, from: std.net.Address, allow_peer_reflexive: bool) bool {
+        if (!self.isActive()) return false;
+
+        if (!allow_peer_reflexive) {
+            for (self.candidates.items) |candidate| {
+                if (nat.isAddressEqual(candidate.addr, from)) break;
+            } else {
+                return false;
+            }
         }
-        return false;
+
+        const selected_before = self.probe.selected;
+        self.probe.onAuthenticatedRecv(from);
+        return selected_before == null and self.probe.selected != null;
     }
 };
 
@@ -1569,7 +1619,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         },
         .ssh => |*s| {
             try appendSshIpc(&s.write_buf, alloc, .Init, std.mem.asBytes(&init));
-            _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, last_ack_send_ns);
+            _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, last_ack_send_ns);
         },
     }
 
@@ -1633,7 +1683,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &pending_ssh_detach,
                     )) {
                         pending_udp_switch = false;
-                        _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
+                        _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
                         continue;
                     }
 
@@ -1678,7 +1728,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     continue;
                 }
                 pending_udp_switch = false;
-                _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
+                _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
                 continue;
             }
         } else if (transport_mode == .ssh) {
@@ -1724,7 +1774,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         }
 
         var netmon_idx: ?usize = null;
-        if (transport_mode == .udp and network_monitor.pollFd() != null) {
+        if (network_monitor.pollFd() != null) {
             netmon_idx = poll_count;
             poll_fds[poll_count] = .{ .fd = network_monitor.pollFd().?, .events = posix.POLL.IN, .revents = 0 };
             poll_count += 1;
@@ -1754,7 +1804,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
             const heartbeat_ms = @divFloor(peer.heartbeatDelayNs(now, config), std.time.ns_per_ms);
             poll_timeout = @min(poll_timeout, heartbeat_ms);
-            poll_timeout = @min(poll_timeout, @as(i64, network_monitor.pollTimeoutMs(now)));
             if (standby_reprobe.pollDelayMs(now)) |reprobe_ms| {
                 poll_timeout = @min(poll_timeout, reprobe_ms);
             }
@@ -1762,12 +1811,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             if (pending_ssh_detach and transport_mode.ssh.write_buf.items.len > 0) {
                 poll_timeout = @min(poll_timeout, @as(i64, 20));
             }
-            if (!pending_udp_switch) {
-                if (ssh_reprobe.pollDelayMs(now)) |reprobe_ms| {
-                    poll_timeout = @min(poll_timeout, reprobe_ms);
-                }
+            if (ssh_reprobe.pollDelayMs(now)) |reprobe_ms| {
+                poll_timeout = @min(poll_timeout, reprobe_ms);
             }
         }
+        poll_timeout = @min(poll_timeout, @as(i64, network_monitor.pollTimeoutMs(now)));
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
@@ -1775,22 +1823,61 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             return err;
         };
 
-        if (transport_mode == .udp) {
-            const netmon_revents = if (netmon_idx) |idx| poll_fds[idx].revents else 0;
-            const netmon_now: i64 = @intCast(std.time.nanoTimestamp());
-            if (network_monitor.poll(netmon_now, netmon_revents)) {
-                handleClientNetworkChange(
-                    alloc,
-                    socket_family,
-                    &peer,
-                    &udp_sock,
-                    &reliable_recv,
-                    &standby_ssh,
-                    &last_ack_send_ns,
-                    &ack_dirty,
-                    options.connect_debug,
-                    netmon_now,
-                );
+        const netmon_revents = if (netmon_idx) |idx| poll_fds[idx].revents else 0;
+        const netmon_now: i64 = @intCast(std.time.nanoTimestamp());
+        if (network_monitor.poll(netmon_now, netmon_revents)) {
+            switch (transport_mode) {
+                .udp => {
+                    handleClientNetworkChange(
+                        alloc,
+                        socket_family,
+                        &peer,
+                        &udp_sock,
+                        &reliable_recv,
+                        &standby_ssh,
+                        &last_ack_send_ns,
+                        &ack_dirty,
+                        options.connect_debug,
+                        netmon_now,
+                    );
+                },
+                .ssh => |*s| {
+                    connectDebug(options.connect_debug, "local network change detected", .{});
+                    peer.enterRecoveryMode(netmon_now);
+
+                    var refreshed_candidates = gatherHostCandidatesOnly(alloc, &udp_sock, socket_family) catch |err| blk: {
+                        connectDebug(options.connect_debug, "failed to refresh host candidates after network change: {s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    defer if (refreshed_candidates) |*candidates| candidates.deinit(alloc);
+
+                    var sent_any_heartbeat = false;
+                    if (peer.addr) |last_peer_addr| {
+                        var burst: u8 = 0;
+                        while (burst < network_change_heartbeat_burst) : (burst += 1) {
+                            sendProbeHeartbeatTo(&peer, &udp_sock, last_peer_addr, &reliable_recv) catch |err| {
+                                if (err == error.WouldBlock) break;
+                                connectDebug(options.connect_debug, "failed to send recovery heartbeat burst: {s}", .{@errorName(err)});
+                                break;
+                            };
+                            sent_any_heartbeat = true;
+                        }
+                    }
+
+                    if (sent_any_heartbeat) {
+                        last_ack_send_ns = netmon_now;
+                        ack_dirty = false;
+                    }
+
+                    if (refreshed_candidates) |candidates| {
+                        const json_payload = try nat.encodeCandidatesPayloadJson(alloc, candidates.items);
+                        defer alloc.free(json_payload);
+                        try appendSshIpc(&s.write_buf, alloc, .CandidateRefresh, json_payload);
+                    }
+
+                    pending_udp_switch = false;
+                    _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, netmon_now);
+                },
             }
         }
 
@@ -2089,7 +2176,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                 var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                 defer candidates.deinit(alloc);
                                 try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
-                                _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
+                                _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
                                 connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                 continue;
                             }
@@ -2122,7 +2209,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                         var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                         defer candidates.deinit(alloc);
                                         try replaceCandidateSet(alloc, &session.server_candidates, socket_family, candidates.items);
-                                        _ = try ssh_reprobe.start(alloc, socket_family, session.server_candidates.items, now);
+                                        _ = try ssh_reprobe.startPersistent(alloc, socket_family, session.server_candidates.items, now);
                                         connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                         continue;
                                     }
@@ -2156,7 +2243,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 peer.addr = prev_addr;
                 if (decoded == null) continue;
 
-                if (ssh_reprobe.onAuthenticatedRecv(raw.from)) {
+                if (ssh_reprobe.onAuthenticatedRecvPeerReflexive(raw.from)) {
                     peer.addr = raw.from;
                     connectDebug(options.connect_debug, "authenticated revived UDP path {f}", .{raw.from});
                     if (!pending_udp_switch and transport_mode == .ssh and !ssh_write_closed) {
@@ -2406,6 +2493,54 @@ test "standby candidate reprobe filters reset and select refreshed path" {
     try std.testing.expect(reprobe.onAuthenticatedRecv(reprobe.candidates.items[1].addr));
     try std.testing.expect(nat.isAddressEqual(reprobe.candidates.items[1].addr, reprobe.probe.selected.?));
     try std.testing.expect(reprobe.maybeNextProbeAddr(std.time.ns_per_s) == null);
+}
+
+test "ssh candidate reprobe persists across probe cycles" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var refreshed = [_]nat.Candidate{
+        .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60001), .source = "stun" },
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 20 }, 60002), .source = "host" },
+    };
+
+    var reprobe: CandidateReprobe = .{};
+    defer reprobe.deinit(alloc);
+
+    try std.testing.expect(try reprobe.startPersistent(alloc, posix.AF.INET, &refreshed, 0));
+
+    var probe_now: i64 = 0;
+    var sends: usize = 0;
+    const total_probes = refreshed.len * @as(usize, reprobe.probe.attempts_per_candidate);
+    while (sends < total_probes) : (sends += 1) {
+        const addr = reprobe.maybeNextProbeAddr(probe_now).?;
+        try std.testing.expect(nat.isAddressEqual(addr, refreshed[sends % refreshed.len].addr));
+        probe_now += @as(i64, reprobe.probe.interval_ms) * std.time.ns_per_ms;
+    }
+
+    const restarted = reprobe.maybeNextProbeAddr(probe_now).?;
+    try std.testing.expect(nat.isAddressEqual(restarted, refreshed[0].addr));
+}
+
+test "ssh candidate reprobe accepts authenticated peer-reflexive path" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var refreshed = [_]nat.Candidate{
+        .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60001), .source = "stun" },
+    };
+
+    var reprobe: CandidateReprobe = .{};
+    defer reprobe.deinit(alloc);
+
+    try std.testing.expect(try reprobe.startPersistent(alloc, posix.AF.INET, &refreshed, 0));
+    _ = reprobe.maybeNextProbeAddr(0).?;
+
+    const peer_reflexive = std.net.Address.initIp4(.{ 203, 0, 113, 44 }, 62044);
+    try std.testing.expect(reprobe.onAuthenticatedRecvPeerReflexive(peer_reflexive));
+    try std.testing.expect(nat.isAddressEqual(peer_reflexive, reprobe.probe.selected.?));
 }
 
 test "standby UDP control messages start refreshed reprobes" {

@@ -887,6 +887,11 @@ pub const Gateway = struct {
         return true;
     }
 
+    fn noteSshUdpProbeAuthenticated(self: *Gateway, now: i64) void {
+        self.ssh_udp_probe_authenticated_ns = now;
+        self.peer.enterRecoveryMode(now);
+    }
+
     fn beginUdpRepromotion(self: *Gateway) u32 {
         self.snapshot_id +%= 1;
         self.snapshot_in_flight_id = self.snapshot_id;
@@ -1233,7 +1238,7 @@ pub const Gateway = struct {
 
                     var decrypt_buf: [9000]u8 = undefined;
                     const decoded = try self.peer.decodeAndUpdate(raw.data, raw.from, &decrypt_buf) orelse continue;
-                    self.ssh_udp_probe_authenticated_ns = @intCast(std.time.nanoTimestamp());
+                    self.noteSshUdpProbeAuthenticated(@intCast(std.time.nanoTimestamp()));
 
                     const packet = transport.parsePacket(decoded) catch {
                         self.sendHeartbeat(@intCast(std.time.nanoTimestamp())) catch {};
@@ -1976,6 +1981,16 @@ test "udp re-promotion reserves a fresh baseline snapshot" {
     try std.testing.expectEqual(@as(?u32, 8), gateway.snapshot_in_flight_id);
     try std.testing.expectEqual(@as(u32, 8), gateway.output_epoch);
     try std.testing.expect(gateway.ssh_udp_probe_authenticated_ns == null);
+}
+
+test "ssh UDP probe authentication re-enters recovery mode" {
+    var gateway: Gateway = undefined;
+    gateway.peer = udp.Peer.init([_]u8{0} ** crypto.key_length, .to_client);
+    gateway.ssh_udp_probe_authenticated_ns = null;
+
+    gateway.noteSshUdpProbeAuthenticated(123);
+    try std.testing.expectEqual(@as(?i64, 123), gateway.ssh_udp_probe_authenticated_ns);
+    try std.testing.expect(gateway.peer.recovery_mode);
 }
 
 test "ssh promotion replay drops stale snapshots but preserves later reliable IPC" {
