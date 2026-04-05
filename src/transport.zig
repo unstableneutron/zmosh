@@ -407,10 +407,26 @@ pub fn buildUnreliable(
 ) ![]const u8 {
     const total = header_len + payload.len;
     if (out.len < total) return error.BufferTooSmall;
-    writeHeader(out[0..header_len], channel, seq, ack, ack_bits, payload.len);
+
     if (payload.len > 0) {
-        @memcpy(out[header_len..total], payload);
+        // Some callers stage the payload in `out` before prepending the transport
+        // header, so move the payload into place before writing the header.
+        const dest = out[header_len..total];
+        const dest_addr = @intFromPtr(dest.ptr);
+        const src_addr = @intFromPtr(payload.ptr);
+        const overlaps = dest_addr < (src_addr + payload.len) and src_addr < (dest_addr + dest.len);
+        if (overlaps) {
+            if (dest_addr > src_addr) {
+                std.mem.copyBackwards(u8, dest, payload);
+            } else if (dest_addr < src_addr) {
+                std.mem.copyForwards(u8, dest, payload);
+            }
+        } else {
+            @memcpy(dest, payload);
+        }
     }
+
+    writeHeader(out[0..header_len], channel, seq, ack, ack_bits, payload.len);
     return out[0..total];
 }
 
@@ -447,6 +463,21 @@ test "transport header round trip" {
     try std.testing.expectEqual(@as(u32, 6), parsed.ack);
     try std.testing.expectEqual(@as(u32, 0x55), parsed.ack_bits);
     try std.testing.expectEqualStrings(payload, parsed.payload);
+}
+
+test "buildUnreliable handles payload slices that alias output buffer" {
+    const payload_len = header_len + 12;
+    var expected: [payload_len]u8 = undefined;
+    for (&expected, 0..) |*byte, i| byte.* = @intCast(i);
+
+    var buf: [header_len + payload_len]u8 = undefined;
+    @memcpy(buf[0..payload_len], &expected);
+
+    const pkt = try buildUnreliable(.output, 7, 6, 0x55, buf[0..payload_len], &buf);
+    const parsed = try parsePacket(pkt);
+
+    try std.testing.expect(parsed.channel == .output);
+    try std.testing.expectEqualSlices(u8, &expected, parsed.payload);
 }
 
 test "seqAfter handles wrap-around" {
