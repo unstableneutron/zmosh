@@ -133,6 +133,12 @@ pub const ReliableDelivery = struct {
     }
 };
 
+pub const PendingReliableFrame = struct {
+    seq: u32,
+    channel: Channel,
+    payload: []const u8,
+};
+
 pub const ReliableInbox = struct {
     alloc: std.mem.Allocator,
     next_seq: u32 = 1,
@@ -278,6 +284,64 @@ pub const ReliableSend = struct {
         }
 
         return out;
+    }
+
+    pub fn appendPendingReliableIpc(self: *ReliableSend, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        if (self.pending.items.len == 0) return;
+
+        const ordered = try alloc.alloc(Pending, self.pending.items.len);
+        defer alloc.free(ordered);
+        @memcpy(ordered, self.pending.items);
+
+        var i: usize = 1;
+        while (i < ordered.len) : (i += 1) {
+            const key = ordered[i];
+            var j = i;
+            while (j > 0 and seqAfter(ordered[j - 1].seq, key.seq)) : (j -= 1) {
+                ordered[j] = ordered[j - 1];
+            }
+            ordered[j] = key;
+        }
+
+        for (ordered) |pending| {
+            const packet = parsePacket(pending.packet) catch continue;
+            if (packet.channel != .reliable_ipc) continue;
+            try out.appendSlice(alloc, packet.payload);
+        }
+    }
+
+    pub fn collectPendingReliableFrames(self: *ReliableSend, alloc: std.mem.Allocator) !std.ArrayList(PendingReliableFrame) {
+        var out = try std.ArrayList(PendingReliableFrame).initCapacity(alloc, self.pending.items.len);
+        errdefer out.deinit(alloc);
+        if (self.pending.items.len == 0) return out;
+
+        const ordered = try alloc.alloc(Pending, self.pending.items.len);
+        defer alloc.free(ordered);
+        @memcpy(ordered, self.pending.items);
+
+        var i: usize = 1;
+        while (i < ordered.len) : (i += 1) {
+            const key = ordered[i];
+            var j = i;
+            while (j > 0 and seqAfter(ordered[j - 1].seq, key.seq)) : (j -= 1) {
+                ordered[j] = ordered[j - 1];
+            }
+            ordered[j] = key;
+        }
+
+        for (ordered) |pending| {
+            const packet = parsePacket(pending.packet) catch continue;
+            if (packet.channel != .reliable_ipc and packet.channel != .control) continue;
+            try out.append(alloc, .{ .seq = pending.seq, .channel = packet.channel, .payload = packet.payload });
+        }
+        return out;
+    }
+
+    pub fn clearPending(self: *ReliableSend) void {
+        for (self.pending.items) |pending| {
+            self.alloc.free(pending.packet);
+        }
+        self.pending.clearRetainingCapacity();
     }
 
     fn isAcked(seq: u32, ack_seq: u32, ack_bits: u32) bool {

@@ -200,34 +200,42 @@ const Daemon = struct {
         // local attach (where the shell hasn't emitted anything yet) skips
         // the snapshot, while a remote attach — where the shell may have been
         // running since the gateway forked the daemon — gets a full replay.
-        if (self.has_pty_output) {
-            const cursor = &term.screens.active.cursor;
-            std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
-            if (serializeTerminalState(self.alloc, term, init.rows)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                defer self.alloc.free(term_output);
-                // Only clear on re-init. For first Init on a fresh socket,
-                // write_buf may contain queued non-Output replies (e.g. Info)
-                // from earlier messages in the same read batch.
-                if (client.initialized) {
-                    // Drop any stale output buffered before Init so the snapshot
-                    // is the first payload rendered after a resync request.
-                    client.write_buf.clearRetainingCapacity();
+        // Even when there's no history to send, emit an empty final snapshot
+        // so SSH clients know the post-Init baseline is ready.
+        if (client.initialized) {
+            // Drop any stale output buffered before Init so the snapshot
+            // is the first payload rendered after a resync request.
+            client.write_buf.clearRetainingCapacity();
+        }
+
+        const snapshot_prefix = ipc.Snapshot{ .id = init.snapshot_id, .flags = 0x1 };
+        emit_snapshot: {
+            if (self.has_pty_output) {
+                const cursor = &term.screens.active.cursor;
+                std.log.debug("cursor before serialize: x={d} y={d} pending_wrap={}", .{ cursor.x, cursor.y, cursor.pending_wrap });
+                if (serializeTerminalState(self.alloc, term, init.rows)) |term_output| {
+                    std.log.debug("serialize terminal state", .{});
+                    defer self.alloc.free(term_output);
+                    const snapshot_len = @sizeOf(ipc.Snapshot) + term_output.len;
+                    const snapshot_payload = self.alloc.alloc(u8, snapshot_len) catch |err| {
+                        std.log.warn("failed to allocate snapshot payload err={s}", .{@errorName(err)});
+                        return;
+                    };
+                    defer self.alloc.free(snapshot_payload);
+                    @memcpy(snapshot_payload[0..@sizeOf(ipc.Snapshot)], std.mem.asBytes(&snapshot_prefix));
+                    @memcpy(snapshot_payload[@sizeOf(ipc.Snapshot)..], term_output);
+                    ipc.appendMessage(self.alloc, &client.write_buf, .Snapshot, snapshot_payload) catch |err| {
+                        std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
+                    };
+                    client.has_pending_output = true;
+                    break :emit_snapshot;
                 }
-                const snapshot_prefix = ipc.Snapshot{ .id = init.snapshot_id, .flags = 0 };
-                const snapshot_len = @sizeOf(ipc.Snapshot) + term_output.len;
-                const snapshot_payload = self.alloc.alloc(u8, snapshot_len) catch |err| {
-                    std.log.warn("failed to allocate snapshot payload err={s}", .{@errorName(err)});
-                    return;
-                };
-                defer self.alloc.free(snapshot_payload);
-                @memcpy(snapshot_payload[0..@sizeOf(ipc.Snapshot)], std.mem.asBytes(&snapshot_prefix));
-                @memcpy(snapshot_payload[@sizeOf(ipc.Snapshot)..], term_output);
-                ipc.appendMessage(self.alloc, &client.write_buf, .Snapshot, snapshot_payload) catch |err| {
-                    std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
-                };
-                client.has_pending_output = true;
             }
+
+            ipc.appendMessage(self.alloc, &client.write_buf, .Snapshot, std.mem.asBytes(&snapshot_prefix)) catch |err| {
+                std.log.warn("failed to buffer empty terminal snapshot for client err={s}", .{@errorName(err)});
+            };
+            client.has_pending_output = true;
         }
 
         var ws: c.struct_winsize = .{
@@ -1551,7 +1559,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
-                        .Output, .Ack, .SessionEnd, .Snapshot => {},
+                        .Output, .Ack, .SessionEnd, .Snapshot, .ReliableReplay => {},
                     }
                 }
             }

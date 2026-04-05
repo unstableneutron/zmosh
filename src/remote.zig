@@ -13,10 +13,13 @@ const max_bootstrap_line = 4096;
 const default_probe_timeout_ms: u32 = 3000;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
+const detach_drain_ns = 2 * std.time.ns_per_s;
 const session_end_grace_ns = 2 * std.time.ns_per_s;
 const ssh_fallback_after_disconnected_ns = 10 * std.time.ns_per_s;
 const use_ack_timeout_ms: i32 = 2000;
 const max_standby_buffer = 8 * 1024;
+const initial_ssh_snapshot_id: u32 = 0x8000_0000;
+const max_ssh_snapshot_restarts: u8 = 2;
 
 const c = switch (builtin.os.tag) {
     .macos => @cImport({
@@ -374,12 +377,6 @@ fn probeAndSelectTransport(
     var local_candidates = try gatherLocalCandidates(alloc, udp_sock, fallback_addr.any.family, options.stun_servers);
     defer local_candidates.deinit(alloc);
 
-    try appendUniqueCandidate(&local_candidates, alloc, .{
-        .ctype = .host,
-        .addr = fallback_addr,
-        .source = "ssh_host",
-    }, 8);
-
     try sendCandidates(pipes.stdin_fd, alloc, local_candidates.items);
 
     var remote_candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, session.server_candidates.items.len + 1);
@@ -721,6 +718,50 @@ fn flushWriteBuffer(fd: i32, write_buf: *std.ArrayList(u8), alloc: std.mem.Alloc
     }
 }
 
+fn drainUdpReliableSend(
+    alloc: std.mem.Allocator,
+    peer: *udp_mod.Peer,
+    sock: *udp_mod.UdpSocket,
+    reliable_send: *transport.ReliableSend,
+) !void {
+    if (!reliable_send.hasPending()) return;
+
+    const deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) + detach_drain_ns;
+    while (reliable_send.hasPending()) {
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        if (now >= deadline_ns) break;
+
+        var retransmits = try reliable_send.collectRetransmits(alloc, now, peer.rto_us());
+        defer retransmits.deinit(alloc);
+        for (retransmits.items) |pkt| {
+            peer.send(sock, pkt) catch |err| {
+                if (err != error.NoPeerAddress and err != error.WouldBlock) return err;
+            };
+        }
+
+        const remaining_ms = @max(@as(i64, 1), @divFloor(deadline_ns - now, std.time.ns_per_ms));
+        const rto_ms = @max(@as(i64, 1), @divFloor(peer.rto_us(), 1000));
+        const poll_timeout: i32 = @intCast(@min(remaining_ms, rto_ms));
+        var poll_fds = [_]posix.pollfd{.{ .fd = sock.getFd(), .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
+            if (err == error.Interrupted) continue;
+            return err;
+        };
+
+        if (poll_fds[0].revents & posix.POLL.IN == 0) continue;
+        while (true) {
+            var decrypt_buf: [9000]u8 = undefined;
+            const recv_result = try peer.recv(sock, &decrypt_buf);
+            const result = recv_result orelse break;
+
+            const packet = transport.parsePacket(result.data) catch continue;
+            if (reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
+                peer.reportRtt(rtt_us);
+            }
+        }
+    }
+}
+
 fn closeSshBootstrap(pipes: SshBootstrap) void {
     if (pipes.stdin_fd == pipes.stdout_fd) {
         posix.close(pipes.stdin_fd);
@@ -734,6 +775,235 @@ fn shouldSwitchToStandbySsh(now: i64, disconnected_since_ns: ?i64, standby_ssh: 
     if (standby_ssh == null) return false;
     const since = disconnected_since_ns orelse return false;
     return (now - since) >= ssh_fallback_after_disconnected_ns;
+}
+
+fn shouldBufferSshOutput(active_snapshot_id: ?u32, awaiting_ssh_snapshot: bool) bool {
+    return active_snapshot_id != null or awaiting_ssh_snapshot;
+}
+
+fn reserveSshSnapshotId(next_ssh_snapshot_id: *u32, awaiting_ssh_snapshot: *bool, expected_ssh_snapshot_id: *?u32) u32 {
+    const snapshot_id = next_ssh_snapshot_id.*;
+    next_ssh_snapshot_id.* +%= 1;
+    awaiting_ssh_snapshot.* = true;
+    expected_ssh_snapshot_id.* = snapshot_id;
+    return snapshot_id;
+}
+
+fn restartSshBaseline(
+    alloc: std.mem.Allocator,
+    write_buf: *std.ArrayList(u8),
+    next_ssh_snapshot_id: *u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    active_snapshot_id: *?u32,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    ssh_snapshot_restarts: *u8,
+) !void {
+    if (ssh_snapshot_restarts.* >= max_ssh_snapshot_restarts) return error.SshSnapshotRestartLimit;
+    ssh_snapshot_restarts.* += 1;
+
+    stdout_buf.clearRetainingCapacity();
+    deferred_output_buf.clearRetainingCapacity();
+    active_snapshot_id.* = null;
+
+    const snapshot_id = reserveSshSnapshotId(next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id);
+    const size = getTerminalSize();
+    const init = ipc.Init{ .rows = size.rows, .cols = size.cols, .snapshot_id = snapshot_id };
+    try appendSshIpc(write_buf, alloc, .Init, std.mem.asBytes(&init));
+}
+
+fn buildSshReplayPayload(alloc: std.mem.Allocator, channel: transport.Channel, payload: []const u8) !?[]u8 {
+    switch (channel) {
+        .control => {
+            const ctrl = transport.parseControl(payload) catch return try alloc.dupe(u8, payload);
+            if (ctrl == .resync_request) return null;
+            return try alloc.dupe(u8, payload);
+        },
+        .reliable_ipc => {
+            var filtered = try std.ArrayList(u8).initCapacity(alloc, payload.len);
+            errdefer filtered.deinit(alloc);
+
+            var offset: usize = 0;
+            while (offset < payload.len) {
+                const remaining = payload[offset..];
+                const msg_len = ipc.expectedLength(remaining) orelse return try alloc.dupe(u8, payload);
+                if (remaining.len < msg_len) return try alloc.dupe(u8, payload);
+
+                const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+                if (hdr.tag != .Init) {
+                    try filtered.appendSlice(alloc, remaining[0..msg_len]);
+                }
+                offset += msg_len;
+            }
+
+            if (filtered.items.len == 0) return null;
+            return try filtered.toOwnedSlice(alloc);
+        },
+        else => return try alloc.dupe(u8, payload),
+    }
+}
+
+fn handleSshMessage(
+    alloc: std.mem.Allocator,
+    write_buf: *std.ArrayList(u8),
+    msg: anytype,
+    reliable_inbox: *transport.ReliableInbox,
+    reliable_recv: *transport.RecvState,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    active_snapshot_id: *?u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    next_ssh_snapshot_id: *u32,
+    ssh_snapshot_restarts: *u8,
+    session_ended: *bool,
+    session_end_deadline_ns: *?i64,
+    now: i64,
+) !void {
+    if (msg.header.tag == .ReliableReplay) {
+        const replay = ipc.parseReliableReplay(msg.payload) catch return;
+        const channel = std.meta.intToEnum(transport.Channel, replay.channel) catch return;
+        if (!reliable_inbox.accepts(replay.seq)) return;
+        if (reliable_recv.onReliable(replay.seq) != .accept) return;
+        try reliable_inbox.push(replay.seq, channel, replay.payload);
+        while (reliable_inbox.popReady()) |delivery| {
+            defer delivery.deinit(alloc);
+
+            switch (delivery.channel) {
+                .control => {
+                    const ctrl = transport.parseControl(delivery.payload) catch continue;
+                    _ = ctrl;
+                },
+                .reliable_ipc => {
+                    var offset: usize = 0;
+                    while (offset < delivery.payload.len) {
+                        const remaining = delivery.payload[offset..];
+                        const msg_len = ipc.expectedLength(remaining) orelse break;
+                        if (remaining.len < msg_len) break;
+
+                        const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
+                        const payload = remaining[@sizeOf(ipc.Header)..msg_len];
+
+                        if (hdr.tag == .Output and payload.len > 0) {
+                            const target_buf = if (shouldBufferSshOutput(active_snapshot_id.*, awaiting_ssh_snapshot.*)) deferred_output_buf else stdout_buf;
+                            if (target_buf.items.len + payload.len > max_stdout_buf) {
+                                try restartSshBaseline(alloc, write_buf, next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id, active_snapshot_id, stdout_buf, deferred_output_buf, ssh_snapshot_restarts);
+                            } else {
+                                try target_buf.appendSlice(alloc, payload);
+                            }
+                        } else if (hdr.tag == .Snapshot and payload.len >= @sizeOf(ipc.Snapshot)) {
+                            const snapshot = std.mem.bytesToValue(ipc.Snapshot, payload[0..@sizeOf(ipc.Snapshot)]);
+                            const snapshot_bytes = payload[@sizeOf(ipc.Snapshot)..];
+
+                            if (awaiting_ssh_snapshot.*) {
+                                const expected = expected_ssh_snapshot_id.* orelse {
+                                    offset += msg_len;
+                                    continue;
+                                };
+                                if (snapshot.id != expected) {
+                                    offset += msg_len;
+                                    continue;
+                                }
+                            }
+
+                            if (active_snapshot_id.*) |current| {
+                                if (snapshot.id < current) {
+                                    offset += msg_len;
+                                    continue;
+                                }
+                                if (snapshot.id > current) {
+                                    stdout_buf.clearRetainingCapacity();
+                                    deferred_output_buf.clearRetainingCapacity();
+                                    active_snapshot_id.* = snapshot.id;
+                                }
+                            } else {
+                                stdout_buf.clearRetainingCapacity();
+                                deferred_output_buf.clearRetainingCapacity();
+                                active_snapshot_id.* = snapshot.id;
+                            }
+
+                            if (stdout_buf.items.len + snapshot_bytes.len > max_stdout_buf) {
+                                try restartSshBaseline(alloc, write_buf, next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id, active_snapshot_id, stdout_buf, deferred_output_buf, ssh_snapshot_restarts);
+                            } else {
+                                try stdout_buf.appendSlice(alloc, snapshot_bytes);
+                                if (snapshot.isFinal()) {
+                                    active_snapshot_id.* = null;
+                                    awaiting_ssh_snapshot.* = false;
+                                    expected_ssh_snapshot_id.* = null;
+                                    ssh_snapshot_restarts.* = 0;
+                                    if (stdout_buf.items.len + deferred_output_buf.items.len > max_stdout_buf) {
+                                        try restartSshBaseline(alloc, write_buf, next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id, active_snapshot_id, stdout_buf, deferred_output_buf, ssh_snapshot_restarts);
+                                    } else {
+                                        try stdout_buf.appendSlice(alloc, deferred_output_buf.items);
+                                        deferred_output_buf.clearRetainingCapacity();
+                                    }
+                                }
+                            }
+                        } else if (hdr.tag == .SessionEnd) {
+                            session_ended.* = true;
+                            session_end_deadline_ns.* = session_end_deadline_ns.* orelse now + session_end_grace_ns;
+                        }
+
+                        offset += msg_len;
+                    }
+                },
+                else => unreachable,
+            }
+        }
+        return;
+    }
+
+    if (msg.header.tag == .Output and msg.payload.len > 0) {
+        const target_buf = if (shouldBufferSshOutput(active_snapshot_id.*, awaiting_ssh_snapshot.*)) deferred_output_buf else stdout_buf;
+        if (target_buf.items.len + msg.payload.len > max_stdout_buf) {
+            try restartSshBaseline(alloc, write_buf, next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id, active_snapshot_id, stdout_buf, deferred_output_buf, ssh_snapshot_restarts);
+        } else {
+            try target_buf.appendSlice(alloc, msg.payload);
+        }
+    } else if (msg.header.tag == .Snapshot and msg.payload.len >= @sizeOf(ipc.Snapshot)) {
+        const snapshot = std.mem.bytesToValue(ipc.Snapshot, msg.payload[0..@sizeOf(ipc.Snapshot)]);
+        const snapshot_bytes = msg.payload[@sizeOf(ipc.Snapshot)..];
+
+        if (awaiting_ssh_snapshot.*) {
+            const expected = expected_ssh_snapshot_id.* orelse return;
+            if (snapshot.id != expected) return;
+        }
+
+        if (active_snapshot_id.*) |current| {
+            if (snapshot.id < current) return;
+            if (snapshot.id > current) {
+                stdout_buf.clearRetainingCapacity();
+                deferred_output_buf.clearRetainingCapacity();
+                active_snapshot_id.* = snapshot.id;
+            }
+        } else {
+            stdout_buf.clearRetainingCapacity();
+            deferred_output_buf.clearRetainingCapacity();
+            active_snapshot_id.* = snapshot.id;
+        }
+
+        if (stdout_buf.items.len + snapshot_bytes.len > max_stdout_buf) {
+            try restartSshBaseline(alloc, write_buf, next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id, active_snapshot_id, stdout_buf, deferred_output_buf, ssh_snapshot_restarts);
+        } else {
+            try stdout_buf.appendSlice(alloc, snapshot_bytes);
+            if (snapshot.isFinal()) {
+                active_snapshot_id.* = null;
+                awaiting_ssh_snapshot.* = false;
+                expected_ssh_snapshot_id.* = null;
+                ssh_snapshot_restarts.* = 0;
+                if (stdout_buf.items.len + deferred_output_buf.items.len > max_stdout_buf) {
+                    try restartSshBaseline(alloc, write_buf, next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id, active_snapshot_id, stdout_buf, deferred_output_buf, ssh_snapshot_restarts);
+                } else {
+                    try stdout_buf.appendSlice(alloc, deferred_output_buf.items);
+                    deferred_output_buf.clearRetainingCapacity();
+                }
+            }
+        }
+    } else if (msg.header.tag == .SessionEnd) {
+        session_ended.* = true;
+        session_end_deadline_ns.* = session_end_deadline_ns.* orelse now + session_end_grace_ns;
+    }
 }
 
 fn waitForUseAck(fd: i32, alloc: std.mem.Allocator, mode: []const u8, buffered: *std.ArrayList(u8)) !void {
@@ -762,7 +1032,10 @@ fn waitForUseAck(fd: i32, alloc: std.mem.Allocator, mode: []const u8, buffered: 
             return err;
         };
 
-        if (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+        if (fds[0].revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            return error.UnexpectedEof;
+        }
+        if (fds[0].revents & posix.POLL.HUP != 0 and fds[0].revents & posix.POLL.IN == 0) {
             return error.UnexpectedEof;
         }
         if (fds[0].revents & posix.POLL.IN == 0) continue;
@@ -813,6 +1086,15 @@ fn performSshFallback(
     transport_mode: *RemoteTransport,
     standby_ssh: *?SshBootstrap,
     standby_buffer: *std.ArrayList(u8),
+    reliable_send: *transport.ReliableSend,
+    active_snapshot_id: *?u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    next_ssh_snapshot_id: *u32,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    pending_output_epoch: *?u32,
+    resync_pending: *bool,
     connect_debug: bool,
     reason: []const u8,
     disconnected_since_ns: *?i64,
@@ -834,10 +1116,26 @@ fn performSshFallback(
     disconnected_since_ns.* = null;
     was_disconnected.* = false;
     pending_ssh_detach.* = false;
+    active_snapshot_id.* = null;
+    stdout_buf.clearRetainingCapacity();
+    deferred_output_buf.clearRetainingCapacity();
+    pending_output_epoch.* = null;
+    resync_pending.* = false;
 
     if (transport_mode.* == .ssh) {
+        var pending_replay = try reliable_send.collectPendingReliableFrames(alloc);
+        defer pending_replay.deinit(alloc);
+        for (pending_replay.items) |pending| {
+            const replay_payload = try buildSshReplayPayload(alloc, pending.channel, pending.payload) orelse continue;
+            defer alloc.free(replay_payload);
+            try ipc.appendReliableReplay(alloc, &transport_mode.ssh.write_buf, pending.seq, @intFromEnum(pending.channel), replay_payload);
+        }
+        reliable_send.clearPending();
+
         const resumed_size = getTerminalSize();
-        try appendSshIpc(&transport_mode.ssh.write_buf, alloc, .Init, std.mem.asBytes(&resumed_size));
+        const resumed_snapshot_id = reserveSshSnapshotId(next_ssh_snapshot_id, awaiting_ssh_snapshot, expected_ssh_snapshot_id);
+        const resumed_init = ipc.Init{ .rows = resumed_size.rows, .cols = resumed_size.cols, .snapshot_id = resumed_snapshot_id };
+        try appendSshIpc(&transport_mode.ssh.write_buf, alloc, .Init, std.mem.asBytes(&resumed_init));
     }
     return true;
 }
@@ -937,11 +1235,21 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var resync_backoff_ns: i64 = initial_resync_backoff_ns;
     var resync_pending = false;
     var active_snapshot_id: ?u32 = null;
+    var awaiting_ssh_snapshot = false;
+    var expected_ssh_snapshot_id: ?u32 = null;
+    var next_ssh_snapshot_id: u32 = initial_ssh_snapshot_id;
+    var ssh_snapshot_restarts: u8 = 0;
+    var ssh_eof = false;
+    var ssh_write_closed = false;
     var current_output_epoch: u32 = 0;
     var pending_output_epoch: ?u32 = null;
 
     const size = getTerminalSize();
-    const init = ipc.Init{ .rows = size.rows, .cols = size.cols, .snapshot_id = 0 };
+    const init_snapshot_id = switch (transport_mode) {
+        .udp => @as(u32, 0),
+        .ssh => reserveSshSnapshotId(&next_ssh_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id),
+    };
+    const init = ipc.Init{ .rows = size.rows, .cols = size.cols, .snapshot_id = init_snapshot_id };
     switch (transport_mode) {
         .udp => {
             var init_buf: [64]u8 = undefined;
@@ -990,6 +1298,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &transport_mode,
                         &standby_ssh,
                         &standby_buffer,
+                        &reliable_send,
+                        &active_snapshot_id,
+                        &awaiting_ssh_snapshot,
+                        &expected_ssh_snapshot_id,
+                        &next_ssh_snapshot_id,
+                        &stdout_buf,
+                        &deferred_output_buf,
+                        &pending_output_epoch,
+                        &resync_pending,
                         options.connect_debug,
                         "dead UDP state",
                         &disconnected_since_ns,
@@ -1023,6 +1340,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     &transport_mode,
                     &standby_ssh,
                     &standby_buffer,
+                    &reliable_send,
+                    &active_snapshot_id,
+                    &awaiting_ssh_snapshot,
+                    &expected_ssh_snapshot_id,
+                    &next_ssh_snapshot_id,
+                    &stdout_buf,
+                    &deferred_output_buf,
+                    &pending_output_epoch,
+                    &resync_pending,
                     options.connect_debug,
                     "disconnect timeout",
                     &disconnected_since_ns,
@@ -1068,7 +1394,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         }
 
         var ssh_write_idx: ?usize = null;
-        if (transport_mode == .ssh and transport_mode.ssh.write_buf.items.len > 0) {
+        if (transport_mode == .ssh and !ssh_write_closed and transport_mode.ssh.write_buf.items.len > 0) {
             ssh_write_idx = poll_count;
             poll_fds[poll_count] = .{ .fd = transport_mode.ssh.write_fd, .events = posix.POLL.OUT, .revents = 0 };
             poll_count += 1;
@@ -1094,19 +1420,26 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             return err;
         };
 
+        var ssh_read_hup = false;
+        var ssh_write_hup = false;
+
         if (transport_mode == .ssh) {
-            if (poll_fds[transport_read_idx].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            const ssh_read_revents = poll_fds[transport_read_idx].revents;
+            if (ssh_read_revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
                 return;
             }
+            ssh_read_hup = ssh_read_revents & posix.POLL.HUP != 0;
             if (ssh_write_idx) |idx| {
-                if (poll_fds[idx].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                const ssh_write_revents = poll_fds[idx].revents;
+                if (ssh_write_revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
                     return;
                 }
+                ssh_write_hup = ssh_write_revents & posix.POLL.HUP != 0;
             }
         }
 
         if (standby_read_idx) |idx| {
-            if (poll_fds[idx].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            if (poll_fds[idx].revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
                 disableStandby(&standby_ssh, &standby_buffer);
             }
 
@@ -1132,6 +1465,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     };
                 }
             }
+
+            if (standby_ssh != null and poll_fds[idx].revents & posix.POLL.HUP != 0 and poll_fds[idx].revents & posix.POLL.IN == 0) {
+                disableStandby(&standby_ssh, &standby_buffer);
+            }
         }
 
         if (!pending_ssh_detach and poll_fds[stdin_idx].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
@@ -1147,12 +1484,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         .udp => {
                             if (should_detach) {
                                 try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Detach, "", now);
+                                try drainUdpReliableSend(alloc, &peer, &udp_sock, &reliable_send);
                                 return;
                             }
                             try sendIpcReliable(&peer, &udp_sock, &reliable_send, &reliable_recv, .Input, input_raw[0..n], now);
                         },
                         .ssh => |*s| {
-                            if (should_detach) {
+                            if (ssh_write_closed) {
+                                // Read side may still have tail output to drain.
+                            } else if (should_detach) {
                                 try appendSshIpc(&s.write_buf, alloc, .Detach, "");
                                 pending_ssh_detach = true;
                                 pending_ssh_detach_ns = @intCast(std.time.nanoTimestamp());
@@ -1167,7 +1507,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
-        if (poll_fds[transport_read_idx].revents & posix.POLL.IN != 0) {
+        const transport_read_ready = switch (transport_mode) {
+            .udp => poll_fds[transport_read_idx].revents & posix.POLL.IN != 0,
+            .ssh => |s| poll_fds[transport_read_idx].revents & posix.POLL.IN != 0 or s.read_buf.buf.items.len > 0,
+        };
+        if (transport_read_ready) {
             switch (transport_mode) {
                 .udp => {
                     while (true) {
@@ -1299,7 +1643,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                             current_output_epoch = prefix.epoch;
                                         }
                                         const output_payload = packet.payload[@sizeOf(transport.OutputPrefix)..];
-                                        const target_buf = if (active_snapshot_id != null) &deferred_output_buf else &stdout_buf;
+                                        const awaiting_snapshot_for_epoch = active_snapshot_id != null or
+                                            (pending_output_epoch != null and pending_output_epoch.? == prefix.epoch);
+                                        const target_buf = if (awaiting_snapshot_for_epoch) &deferred_output_buf else &stdout_buf;
                                         if (target_buf.items.len + output_payload.len > max_stdout_buf) {
                                             stdout_buf.clearRetainingCapacity();
                                             deferred_output_buf.clearRetainingCapacity();
@@ -1319,25 +1665,23 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     }
                 },
                 .ssh => |*s| {
-                    while (true) {
-                        const n = s.read_buf.read(s.read_fd) catch |err| {
-                            if (err == error.WouldBlock) break;
-                            return err;
-                        };
-                        if (n == 0) {
-                            return;
-                        }
+                    while (s.read_buf.next()) |msg| {
+                        try handleSshMessage(alloc, &s.write_buf, msg, &reliable_inbox, &reliable_recv, &stdout_buf, &deferred_output_buf, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &next_ssh_snapshot_id, &ssh_snapshot_restarts, &session_ended, &session_end_deadline_ns, now);
+                    }
 
-                        while (s.read_buf.next()) |msg| {
-                            if (msg.header.tag == .Output and msg.payload.len > 0) {
-                                if (stdout_buf.items.len + msg.payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, msg.payload);
-                                }
-                            } else if (msg.header.tag == .SessionEnd) {
-                                session_ended = true;
-                                session_end_deadline_ns = session_end_deadline_ns orelse now + session_end_grace_ns;
+                    if (poll_fds[transport_read_idx].revents & posix.POLL.IN != 0) {
+                        while (true) {
+                            const n = s.read_buf.read(s.read_fd) catch |err| {
+                                if (err == error.WouldBlock) break;
+                                return err;
+                            };
+                            if (n == 0) {
+                                ssh_eof = true;
+                                break;
+                            }
+
+                            while (s.read_buf.next()) |msg| {
+                                try handleSshMessage(alloc, &s.write_buf, msg, &reliable_inbox, &reliable_recv, &stdout_buf, &deferred_output_buf, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &next_ssh_snapshot_id, &ssh_snapshot_restarts, &session_ended, &session_end_deadline_ns, now);
                             }
                         }
                     }
@@ -1371,11 +1715,28 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
+        if (transport_mode == .ssh) {
+            const ssh_read_revents = poll_fds[transport_read_idx].revents;
+            if (ssh_read_hup and ssh_read_revents & posix.POLL.IN == 0) {
+                ssh_eof = true;
+            }
+            if (ssh_write_hup) {
+                ssh_write_closed = true;
+                pending_ssh_detach = false;
+                transport_mode.ssh.write_buf.clearRetainingCapacity();
+            }
+        }
+
+        if (ssh_eof and transport_mode == .ssh and stdout_buf.items.len == 0 and (ssh_write_closed or transport_mode.ssh.write_buf.items.len == 0)) {
+            return;
+        }
+
         if (session_ended and
             session_end_deadline_ns != null and
             now >= session_end_deadline_ns.? and
             active_snapshot_id == null and
-            deferred_output_buf.items.len == 0)
+            deferred_output_buf.items.len == 0 and
+            !awaiting_ssh_snapshot)
         {
             while (stdout_buf.items.len > 0) {
                 const written = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
@@ -1437,6 +1798,54 @@ test "ssh standby fallback threshold" {
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 5 * std.time.ns_per_s, pipes));
     try std.testing.expect(shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, pipes));
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, null));
+}
+
+test "ssh output is buffered until the snapshot baseline is ready" {
+    try std.testing.expect(shouldBufferSshOutput(null, true));
+    try std.testing.expect(shouldBufferSshOutput(1, false));
+    try std.testing.expect(!shouldBufferSshOutput(null, false));
+}
+
+test "ssh snapshot ids use a reserved namespace" {
+    var next_snapshot_id = initial_ssh_snapshot_id;
+    var awaiting = false;
+    var expected: ?u32 = null;
+
+    const first = reserveSshSnapshotId(&next_snapshot_id, &awaiting, &expected);
+    try std.testing.expectEqual(initial_ssh_snapshot_id, first);
+    try std.testing.expect(awaiting);
+    try std.testing.expectEqual(@as(?u32, initial_ssh_snapshot_id), expected);
+    try std.testing.expectEqual(initial_ssh_snapshot_id + 1, next_snapshot_id);
+}
+
+test "ssh replay drops redundant resync requests" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const replay = try buildSshReplayPayload(alloc, .control, transport.buildControl(.resync_request, &[8]u8{0} ** 8));
+    try std.testing.expect(replay == null);
+}
+
+test "ssh replay strips Init while preserving later reliable IPC" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var payload = try std.ArrayList(u8).initCapacity(alloc, 32);
+    defer payload.deinit(alloc);
+
+    const init = ipc.Init{ .rows = 24, .cols = 80, .snapshot_id = 7 };
+    try ipc.appendMessage(alloc, &payload, .Init, std.mem.asBytes(&init));
+    try ipc.appendMessage(alloc, &payload, .Detach, "");
+
+    const replay = (try buildSshReplayPayload(alloc, .reliable_ipc, payload.items)).?;
+    defer alloc.free(replay);
+
+    const msg_len = ipc.expectedLength(replay).?;
+    try std.testing.expectEqual(msg_len, replay.len);
+    const hdr = std.mem.bytesToValue(ipc.Header, replay[0..@sizeOf(ipc.Header)]);
+    try std.testing.expect(hdr.tag == .Detach);
 }
 
 test "session name validation" {

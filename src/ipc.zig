@@ -15,6 +15,7 @@ pub const Tag = enum(u8) {
     Ack = 10,
     SessionEnd = 11,
     Snapshot = 12,
+    ReliableReplay = 13,
 };
 
 pub const Header = packed struct {
@@ -40,6 +41,11 @@ pub const Snapshot = packed struct {
     pub fn isFinal(self: Snapshot) bool {
         return (self.flags & 0x1) != 0;
     }
+};
+
+pub const ReliableReplay = packed struct {
+    seq: u32,
+    channel: u8,
 };
 
 pub const MAX_CMD_LEN = 256;
@@ -84,6 +90,27 @@ pub fn appendMessage(alloc: std.mem.Allocator, list: *std.ArrayList(u8), tag: Ta
     if (data.len > 0) {
         try list.appendSlice(alloc, data);
     }
+}
+
+pub fn appendReliableReplay(alloc: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, channel: u8, data: []const u8) !void {
+    const len = @sizeOf(ReliableReplay) + data.len;
+    const payload = try alloc.alloc(u8, len);
+    defer alloc.free(payload);
+
+    const replay = ReliableReplay{ .seq = seq, .channel = channel };
+    @memcpy(payload[0..@sizeOf(ReliableReplay)], std.mem.asBytes(&replay));
+    @memcpy(payload[@sizeOf(ReliableReplay)..], data);
+    try appendMessage(alloc, list, .ReliableReplay, payload);
+}
+
+pub fn parseReliableReplay(data: []const u8) !struct { seq: u32, channel: u8, payload: []const u8 } {
+    if (data.len < @sizeOf(ReliableReplay)) return error.InvalidReliableReplay;
+    const replay = std.mem.bytesToValue(ReliableReplay, data[0..@sizeOf(ReliableReplay)]);
+    return .{
+        .seq = replay.seq,
+        .channel = replay.channel,
+        .payload = data[@sizeOf(ReliableReplay)..],
+    };
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
