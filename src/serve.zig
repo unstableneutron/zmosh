@@ -243,6 +243,17 @@ fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.All
     try nat.appendUniqueCandidate(list, alloc, candidate);
 }
 
+fn appendPortmapCandidateIfUsable(
+    list: *std.ArrayList(nat.Candidate),
+    alloc: std.mem.Allocator,
+    socket_capability: udp.SocketCapability,
+    candidate: nat.Candidate,
+) !void {
+    if (!nat.shouldUseCandidate(socket_capability, candidate.addr)) return;
+    if (!nat.isCandidateAddressUsable(candidate.addr)) return;
+    try appendUniqueCandidate(list, alloc, candidate, nat.max_candidates);
+}
+
 fn containsAddressExcept(slots: []const ?std.net.Address, skip_idx: ?usize, addr: std.net.Address) bool {
     for (slots, 0..) |slot, idx| {
         if (skip_idx != null and idx == skip_idx.?) continue;
@@ -674,7 +685,7 @@ pub const Gateway = struct {
             defer local_candidates.deinit(alloc);
             if (portmap_client) |*client| {
                 if (client.currentCandidate()) |candidate| {
-                    try appendUniqueCandidate(&local_candidates, alloc, candidate, nat.max_candidates);
+                    try appendPortmapCandidateIfUsable(&local_candidates, alloc, socket_capability, candidate);
                     nat.sortAndTruncateCandidates(&local_candidates, nat.max_candidates);
                 }
             }
@@ -995,7 +1006,7 @@ pub const Gateway = struct {
         try appendCurrentSrflxCandidates(&refreshed, self.alloc, self.srflx_mappings.items);
         if (self.portmap_client) |*client| {
             if (client.currentCandidate()) |candidate| {
-                try appendUniqueCandidate(&refreshed, self.alloc, candidate, nat.max_candidates);
+                try appendPortmapCandidateIfUsable(&refreshed, self.alloc, self.socket_capability, candidate);
             }
         }
 
@@ -2274,6 +2285,22 @@ test "gateway candidate reprobe mode follows transport intent" {
     try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, .ipv4_only, &candidates, 77, true));
     try std.testing.expect(reprobe.persistent);
     try std.testing.expectEqual(@as(i64, 77), reprobe.next_probe_ns);
+}
+
+test "ipv6-only gateway skips IPv4 NAT-PMP candidates" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, 1);
+    defer candidates.deinit(alloc);
+
+    try appendPortmapCandidateIfUsable(&candidates, alloc, .ipv6_only, .{
+        .ctype = .host,
+        .addr = std.net.Address.initIp4(.{ 203, 0, 113, 9 }, 62000),
+        .source = "nat-pmp",
+    });
+    try std.testing.expectEqual(@as(usize, 0), candidates.items.len);
 }
 
 test "ssh promotion replay drops stale snapshots but preserves later reliable IPC" {
