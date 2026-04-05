@@ -17,6 +17,7 @@ const resync_cooldown_ns = 500 * std.time.ns_per_ms;
 const stun_keepalive_ns = 25 * std.time.ns_per_s;
 const shutdown_drain_ns = 2 * std.time.ns_per_s;
 const default_probe_timeout_ms: u32 = 3000;
+const standby_candidate_probe_burst: u8 = 2;
 
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -96,6 +97,23 @@ const StandbySsh = struct {
 
 const Candidates2Json = struct {
     candidates: []nat.CandidateWire,
+};
+
+const UseMode = enum {
+    udp,
+    ssh,
+};
+
+const StandbyControlMessage = union(enum) {
+    use: UseMode,
+    candidates: std.ArrayList(nat.Candidate),
+
+    fn deinit(self: *StandbyControlMessage, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .use => {},
+            .candidates => |*list| list.deinit(alloc),
+        }
+    }
 };
 
 fn setNonBlocking(fd: i32) !void {
@@ -258,10 +276,17 @@ fn parseCandidatesLine(alloc: std.mem.Allocator, line: []const u8) !std.ArrayLis
     return out;
 }
 
-fn parseUseLine(line: []const u8) !enum { udp, ssh } {
+fn parseUseLine(line: []const u8) !UseMode {
     if (std.mem.eql(u8, line, "ZMX_USE udp")) return .udp;
     if (std.mem.eql(u8, line, "ZMX_USE ssh")) return .ssh;
     return error.InvalidControlMessage;
+}
+
+fn parseStandbyControlLine(alloc: std.mem.Allocator, line: []const u8) !StandbyControlMessage {
+    if (std.mem.startsWith(u8, line, "ZMX_CANDIDATES2 ")) {
+        return .{ .candidates = try parseCandidatesLine(alloc, line) };
+    }
+    return .{ .use = try parseUseLine(line) };
 }
 
 fn buildSshPromotionReplayPayload(alloc: std.mem.Allocator, channel: transport.Channel, payload: []const u8) !?[]u8 {
@@ -438,6 +463,7 @@ pub const Gateway = struct {
     reliable_inbox: transport.ReliableInbox,
     output_seq: u32,
     output_epoch: u32,
+    socket_family: u16,
 
     config: udp.Config,
     running: bool,
@@ -580,6 +606,7 @@ pub const Gateway = struct {
             .reliable_inbox = reliable_inbox,
             .output_seq = 1,
             .output_epoch = 0,
+            .socket_family = socket_family,
             .config = config,
             .running = true,
             .last_output_flush_ns = now,
@@ -793,6 +820,29 @@ pub const Gateway = struct {
         return true;
     }
 
+    fn handleStandbyCandidateRefresh(self: *Gateway, candidates: []const nat.Candidate, now: i64) !void {
+        self.peer.enterRecoveryMode(now);
+
+        var filtered = try std.ArrayList(nat.Candidate).initCapacity(self.alloc, candidates.len);
+        defer filtered.deinit(self.alloc);
+        for (candidates) |candidate| {
+            if (!nat.shouldUseCandidate(self.socket_family, candidate.addr)) continue;
+            if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
+            try appendUniqueCandidate(&filtered, self.alloc, candidate, 8);
+        }
+        nat.sortCandidatesByPriority(filtered.items);
+
+        for (filtered.items) |candidate| {
+            var burst: u8 = 0;
+            while (burst < standby_candidate_probe_burst) : (burst += 1) {
+                sendProbeHeartbeatTo(&self.peer, &self.udp_sock, candidate.addr, &self.reliable_recv) catch |err| {
+                    if (err == error.WouldBlock) return;
+                    return err;
+                };
+            }
+        }
+    }
+
     fn handleStandbySshEvents(self: *Gateway, revents: i16) !bool {
         if (self.standby_ssh == null) return false;
 
@@ -842,21 +892,31 @@ pub const Gateway = struct {
             var standby = &self.standby_ssh.?;
             const nl_idx = std.mem.indexOfScalar(u8, standby.control_buf.items, '\n') orelse break;
             const line = std.mem.trimRight(u8, standby.control_buf.items[0..nl_idx], "\r\n");
-            const mode = parseUseLine(line) catch {
+            var msg = parseStandbyControlLine(self.alloc, line) catch {
                 log.warn("invalid standby ssh control message: {s}", .{line});
                 try standby.control_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
                 continue;
             };
+            defer msg.deinit(self.alloc);
             try standby.control_buf.replaceRange(self.alloc, 0, nl_idx + 1, &[_]u8{});
 
-            if (mode == .ssh) {
-                sendUseAck(standby.write_fd, "ssh") catch {
-                    standby.deinit(self.alloc, true);
-                    self.standby_ssh = null;
-                    return false;
-                };
-                try self.promoteStandbyToSsh();
-                return true;
+            switch (msg) {
+                .use => |mode| {
+                    if (mode == .ssh) {
+                        sendUseAck(standby.write_fd, "ssh") catch {
+                            standby.deinit(self.alloc, true);
+                            self.standby_ssh = null;
+                            return false;
+                        };
+                        try self.promoteStandbyToSsh();
+                        return true;
+                    }
+                },
+                .candidates => |candidates| {
+                    self.handleStandbyCandidateRefresh(candidates.items, @intCast(std.time.nanoTimestamp())) catch |err| {
+                        log.warn("standby candidate refresh failed: {s}", .{@errorName(err)});
+                    };
+                },
             }
         }
 
@@ -1618,6 +1678,41 @@ test "resolveSocketDir returns valid path" {
     defer alloc.free(dir);
     try std.testing.expect(dir.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, dir, "zmx") != null);
+}
+
+test "standby control parser accepts use messages" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var msg = try parseStandbyControlLine(alloc, "ZMX_USE ssh");
+    defer msg.deinit(alloc);
+
+    switch (msg) {
+        .use => |mode| try std.testing.expect(mode == .ssh),
+        .candidates => try std.testing.expect(false),
+    }
+}
+
+test "standby control parser accepts candidate refresh messages" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var msg = try parseStandbyControlLine(
+        alloc,
+        "ZMX_CANDIDATES2 {\"candidates\":[{\"ctype\":\"host\",\"endpoint\":\"203.0.113.10:60000\",\"source\":\"ifaddr\"}]}",
+    );
+    defer msg.deinit(alloc);
+
+    switch (msg) {
+        .use => try std.testing.expect(false),
+        .candidates => |list| {
+            try std.testing.expectEqual(@as(usize, 1), list.items.len);
+            try std.testing.expect(list.items[0].ctype == .host);
+            try std.testing.expectEqual(@as(u16, 60000), list.items[0].addr.getPort());
+        },
+    }
 }
 
 test "stun datagrams are ignored without active stun state" {

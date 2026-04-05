@@ -5,12 +5,14 @@ const udp_mod = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
 const nat = @import("nat.zig");
+const netmon = @import("netmon.zig");
 const builtin = @import("builtin");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 4 * 1024 * 1024;
 const max_bootstrap_line = 4096;
 const default_probe_timeout_ms: u32 = 3000;
+const network_change_heartbeat_burst: u8 = 3;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const initial_resync_backoff_ns = 250 * std.time.ns_per_ms;
 const detach_drain_ns = 2 * std.time.ns_per_s;
@@ -317,6 +319,17 @@ fn gatherLocalCandidates(
         }
     }
 
+    nat.sortCandidatesByPriority(candidates.items);
+    return candidates;
+}
+
+fn gatherHostCandidatesOnly(
+    alloc: std.mem.Allocator,
+    sock: *udp_mod.UdpSocket,
+    socket_family: u16,
+) !std.ArrayList(nat.Candidate) {
+    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_family, 8);
+    errdefer candidates.deinit(alloc);
     nat.sortCandidatesByPriority(candidates.items);
     return candidates;
 }
@@ -1148,14 +1161,65 @@ fn disableStandby(standby_ssh: *?SshBootstrap, standby_buffer: *std.ArrayList(u8
     standby_buffer.clearRetainingCapacity();
 }
 
+fn handleClientNetworkChange(
+    alloc: std.mem.Allocator,
+    socket_family: u16,
+    peer: *udp_mod.Peer,
+    sock: *udp_mod.UdpSocket,
+    reliable_recv: *const transport.RecvState,
+    standby_ssh: *?SshBootstrap,
+    standby_buffer: *std.ArrayList(u8),
+    last_ack_send_ns: *i64,
+    ack_dirty: *bool,
+    connect_debug: bool,
+    now: i64,
+) void {
+    connectDebug(connect_debug, "local network change detected", .{});
+    peer.enterRecoveryMode(now);
+
+    var refreshed_candidates = gatherHostCandidatesOnly(alloc, sock, socket_family) catch |err| blk: {
+        connectDebug(connect_debug, "failed to refresh host candidates after network change: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (refreshed_candidates) |*candidates| candidates.deinit(alloc);
+
+    var sent_any_heartbeat = false;
+    if (peer.addr) |last_peer_addr| {
+        var burst: u8 = 0;
+        while (burst < network_change_heartbeat_burst) : (burst += 1) {
+            sendProbeHeartbeatTo(peer, sock, last_peer_addr, reliable_recv) catch |err| {
+                if (err == error.WouldBlock) break;
+                connectDebug(connect_debug, "failed to send recovery heartbeat burst: {s}", .{@errorName(err)});
+                break;
+            };
+            sent_any_heartbeat = true;
+        }
+    }
+
+    if (sent_any_heartbeat) {
+        last_ack_send_ns.* = now;
+        ack_dirty.* = false;
+    }
+
+    if (standby_ssh.*) |pipes| {
+        if (refreshed_candidates) |candidates| {
+            sendCandidates(pipes.stdin_fd, alloc, candidates.items) catch |err| {
+                connectDebug(connect_debug, "failed to send refreshed candidates over standby SSH: {s}", .{@errorName(err)});
+                disableStandby(standby_ssh, standby_buffer);
+            };
+        }
+    }
+}
+
 /// Remote attach: connect to a remote zmx session via UDP or SSH fallback.
 pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options: RemoteAttachOptions) !void {
     var session = session_in;
     defer session.deinit(alloc);
 
     const fallback_addr = try resolveHostAddress(alloc, session.host, session.port);
+    const socket_family = fallback_addr.any.family;
 
-    var udp_sock = try udp_mod.UdpSocket.bindEphemeral(fallback_addr.any.family);
+    var udp_sock = try udp_mod.UdpSocket.bindEphemeral(socket_family);
     defer udp_sock.close();
 
     var peer = udp_mod.Peer.init(session.key, .to_server);
@@ -1208,6 +1272,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     defer if (standby_ssh) |pipes| closeSshBootstrap(pipes);
     var standby_buffer: std.ArrayList(u8) = .empty;
     defer standby_buffer.deinit(alloc);
+    var network_monitor = netmon.NetworkMonitor.init(alloc);
+    defer network_monitor.deinit();
 
     const decision = try probeAndSelectTransport(alloc, &session, options, fallback_addr, &udp_sock, &peer, &reliable_recv);
     if (decision == .udp and session.ssh != null) {
@@ -1361,7 +1427,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
         }
 
-        var poll_fds: [5]posix.pollfd = undefined;
+        var poll_fds: [6]posix.pollfd = undefined;
         var poll_count: usize = 0;
 
         const stdin_idx = poll_count;
@@ -1383,6 +1449,13 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         if (transport_mode == .udp and standby_ssh != null) {
             standby_read_idx = poll_count;
             poll_fds[poll_count] = .{ .fd = standby_ssh.?.stdout_fd, .events = posix.POLL.IN, .revents = 0 };
+            poll_count += 1;
+        }
+
+        var netmon_idx: ?usize = null;
+        if (transport_mode == .udp and network_monitor.pollFd() != null) {
+            netmon_idx = poll_count;
+            poll_fds[poll_count] = .{ .fd = network_monitor.pollFd().?, .events = posix.POLL.IN, .revents = 0 };
             poll_count += 1;
         }
 
@@ -1410,6 +1483,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             }
             const heartbeat_ms = @divFloor(peer.heartbeatDelayNs(now, config), std.time.ns_per_ms);
             poll_timeout = @min(poll_timeout, heartbeat_ms);
+            poll_timeout = @min(poll_timeout, @as(i64, network_monitor.pollTimeoutMs(now)));
         } else if (pending_ssh_detach and transport_mode.ssh.write_buf.items.len > 0) {
             poll_timeout = @min(poll_timeout, @as(i64, 20));
         }
@@ -1419,6 +1493,26 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             if (err == error.Interrupted) continue;
             return err;
         };
+
+        if (transport_mode == .udp) {
+            const netmon_revents = if (netmon_idx) |idx| poll_fds[idx].revents else 0;
+            const netmon_now: i64 = @intCast(std.time.nanoTimestamp());
+            if (network_monitor.poll(netmon_now, netmon_revents)) {
+                handleClientNetworkChange(
+                    alloc,
+                    socket_family,
+                    &peer,
+                    &udp_sock,
+                    &reliable_recv,
+                    &standby_ssh,
+                    &standby_buffer,
+                    &last_ack_send_ns,
+                    &ack_dirty,
+                    options.connect_debug,
+                    netmon_now,
+                );
+            }
+        }
 
         var ssh_read_hup = false;
         var ssh_write_hup = false;
