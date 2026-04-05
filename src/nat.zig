@@ -461,6 +461,13 @@ pub const ProbeState = struct {
         return addr;
     }
 
+    pub fn reset(self: *ProbeState, candidates: []Candidate) void {
+        self.candidates = candidates;
+        self.selected = null;
+        self.current_round = 0;
+        self.next_idx = 0;
+    }
+
     pub fn onAuthenticatedRecv(self: *ProbeState, from: std.net.Address) void {
         if (self.selected == null) self.selected = from;
     }
@@ -560,4 +567,29 @@ test "probe state progresses and locks on auth recv" {
     state.onAuthenticatedRecv(std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 61000));
     try std.testing.expect(state.isComplete());
     try std.testing.expect(state.nextProbeAddr() == null);
+}
+
+test "probe state reset swaps candidates and clears progress" {
+    var first_candidates = [_]Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 10, 0, 0, 10 }, 60000), .source = "host" },
+        .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 61000), .source = "srflx" },
+    };
+    var second_candidates = [_]Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 10 }, 62000), .source = "host" },
+    };
+
+    var state = ProbeState{
+        .candidates = &first_candidates,
+        .attempts_per_candidate = 2,
+    };
+
+    _ = state.nextProbeAddr().?;
+    state.onAuthenticatedRecv(first_candidates[1].addr);
+    try std.testing.expect(state.isComplete());
+
+    state.reset(&second_candidates);
+    try std.testing.expect(!state.isComplete());
+    try std.testing.expect(state.selected == null);
+    const next = state.nextProbeAddr().?;
+    try std.testing.expect(isAddressEqual(next, second_candidates[0].addr));
 }

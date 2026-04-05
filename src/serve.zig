@@ -171,6 +171,32 @@ fn sendUseAck(fd: i32, mode: []const u8) !void {
     try writeAllFd(fd, line);
 }
 
+fn sendCandidates(fd: i32, alloc: std.mem.Allocator, candidates: []const nat.Candidate) !void {
+    var wire_list = try std.ArrayList(nat.CandidateWire).initCapacity(alloc, candidates.len);
+    defer wire_list.deinit(alloc);
+    var owned_endpoints = try std.ArrayList([]u8).initCapacity(alloc, candidates.len);
+    defer {
+        for (owned_endpoints.items) |ep| alloc.free(ep);
+        owned_endpoints.deinit(alloc);
+    }
+
+    for (candidates) |cand| {
+        const endpoint = try nat.endpointForAddressAlloc(alloc, cand.addr);
+        try owned_endpoints.append(alloc, endpoint);
+        try wire_list.append(alloc, .{
+            .ctype = cand.ctype,
+            .endpoint = endpoint,
+            .source = cand.source,
+        });
+    }
+
+    const payload = nat.Candidates2Payload{ .candidates = wire_list.items };
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    try builder.writer.print("ZMX_CANDIDATES2 {f}\n", .{std.json.fmt(payload, .{})});
+    try writeAllFd(fd, builder.writer.buffered());
+}
+
 fn socketFamily(fd: i32) !u16 {
     var src_addr: posix.sockaddr.storage = undefined;
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
@@ -217,6 +243,13 @@ fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.All
     }
     if (list.items.len >= max_candidates) return;
     try list.append(alloc, candidate);
+}
+
+fn findServerReflexiveCandidate(candidates: []const nat.Candidate) ?std.net.Address {
+    for (candidates) |candidate| {
+        if (candidate.ctype == .srflx) return candidate.addr;
+    }
+    return null;
 }
 
 fn sendConnect2(
@@ -528,6 +561,7 @@ pub const Gateway = struct {
         errdefer transport_mode.deinit(alloc);
         var standby_ssh: ?StandbySsh = null;
         errdefer if (standby_ssh) |*standby| standby.deinit(alloc, true);
+        var initial_srflx: ?std.net.Address = null;
         const bootstrap_v2 = std.mem.eql(u8, posix.getenv("ZMX_BOOTSTRAP") orelse "", "2");
 
         connectDebug(connect_debug, "bootstrap_v2={} probe_timeout_ms={d} stun_servers={d}", .{
@@ -539,6 +573,7 @@ pub const Gateway = struct {
         if (bootstrap_v2) {
             var local_candidates = try gatherLocalCandidates(alloc, &udp_sock, socket_family, stun_servers.items);
             defer local_candidates.deinit(alloc);
+            initial_srflx = findServerReflexiveCandidate(local_candidates.items);
 
             try sendConnect2(posix.STDOUT_FILENO, alloc, key, udp_sock.bound_port, local_candidates.items);
 
@@ -625,7 +660,7 @@ pub const Gateway = struct {
             .stun_server_idx = 0,
             .stun_state = null,
             .last_stun_keepalive_ns = now,
-            .last_srflx = null,
+            .last_srflx = initial_srflx,
         };
     }
 
@@ -800,6 +835,25 @@ pub const Gateway = struct {
         self.last_stun_keepalive_ns = now;
     }
 
+    fn sendStandbyCandidateRefresh(self: *Gateway, srflx_addr: std.net.Address) !void {
+        if (self.standby_ssh == null) return;
+
+        var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_family, 8);
+        defer refreshed.deinit(self.alloc);
+        try appendUniqueCandidate(&refreshed, self.alloc, .{
+            .ctype = .srflx,
+            .addr = srflx_addr,
+            .source = "stun",
+        }, 8);
+        nat.sortCandidatesByPriority(refreshed.items);
+
+        sendCandidates(self.standby_ssh.?.write_fd, self.alloc, refreshed.items) catch |err| {
+            self.standby_ssh.?.deinit(self.alloc, true);
+            self.standby_ssh = null;
+            return err;
+        };
+    }
+
     fn handleStunDatagram(self: *Gateway, from: std.net.Address, data: []const u8) bool {
         const state = &(self.stun_state orelse return false);
         if (!state.waiting_response) return false;
@@ -807,10 +861,16 @@ pub const Gateway = struct {
 
         const parsed = state.handleResponse(data) catch return true;
         if (parsed) |candidate| {
-            if (self.last_srflx) |old| {
-                if (!nat.isAddressEqual(old, candidate.addr)) {
-                    log.warn("stun mapping changed old={f} new={f}", .{ old, candidate.addr });
-                }
+            const mapping_changed = if (self.last_srflx) |old|
+                !nat.isAddressEqual(old, candidate.addr)
+            else
+                false;
+
+            if (mapping_changed) {
+                log.warn("stun mapping changed old={f} new={f}", .{ self.last_srflx.?, candidate.addr });
+                self.sendStandbyCandidateRefresh(candidate.addr) catch |err| {
+                    log.warn("failed to send refreshed standby candidates: {s}", .{@errorName(err)});
+                };
             }
             self.last_srflx = candidate.addr;
         }

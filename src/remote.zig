@@ -118,6 +118,10 @@ const Connect2Json = struct {
     ssh_fallback: bool = false,
 };
 
+const Candidates2Json = struct {
+    candidates: []nat.CandidateWire,
+};
+
 /// Parse a ZMX_CONNECT line: "ZMX_CONNECT udp <port> <base64_key>\n"
 pub fn parseConnectLine(line: []const u8) !struct { port: u16, key: crypto.Key } {
     const trimmed = std.mem.trimRight(u8, line, "\r\n");
@@ -263,6 +267,111 @@ fn appendUniqueCandidate(list: *std.ArrayList(nat.Candidate), alloc: std.mem.All
     }
     if (list.items.len >= max_candidates) return;
     try list.append(alloc, candidate);
+}
+
+fn parseCandidatesLine(alloc: std.mem.Allocator, line: []const u8) !std.ArrayList(nat.Candidate) {
+    if (!std.mem.startsWith(u8, line, "ZMX_CANDIDATES2 ")) return error.InvalidControlMessage;
+    const json_payload = line["ZMX_CANDIDATES2 ".len..];
+
+    var parsed = try std.json.parseFromSlice(Candidates2Json, alloc, json_payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var out = try std.ArrayList(nat.Candidate).initCapacity(alloc, parsed.value.candidates.len);
+    errdefer out.deinit(alloc);
+    for (parsed.value.candidates) |wire| {
+        const candidate = try nat.wireToCandidate(wire);
+        if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
+        try out.append(alloc, candidate);
+    }
+    return out;
+}
+
+const StandbyCandidateReprobe = struct {
+    candidates: std.ArrayList(nat.Candidate) = .empty,
+    probe: nat.ProbeState = .{ .candidates = &[_]nat.Candidate{} },
+    next_probe_ns: i64 = 0,
+
+    fn deinit(self: *StandbyCandidateReprobe, alloc: std.mem.Allocator) void {
+        self.candidates.deinit(alloc);
+    }
+
+    fn start(
+        self: *StandbyCandidateReprobe,
+        alloc: std.mem.Allocator,
+        socket_family: u16,
+        refreshed_candidates: []const nat.Candidate,
+        now: i64,
+    ) !bool {
+        self.candidates.clearRetainingCapacity();
+        for (refreshed_candidates) |candidate| {
+            if (!nat.shouldUseCandidate(socket_family, candidate.addr)) continue;
+            if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
+            try appendUniqueCandidate(&self.candidates, alloc, candidate, 8);
+        }
+        nat.sortCandidatesByPriority(self.candidates.items);
+        self.probe.reset(self.candidates.items);
+        self.next_probe_ns = now;
+        return self.candidates.items.len > 0;
+    }
+
+    fn maybeNextProbeAddr(self: *StandbyCandidateReprobe, now: i64) ?std.net.Address {
+        if (self.probe.isComplete()) return null;
+        if (now < self.next_probe_ns) return null;
+
+        const addr = self.probe.nextProbeAddr() orelse return null;
+        self.next_probe_ns = now + @as(i64, self.probe.interval_ms) * std.time.ns_per_ms;
+        return addr;
+    }
+
+    fn pollDelayMs(self: *const StandbyCandidateReprobe, now: i64) ?i64 {
+        if (self.probe.isComplete()) return null;
+        return @divFloor(@max(@as(i64, 0), self.next_probe_ns - now), std.time.ns_per_ms);
+    }
+
+    fn onAuthenticatedRecv(self: *StandbyCandidateReprobe, from: std.net.Address) bool {
+        for (self.candidates.items) |candidate| {
+            if (!nat.isAddressEqual(candidate.addr, from)) continue;
+            const selected_before = self.probe.selected;
+            self.probe.onAuthenticatedRecv(from);
+            return selected_before == null and self.probe.selected != null;
+        }
+        return false;
+    }
+};
+
+fn handleUdpStandbyControlMessages(
+    alloc: std.mem.Allocator,
+    standby_buffer: *std.ArrayList(u8),
+    socket_family: u16,
+    reprobe: *StandbyCandidateReprobe,
+    peer: *udp_mod.Peer,
+    now: i64,
+    connect_debug: bool,
+) !void {
+    while (true) {
+        const nl_idx = std.mem.indexOfScalar(u8, standby_buffer.items, '\n') orelse break;
+        const line = std.mem.trimRight(u8, standby_buffer.items[0..nl_idx], "\r\n");
+
+        if (std.mem.startsWith(u8, line, "ZMX_CANDIDATES2 ")) {
+            var candidates = parseCandidatesLine(alloc, line) catch |err| {
+                connectDebug(connect_debug, "ignoring invalid standby candidate refresh: {s}", .{@errorName(err)});
+                try standby_buffer.replaceRange(alloc, 0, nl_idx + 1, &[_]u8{});
+                continue;
+            };
+            defer candidates.deinit(alloc);
+
+            if (try reprobe.start(alloc, socket_family, candidates.items, now)) {
+                peer.enterRecoveryMode(now);
+                connectDebug(connect_debug, "received refreshed server candidates over standby SSH ({d})", .{reprobe.candidates.items.len});
+            } else {
+                connectDebug(connect_debug, "received standby candidate refresh with no usable addresses", .{});
+            }
+        } else {
+            connectDebug(connect_debug, "ignoring standby control line during UDP: {s}", .{line});
+        }
+
+        try standby_buffer.replaceRange(alloc, 0, nl_idx + 1, &[_]u8{});
+    }
 }
 
 fn resolveHostAddress(alloc: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
@@ -1272,6 +1381,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     defer if (standby_ssh) |pipes| closeSshBootstrap(pipes);
     var standby_buffer: std.ArrayList(u8) = .empty;
     defer standby_buffer.deinit(alloc);
+    var standby_reprobe: StandbyCandidateReprobe = .{};
+    defer standby_reprobe.deinit(alloc);
     var network_monitor = netmon.NetworkMonitor.init(alloc);
     defer network_monitor.deinit();
 
@@ -1348,6 +1459,12 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             defer retransmits.deinit(alloc);
             for (retransmits.items) |pkt| {
                 peer.send(&udp_sock, pkt) catch {};
+            }
+
+            if (standby_reprobe.maybeNextProbeAddr(now)) |addr| {
+                sendProbeHeartbeatTo(&peer, &udp_sock, addr, &reliable_recv) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                };
             }
 
             if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
@@ -1484,6 +1601,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             const heartbeat_ms = @divFloor(peer.heartbeatDelayNs(now, config), std.time.ns_per_ms);
             poll_timeout = @min(poll_timeout, heartbeat_ms);
             poll_timeout = @min(poll_timeout, @as(i64, network_monitor.pollTimeoutMs(now)));
+            if (standby_reprobe.pollDelayMs(now)) |reprobe_ms| {
+                poll_timeout = @min(poll_timeout, reprobe_ms);
+            }
         } else if (pending_ssh_detach and transport_mode.ssh.write_buf.items.len > 0) {
             poll_timeout = @min(poll_timeout, @as(i64, 20));
         }
@@ -1560,6 +1680,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 }
             }
 
+            if (standby_ssh != null) {
+                try handleUdpStandbyControlMessages(alloc, &standby_buffer, socket_family, &standby_reprobe, &peer, now, options.connect_debug);
+            }
+
             if (standby_ssh != null and poll_fds[idx].revents & posix.POLL.HUP != 0 and poll_fds[idx].revents & posix.POLL.IN == 0) {
                 disableStandby(&standby_ssh, &standby_buffer);
             }
@@ -1612,6 +1736,13 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         var decrypt_buf: [9000]u8 = undefined;
                         const recv_result = try peer.recv(&udp_sock, &decrypt_buf);
                         const result = recv_result orelse break;
+
+                        if (standby_reprobe.onAuthenticatedRecv(result.from)) {
+                            if (peer.addr == null or !nat.isAddressEqual(peer.addr.?, result.from)) {
+                                connectDebug(options.connect_debug, "switched active UDP peer to refreshed candidate {f}", .{result.from});
+                            }
+                            peer.addr = result.from;
+                        }
 
                         const packet = transport.parsePacket(result.data) catch continue;
                         if (reliable_send.ack(packet.ack, packet.ack_bits)) |rtt_us| {
@@ -1917,7 +2048,8 @@ test "ssh replay drops redundant resync requests" {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const replay = try buildSshReplayPayload(alloc, .control, transport.buildControl(.resync_request, &[8]u8{0} ** 8));
+    var ctrl_buf: [8]u8 = [_]u8{0} ** 8;
+    const replay = try buildSshReplayPayload(alloc, .control, transport.buildControl(.resync_request, &ctrl_buf));
     try std.testing.expect(replay == null);
 }
 
@@ -1940,6 +2072,57 @@ test "ssh replay strips Init while preserving later reliable IPC" {
     try std.testing.expectEqual(msg_len, replay.len);
     const hdr = std.mem.bytesToValue(ipc.Header, replay[0..@sizeOf(ipc.Header)]);
     try std.testing.expect(hdr.tag == .Detach);
+}
+
+test "standby candidate reprobe filters reset and select refreshed path" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var refreshed = [_]nat.Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 60000), .source = "loopback" },
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 20 }, 60002), .source = "host" },
+        .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60001), .source = "stun" },
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 20 }, 60002), .source = "dup" },
+    };
+
+    var reprobe: StandbyCandidateReprobe = .{};
+    defer reprobe.deinit(alloc);
+
+    try std.testing.expect(try reprobe.start(alloc, posix.AF.INET, &refreshed, 0));
+    try std.testing.expectEqual(@as(usize, 2), reprobe.candidates.items.len);
+    try std.testing.expect(reprobe.candidates.items[0].ctype == .srflx);
+    try std.testing.expectEqual(@as(i64, 0), reprobe.pollDelayMs(0).?);
+
+    const first = reprobe.maybeNextProbeAddr(0).?;
+    try std.testing.expect(nat.isAddressEqual(first, reprobe.candidates.items[0].addr));
+    try std.testing.expect(!reprobe.onAuthenticatedRecv(std.net.Address.initIp4(.{ 203, 0, 113, 99 }, 60099)));
+    try std.testing.expect(reprobe.onAuthenticatedRecv(reprobe.candidates.items[1].addr));
+    try std.testing.expect(nat.isAddressEqual(reprobe.candidates.items[1].addr, reprobe.probe.selected.?));
+    try std.testing.expect(reprobe.maybeNextProbeAddr(std.time.ns_per_s) == null);
+}
+
+test "standby UDP control messages start refreshed reprobes" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var standby_buffer = try std.ArrayList(u8).initCapacity(alloc, 256);
+    defer standby_buffer.deinit(alloc);
+    try standby_buffer.appendSlice(
+        alloc,
+        "ZMX_CANDIDATES2 {\"candidates\":[{\"ctype\":\"host\",\"endpoint\":\"203.0.113.10:60000\",\"source\":\"ifaddr\"}]}\n",
+    );
+
+    var reprobe: StandbyCandidateReprobe = .{};
+    defer reprobe.deinit(alloc);
+    var peer = udp_mod.Peer.init([_]u8{0} ** crypto.key_length, .to_server);
+
+    try handleUdpStandbyControlMessages(alloc, &standby_buffer, posix.AF.INET, &reprobe, &peer, 123, false);
+    try std.testing.expectEqual(@as(usize, 0), standby_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 1), reprobe.candidates.items.len);
+    try std.testing.expectEqual(@as(i64, 123), reprobe.next_probe_ns);
+    try std.testing.expect(peer.recovery_mode);
 }
 
 test "session name validation" {
