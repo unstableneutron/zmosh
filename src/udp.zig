@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const posix = std.posix;
 const crypto = @import("crypto.zig");
@@ -8,6 +9,66 @@ const replay_window_size = 128;
 /// Truncate nanoTimestamp (i128) to i64 for storage. Sufficient for ~292 years.
 fn nanoNow() i64 {
     return @intCast(std.time.nanoTimestamp());
+}
+
+fn copySockaddrToAddress(src_addr: posix.sockaddr.storage, addr_len: posix.socklen_t) std.net.Address {
+    var addr: std.net.Address = std.mem.zeroes(std.net.Address);
+    const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
+    @memcpy(
+        std.mem.asBytes(&addr)[0..len],
+        std.mem.asBytes(&src_addr)[0..len],
+    );
+    return addr;
+}
+
+fn mapUdpSendErrno(err: posix.E) ?posix.SendToError {
+    return switch (err) {
+        .ACCES => error.AccessDenied,
+        // Linux can report EPERM for firewall-filtered UDP sends (for example,
+        // iptables/nftables rules). Treat it like a transient send failure so
+        // recovery/fallback logic can keep running instead of crashing inside
+        // std.posix.sendto's unexpectedErrno path.
+        .PERM => error.WouldBlock,
+        .AGAIN => error.WouldBlock,
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .INVAL => error.UnreachableAddress,
+        .MSGSIZE => error.MessageTooBig,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .PIPE => error.BrokenPipe,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
+        .LOOP => error.SymLinkLoop,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .HOSTUNREACH, .NETUNREACH => error.NetworkUnreachable,
+        .NOTCONN => error.SocketNotConnected,
+        .NETDOWN => error.NetworkSubsystemFailed,
+        .SUCCESS, .INTR => null,
+        else => null,
+    };
+}
+
+fn sendToCompat(
+    sockfd: posix.socket_t,
+    buf: []const u8,
+    flags: u32,
+    dest_addr: ?*const posix.sockaddr,
+    addrlen: posix.socklen_t,
+) posix.SendToError!usize {
+    if (builtin.os.tag == .windows) {
+        return posix.sendto(sockfd, buf, flags, dest_addr, addrlen);
+    }
+
+    while (true) {
+        const rc = posix.system.sendto(sockfd, buf.ptr, buf.len, flags, dest_addr, addrlen);
+        const err = posix.errno(rc);
+        if (err == .SUCCESS) return @intCast(rc);
+        if (err == .INTR) continue;
+        if (mapUdpSendErrno(err)) |mapped| return mapped;
+        return posix.unexpectedErrno(err);
+    }
 }
 
 pub const Config = struct {
@@ -24,9 +85,48 @@ pub const PeerState = enum {
     dead,
 };
 
+fn ipv6V6OnlySockOpt() u32 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.ws2_32.IPV6_V6ONLY,
+        .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly => 27,
+        else => std.os.linux.IPV6.V6ONLY,
+    };
+}
+
+fn shouldIgnoreDualStackToggleFailure() bool {
+    return builtin.os.tag != .linux;
+}
+
+fn configureIpv6Capability(fd: posix.socket_t) !SocketCapability {
+    const v6only: i32 = 0;
+    posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6V6OnlySockOpt(), std.mem.asBytes(&v6only)) catch |err| {
+        if (!shouldIgnoreDualStackToggleFailure()) return err;
+        log.warn("failed to disable IPV6_V6ONLY on {s}; continuing with IPv6-only socket: {s}", .{
+            @tagName(builtin.os.tag),
+            @errorName(err),
+        });
+        return .ipv6_only;
+    };
+    return .dual_stack;
+}
+
+pub const SocketCapability = enum {
+    ipv4_only,
+    ipv6_only,
+    dual_stack,
+
+    pub fn family(self: SocketCapability) u16 {
+        return switch (self) {
+            .ipv4_only => posix.AF.INET,
+            .ipv6_only, .dual_stack => posix.AF.INET6,
+        };
+    }
+};
+
 pub const UdpSocket = struct {
     fd: i32,
     bound_port: u16,
+    capability: SocketCapability,
 
     /// Bind a non-blocking UDP socket to the first available port in [port_start, port_end).
     /// Uses AF.INET6 with dual-stack when possible, falling back to AF.INET.
@@ -36,6 +136,32 @@ pub const UdpSocket = struct {
         return error.AddressInUse;
     }
 
+    /// Bind a non-blocking UDP socket to an ephemeral port (port 0).
+    pub fn bindEphemeral(family: u32) !UdpSocket {
+        const fd = try posix.socket(
+            family,
+            posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+            0,
+        );
+        errdefer posix.close(fd);
+
+        const capability: SocketCapability = if (family == posix.AF.INET6)
+            try configureIpv6Capability(fd)
+        else
+            .ipv4_only;
+
+        const bind_addr = if (family == posix.AF.INET6)
+            std.net.Address.initIp6(.{0} ** 16, 0, 0, 0)
+        else
+            std.net.Address.initIp4(.{0} ** 4, 0);
+
+        try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
+
+        var sock = UdpSocket{ .fd = fd, .bound_port = 0, .capability = capability };
+        sock.bound_port = try sock.getLocalPort();
+        return sock;
+    }
+
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {
         const fd = posix.socket(
             family,
@@ -43,9 +169,9 @@ pub const UdpSocket = struct {
             0,
         ) catch return null;
 
+        var capability: SocketCapability = if (family == posix.AF.INET6) .ipv6_only else .ipv4_only;
         if (set_v6only) {
-            const v6only: i32 = 0;
-            posix.setsockopt(fd, posix.IPPROTO.IPV6, std.os.linux.IPV6.V6ONLY, std.mem.asBytes(&v6only)) catch {
+            capability = configureIpv6Capability(fd) catch {
                 posix.close(fd);
                 return null;
             };
@@ -62,7 +188,7 @@ pub const UdpSocket = struct {
                 port,
                 if (family == posix.AF.INET6) "inet6" else "inet",
             });
-            return .{ .fd = fd, .bound_port = port };
+            return .{ .fd = fd, .bound_port = port, .capability = capability };
         }
 
         posix.close(fd);
@@ -73,31 +199,38 @@ pub const UdpSocket = struct {
         return self.fd;
     }
 
+    pub fn getLocalPort(self: *const UdpSocket) !u16 {
+        var src_addr: posix.sockaddr.storage = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        try posix.getsockname(self.fd, @ptrCast(&src_addr), &addr_len);
+        const addr = copySockaddrToAddress(src_addr, addr_len);
+        return addr.getPort();
+    }
+
     pub fn sendTo(self: *UdpSocket, data: []const u8, addr: std.net.Address) !void {
-        _ = posix.sendto(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        _ = sendToCompat(self.fd, data, 0, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock => return error.WouldBlock,
             else => return err,
         };
     }
 
     pub fn recvFrom(self: *UdpSocket, buf: []u8) !struct { len: usize, addr: std.net.Address } {
+        const raw = try self.recvRaw(buf) orelse return error.WouldBlock;
+        return .{ .len = raw.data.len, .addr = raw.from };
+    }
+
+    pub fn recvRaw(self: *UdpSocket, buf: []u8) !?struct { data: []u8, from: std.net.Address } {
         var src_addr: posix.sockaddr.storage = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         const n = posix.recvfrom(self.fd, buf, 0, @ptrCast(&src_addr), &addr_len) catch |err| switch (err) {
-            error.WouldBlock => return error.WouldBlock,
+            error.WouldBlock => return null,
             else => return err,
         };
-        // Copy the full address returned by the kernel — not just the first
-        // sizeof(sockaddr) bytes — so IPv6 addresses (28 bytes) aren't truncated.
-        var addr: std.net.Address = std.mem.zeroes(std.net.Address);
-        const len = @min(@as(usize, @intCast(addr_len)), @sizeOf(std.net.Address));
-        @memcpy(
-            std.mem.asBytes(&addr)[0..len],
-            std.mem.asBytes(&src_addr)[0..len],
-        );
+
+        const addr = copySockaddrToAddress(src_addr, addr_len);
         return .{
-            .len = n,
-            .addr = addr,
+            .data = buf[0..n],
+            .from = addr,
         };
     }
 
@@ -178,10 +311,15 @@ pub const Peer = struct {
     /// Returns null if no data available (EAGAIN) or decryption fails.
     pub fn recv(self: *Peer, sock: *UdpSocket, buf: []u8) !?struct { data: []u8, from: std.net.Address } {
         var raw: [9000]u8 = undefined;
-        const result = sock.recvFrom(&raw) catch |err| switch (err) {
-            error.WouldBlock => return null,
-            else => return err,
-        };
+        const result = try sock.recvRaw(&raw) orelse return null;
+
+        const plaintext = try self.decodeAndUpdate(result.data, result.from, buf) orelse return null;
+        return .{ .data = plaintext, .from = result.from };
+    }
+
+    /// Decode a previously received raw datagram and update anti-replay / roaming state.
+    /// Returns null for invalid or unauthenticated packets.
+    pub fn decodeAndUpdate(self: *Peer, raw: []const u8, from: std.net.Address, buf: []u8) !?[]u8 {
 
         // Determine expected direction: if we send to_server, we receive to_client
         const recv_direction: crypto.Direction = switch (self.direction) {
@@ -192,7 +330,7 @@ pub const Peer = struct {
         const decoded = crypto.decodeDatagram(
             self.key,
             recv_direction,
-            raw[0..result.len],
+            raw,
             buf,
         ) catch |err| {
             log.debug("decrypt failed: {s}", .{@errorName(err)});
@@ -202,7 +340,7 @@ pub const Peer = struct {
         const now = nanoNow();
 
         if (!self.has_received_first) {
-            self.addr = result.addr;
+            self.addr = from;
             self.max_recv_seq = decoded.seq;
             self.has_received_first = true;
             self.recv_bitmap = 0;
@@ -215,7 +353,7 @@ pub const Peer = struct {
                 self.recv_bitmap <<= @intCast(shift);
                 self.recv_bitmap |= @as(u128, 1) << @intCast(shift - 1);
             }
-            self.addr = result.addr;
+            self.addr = from;
             self.max_recv_seq = decoded.seq;
             self.last_recv_time = now;
         } else if (decoded.seq == self.max_recv_seq) {
@@ -246,7 +384,7 @@ pub const Peer = struct {
             log.info("peer reconnected", .{});
         }
 
-        return .{ .data = decoded.plaintext, .from = result.addr };
+        return decoded.plaintext;
     }
 
     /// Check if a heartbeat should be sent.
@@ -325,6 +463,25 @@ pub const Peer = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
+test "dual-stack toggle failure policy is strict only on linux" {
+    try std.testing.expectEqual(builtin.os.tag != .linux, shouldIgnoreDualStackToggleFailure());
+}
+
+test "ipv6 v6only sockopt matches platform" {
+    const expected: u32 = switch (builtin.os.tag) {
+        .windows => std.os.windows.ws2_32.IPV6_V6ONLY,
+        .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly => 27,
+        else => std.os.linux.IPV6.V6ONLY,
+    };
+    try std.testing.expectEqual(expected, ipv6V6OnlySockOpt());
+}
+
+test "socket capability reports bound family" {
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), SocketCapability.ipv4_only.family());
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), SocketCapability.ipv6_only.family());
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), SocketCapability.dual_stack.family());
+}
+
 /// Bind a non-blocking IPv4-only UDP socket on loopback for testing.
 fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
@@ -333,7 +490,7 @@ fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
     while (port < port_end) : (port += 1) {
         const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
         posix.bind(fd, &addr.any, addr.getOsSockLen()) catch continue;
-        return .{ .fd = fd, .bound_port = port };
+        return .{ .fd = fd, .bound_port = port, .capability = .ipv4_only };
     }
     posix.close(fd);
     return error.AddressInUse;
@@ -342,6 +499,10 @@ fn testBindIp4(port_start: u16, port_end: u16) !UdpSocket {
 fn testPollReady(fd: i32) !void {
     var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     _ = try posix.poll(&poll_fds, 1000);
+}
+
+test "UDP send errno EPERM is treated as transient send failure" {
+    try std.testing.expectEqual(error.WouldBlock, mapUdpSendErrno(.PERM).?);
 }
 
 test "UdpSocket bind in port range" {

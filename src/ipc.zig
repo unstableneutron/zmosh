@@ -15,6 +15,10 @@ pub const Tag = enum(u8) {
     Ack = 10,
     SessionEnd = 11,
     Snapshot = 12,
+    ReliableReplay = 13,
+    CandidateRefresh = 14,
+    TransportSwitchRequest = 15,
+    TransportSwitchAck = 16,
 };
 
 pub const Header = packed struct {
@@ -40,6 +44,25 @@ pub const Snapshot = packed struct {
     pub fn isFinal(self: Snapshot) bool {
         return (self.flags & 0x1) != 0;
     }
+};
+
+pub const ReliableReplay = packed struct {
+    seq: u32,
+    channel: u8,
+};
+
+pub const TransportMode = enum(u8) {
+    udp = 0,
+    ssh = 1,
+};
+
+pub const TransportSwitchRequest = packed struct {
+    mode: TransportMode,
+};
+
+pub const TransportSwitchAck = packed struct {
+    mode: TransportMode,
+    baseline_snapshot_id: u32,
 };
 
 pub const MAX_CMD_LEN = 256;
@@ -84,6 +107,51 @@ pub fn appendMessage(alloc: std.mem.Allocator, list: *std.ArrayList(u8), tag: Ta
     if (data.len > 0) {
         try list.appendSlice(alloc, data);
     }
+}
+
+pub fn appendReliableReplay(alloc: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, channel: u8, data: []const u8) !void {
+    const len = @sizeOf(ReliableReplay) + data.len;
+    const payload = try alloc.alloc(u8, len);
+    defer alloc.free(payload);
+
+    const replay = ReliableReplay{ .seq = seq, .channel = channel };
+    @memcpy(payload[0..@sizeOf(ReliableReplay)], std.mem.asBytes(&replay));
+    @memcpy(payload[@sizeOf(ReliableReplay)..], data);
+    try appendMessage(alloc, list, .ReliableReplay, payload);
+}
+
+pub fn parseReliableReplay(data: []const u8) !struct { seq: u32, channel: u8, payload: []const u8 } {
+    if (data.len < @sizeOf(ReliableReplay)) return error.InvalidReliableReplay;
+    const replay = std.mem.bytesToValue(ReliableReplay, data[0..@sizeOf(ReliableReplay)]);
+    return .{
+        .seq = replay.seq,
+        .channel = replay.channel,
+        .payload = data[@sizeOf(ReliableReplay)..],
+    };
+}
+
+pub fn encodeTransportSwitchRequest(out: *[8]u8, mode: TransportMode) []const u8 {
+    const request = TransportSwitchRequest{ .mode = mode };
+    const bytes = std.mem.asBytes(&request);
+    @memcpy(out[0..bytes.len], bytes);
+    return out[0..bytes.len];
+}
+
+pub fn parseTransportSwitchRequest(data: []const u8) !TransportSwitchRequest {
+    if (data.len != @sizeOf(TransportSwitchRequest)) return error.InvalidTransportSwitchRequest;
+    return std.mem.bytesToValue(TransportSwitchRequest, data);
+}
+
+pub fn encodeTransportSwitchAck(out: *[8]u8, mode: TransportMode, baseline_snapshot_id: u32) []const u8 {
+    const ack = TransportSwitchAck{ .mode = mode, .baseline_snapshot_id = baseline_snapshot_id };
+    const bytes = std.mem.asBytes(&ack);
+    @memcpy(out[0..bytes.len], bytes);
+    return out[0..bytes.len];
+}
+
+pub fn parseTransportSwitchAck(data: []const u8) !TransportSwitchAck {
+    if (data.len != @sizeOf(TransportSwitchAck)) return error.InvalidTransportSwitchAck;
+    return std.mem.bytesToValue(TransportSwitchAck, data);
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
@@ -167,3 +235,16 @@ pub const SocketBuffer = struct {
         return .{ .header = hdr, .payload = pay };
     }
 };
+
+test "transport switch payload round trip" {
+    var request_buf: [8]u8 = undefined;
+    const request_payload = encodeTransportSwitchRequest(&request_buf, .udp);
+    const request = try parseTransportSwitchRequest(request_payload);
+    try std.testing.expect(request.mode == .udp);
+
+    var ack_buf: [8]u8 = undefined;
+    const ack_payload = encodeTransportSwitchAck(&ack_buf, .udp, 42);
+    const ack = try parseTransportSwitchAck(ack_payload);
+    try std.testing.expect(ack.mode == .udp);
+    try std.testing.expectEqual(@as(u32, 42), ack.baseline_snapshot_id);
+}
