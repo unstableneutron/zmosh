@@ -174,18 +174,25 @@ fn countCandidatesByType(candidates: []const nat.Candidate, ctype: nat.Candidate
     return count;
 }
 
-fn readLineFd(fd: i32, buf: []u8) ![]const u8 {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = try posix.read(fd, buf[total..]);
-        if (n == 0) break;
-        total += n;
-        if (std.mem.indexOfScalar(u8, buf[0..total], '\n') != null) break;
+fn readBufferedLine(fd: i32, alloc: std.mem.Allocator, buffered: *std.ArrayList(u8), max_len: usize) ![]u8 {
+    while (true) {
+        if (std.mem.indexOfScalar(u8, buffered.items, '\n')) |nl_idx| {
+            const line = try alloc.dupe(u8, std.mem.trimRight(u8, buffered.items[0..nl_idx], "\r\n"));
+            try buffered.replaceRange(alloc, 0, nl_idx + 1, &[_]u8{});
+            return line;
+        }
+
+        var tmp: [256]u8 = undefined;
+        const n = try posix.read(fd, &tmp);
+        if (n == 0) {
+            if (buffered.items.len == 0) return error.UnexpectedEof;
+            const line = try alloc.dupe(u8, std.mem.trimRight(u8, buffered.items, "\r\n"));
+            buffered.clearRetainingCapacity();
+            return line;
+        }
+        if (buffered.items.len + n > max_len) return error.LineTooLong;
+        try buffered.appendSlice(alloc, tmp[0..n]);
     }
-    if (total == 0) return error.UnexpectedEof;
-    const nl = std.mem.indexOfScalar(u8, buf[0..total], '\n') orelse total;
-    if (nl == buf.len) return error.LineTooLong;
-    return std.mem.trimRight(u8, buf[0..nl], "\r\n");
 }
 
 fn writeAllFd(fd: i32, bytes: []const u8) !void {
@@ -718,8 +725,11 @@ pub const Gateway = struct {
 
             try sendConnect2(posix.STDOUT_FILENO, alloc, key, udp_sock.bound_port, local_candidates.items);
 
-            var line_buf: [max_control_line]u8 = undefined;
-            const candidates_line = try readLineFd(posix.STDIN_FILENO, &line_buf);
+            var bootstrap_read_buf = try std.ArrayList(u8).initCapacity(alloc, max_control_line);
+            defer bootstrap_read_buf.deinit(alloc);
+
+            const candidates_line = try readBufferedLine(posix.STDIN_FILENO, alloc, &bootstrap_read_buf, max_control_line);
+            defer alloc.free(candidates_line);
             var remote_candidates = try parseCandidatesLine(alloc, candidates_line);
             defer remote_candidates.deinit(alloc);
 
@@ -738,7 +748,8 @@ pub const Gateway = struct {
                 peer.addr = selected;
             }
 
-            const use_line = try readLineFd(posix.STDIN_FILENO, &line_buf);
+            const use_line = try readBufferedLine(posix.STDIN_FILENO, alloc, &bootstrap_read_buf, max_control_line);
+            defer alloc.free(use_line);
             const use_mode = try parseUseLine(use_line);
             if (use_mode == .udp) {
                 try setNonBlocking(posix.STDIN_FILENO);
@@ -2226,6 +2237,29 @@ test "standby control parser accepts candidate refresh messages" {
             try std.testing.expectEqual(@as(u16, 60000), list.items[0].addr.getPort());
         },
     }
+}
+
+test "readBufferedLine preserves unread bytes for the next control line" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    try writeAllFd(pipe_fds[1], "ZMX_CANDIDATES2 {}\nZMX_USE ssh\n");
+
+    var buffered = try std.ArrayList(u8).initCapacity(alloc, 0);
+    defer buffered.deinit(alloc);
+
+    const first = try readBufferedLine(pipe_fds[0], alloc, &buffered, max_control_line);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("ZMX_CANDIDATES2 {}", first);
+
+    const second = try readBufferedLine(pipe_fds[0], alloc, &buffered, max_control_line);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("ZMX_USE ssh", second);
 }
 
 test "stun datagrams are ignored without active stun state" {
