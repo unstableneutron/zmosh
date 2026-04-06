@@ -138,6 +138,24 @@ fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
     std.debug.print("zmx serve debug: " ++ fmt ++ "\n", args);
 }
 
+fn standbyStateLabel(standby_ssh: ?StandbySsh) []const u8 {
+    const standby = standby_ssh orelse return "none";
+    return switch (standby.control) {
+        .line => "line",
+        .framed => "framed",
+    };
+}
+
+fn logTransportState(connect_debug: bool, mode: []const u8, active_client_udp: ?std.net.Address, standby_ssh: ?StandbySsh, reason: []const u8) void {
+    if (active_client_udp) |addr| {
+        log.info("transport_state mode={s} active_client_udp={f} standby={s} reason={s}", .{ mode, addr, standbyStateLabel(standby_ssh), reason });
+        connectDebug(connect_debug, "transport_state mode={s} active_client_udp={f} standby={s} reason={s}", .{ mode, addr, standbyStateLabel(standby_ssh), reason });
+    } else {
+        log.info("transport_state mode={s} active_client_udp=none standby={s} reason={s}", .{ mode, standbyStateLabel(standby_ssh), reason });
+        connectDebug(connect_debug, "transport_state mode={s} active_client_udp=none standby={s} reason={s}", .{ mode, standbyStateLabel(standby_ssh), reason });
+    }
+}
+
 fn durationNsToMsForLog(ns: ?i64) i64 {
     return if (ns) |value| @max(@as(i64, 1), @divFloor(value, std.time.ns_per_ms)) else -1;
 }
@@ -730,6 +748,7 @@ pub const Gateway = struct {
                     .write_fd = posix.STDOUT_FILENO,
                     .control = .{ .line = try std.ArrayList(u8).initCapacity(alloc, 128) },
                 };
+                logTransportState(connect_debug, "udp", peer.addr, standby_ssh, "bootstrap_udp");
             } else {
                 try sendUseAck(posix.STDOUT_FILENO, "ssh");
                 try setNonBlocking(posix.STDIN_FILENO);
@@ -740,6 +759,7 @@ pub const Gateway = struct {
                     .read_buf = try ipc.SocketBuffer.init(alloc),
                     .write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096),
                 } };
+                logTransportState(connect_debug, "ssh", peer.addr, standby_ssh, "bootstrap_ssh");
             }
         } else {
             // Print bootstrap line for SSH capture
@@ -926,6 +946,7 @@ pub const Gateway = struct {
                     const decoded = try nat.decodeReprobeDatagram(&self.peer, &self.candidate_reprobe, raw.data, raw.from, &decrypt_buf, false) orelse continue;
                     if (decoded.selected) {
                         connectDebug(self.connect_debug, "authenticated refreshed client UDP path {f}", .{raw.from});
+                        logTransportState(self.connect_debug, "udp", raw.from, self.standby_ssh, "refreshed_client_path");
                     }
                     try self.handleTransportPacket(decoded.plaintext, now);
                 }

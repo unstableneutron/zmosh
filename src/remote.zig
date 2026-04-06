@@ -21,6 +21,9 @@ const ssh_fallback_after_disconnected_ns = 10 * std.time.ns_per_s;
 const udp_switch_request_retry_ns = 500 * std.time.ns_per_ms;
 const udp_switch_request_timeout_ns = 2 * std.time.ns_per_s;
 const use_ack_timeout_ms: i32 = 2000;
+const standby_fallback_retry_backoff_ns = 300 * std.time.ns_per_ms;
+const max_standby_fallback_retries: u8 = 2;
+const fresh_ssh_recovery_backoff_ns = 1500 * std.time.ns_per_ms;
 const max_standby_buffer = 8 * 1024;
 const initial_ssh_snapshot_id: u32 = 0x8000_0000;
 const max_ssh_snapshot_restarts: u8 = 2;
@@ -63,11 +66,12 @@ pub const RemoteAttachOptions = struct {
 
 pub const RemoteSession = struct {
     host: []const u8,
+    session_name: []const u8,
     port: u16,
     key: crypto.Key,
     server_candidates: std.ArrayList(nat.Candidate),
     ssh: ?SshBootstrap,
-    ssh_pid: ?posix.pid_t,
+    ssh_pids: std.ArrayList(posix.pid_t),
 
     pub fn deinit(self: *RemoteSession, alloc: std.mem.Allocator) void {
         self.server_candidates.deinit(alloc);
@@ -75,11 +79,11 @@ pub const RemoteSession = struct {
             posix.close(pipes.stdin_fd);
             posix.close(pipes.stdout_fd);
         }
-        if (self.ssh_pid) |pid| {
+        for (self.ssh_pids.items) |pid| {
             _ = posix.waitpid(pid, posix.W.NOHANG);
         }
+        self.ssh_pids.deinit(alloc);
         self.ssh = null;
-        self.ssh_pid = null;
     }
 };
 
@@ -240,6 +244,24 @@ fn clampProbeTimeoutMs(ms: u32) u32 {
 fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
     if (!enabled) return;
     std.debug.print("zmx debug: " ++ fmt ++ "\n", args);
+}
+
+fn standbyStateLabel(standby_ssh: ?StandbySsh) []const u8 {
+    const standby = standby_ssh orelse return "none";
+    return switch (standby.control) {
+        .line => "line",
+        .framed => "framed",
+    };
+}
+
+fn logTransportState(connect_debug: bool, mode: []const u8, active_udp_peer: ?std.net.Address, standby_ssh: ?StandbySsh, reason: []const u8) void {
+    if (active_udp_peer) |addr| {
+        log.info("transport_state mode={s} active_udp={f} standby={s} reason={s}", .{ mode, addr, standbyStateLabel(standby_ssh), reason });
+        connectDebug(connect_debug, "transport_state mode={s} active_udp={f} standby={s} reason={s}", .{ mode, addr, standbyStateLabel(standby_ssh), reason });
+    } else {
+        log.info("transport_state mode={s} active_udp=none standby={s} reason={s}", .{ mode, standbyStateLabel(standby_ssh), reason });
+        connectDebug(connect_debug, "transport_state mode={s} active_udp=none standby={s} reason={s}", .{ mode, standbyStateLabel(standby_ssh), reason });
+    }
 }
 
 fn durationNsToMsForLog(ns: ?i64) i64 {
@@ -786,13 +808,18 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
         else
             60000;
 
+        var ssh_pids = try std.ArrayList(posix.pid_t).initCapacity(alloc, 1);
+        errdefer ssh_pids.deinit(alloc);
+        try ssh_pids.append(alloc, child_pid);
+
         return .{
             .host = host,
+            .session_name = session,
             .port = port,
             .key = parsed.key,
             .server_candidates = parsed.candidates,
             .ssh = .{ .stdin_fd = stdin_fd, .stdout_fd = stdout_fd },
-            .ssh_pid = child_pid,
+            .ssh_pids = ssh_pids,
         };
     }
 
@@ -804,13 +831,18 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
     if (child.stdin) |f| f.close();
     if (child.stdout) |f| f.close();
 
+    var ssh_pids = try std.ArrayList(posix.pid_t).initCapacity(alloc, 1);
+    errdefer ssh_pids.deinit(alloc);
+    try ssh_pids.append(alloc, child_pid);
+
     return .{
         .host = host,
+        .session_name = session,
         .port = parsed.port,
         .key = parsed.key,
         .server_candidates = .empty,
         .ssh = null,
-        .ssh_pid = child_pid,
+        .ssh_pids = ssh_pids,
     };
 }
 
@@ -1040,6 +1072,87 @@ const PendingUdpSwitch = struct {
         return self.active and (now - self.started_at_ns) >= udp_switch_request_timeout_ns;
     }
 };
+
+const StandbyFallbackFailure = enum {
+    ack_timeout,
+    eof,
+    write_failed,
+    other,
+};
+
+const StandbyChannelKind = enum {
+    line,
+    framed,
+    none,
+};
+
+const StandbyFallbackDisposition = struct {
+    keep_standby: bool,
+    retry_delay_ns: ?i64,
+    escalate_to_fresh_ssh: bool,
+};
+
+const FallbackRecoveryState = struct {
+    standby_retry_count: u8 = 0,
+    next_standby_retry_ns: ?i64 = null,
+    next_fresh_ssh_attempt_ns: ?i64 = null,
+
+    fn clear(self: *FallbackRecoveryState) void {
+        self.* = .{};
+    }
+
+    fn scheduleFreshSshRetry(self: *FallbackRecoveryState, now: i64) void {
+        self.next_fresh_ssh_attempt_ns = now + fresh_ssh_recovery_backoff_ns;
+    }
+};
+
+fn classifyStandbyFallbackFailure(err: anyerror) StandbyFallbackFailure {
+    return switch (err) {
+        error.UseAckTimeout => .ack_timeout,
+        error.UnexpectedEof => .eof,
+        error.BrokenPipe, error.NotOpenForWriting, error.WriteFailed, error.WriteTimeout => .write_failed,
+        else => .other,
+    };
+}
+
+fn describeStandbyFallbackFailure(failure: StandbyFallbackFailure) []const u8 {
+    return switch (failure) {
+        .ack_timeout => "ack_timeout",
+        .eof => "eof",
+        .write_failed => "write_failed",
+        .other => "other",
+    };
+}
+
+fn standbyChannelKind(standby_ssh: ?StandbySsh) StandbyChannelKind {
+    const standby = standby_ssh orelse return .none;
+    return switch (standby.control) {
+        .line => .line,
+        .framed => .framed,
+    };
+}
+
+fn planStandbyFallbackFailure(channel_kind: StandbyChannelKind, failure: StandbyFallbackFailure, retry_count: u8) StandbyFallbackDisposition {
+    return switch (failure) {
+        .ack_timeout => if (channel_kind == .framed and retry_count < max_standby_fallback_retries)
+            .{
+                .keep_standby = true,
+                .retry_delay_ns = (@as(i64, retry_count) + 1) * standby_fallback_retry_backoff_ns,
+                .escalate_to_fresh_ssh = false,
+            }
+        else
+            .{
+                .keep_standby = false,
+                .retry_delay_ns = null,
+                .escalate_to_fresh_ssh = true,
+            },
+        .eof, .write_failed, .other => .{
+            .keep_standby = false,
+            .retry_delay_ns = null,
+            .escalate_to_fresh_ssh = true,
+        },
+    };
+}
 
 fn reserveSshSnapshotId(next_ssh_snapshot_id: *u32, awaiting_ssh_snapshot: *bool, expected_ssh_snapshot_id: *?u32) u32 {
     const snapshot_id = next_ssh_snapshot_id.*;
@@ -1403,10 +1516,30 @@ fn switchToStandbySsh(
     try activateStandbySsh(alloc, transport_mode, standby_ssh);
 }
 
-fn performSshFallback(
+const StandbyFallbackAttemptResult = union(enum) {
+    switched,
+    failed: StandbyFallbackFailure,
+    unavailable,
+};
+
+fn clearReconnectBanner() void {
+    _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
+}
+
+fn showReconnectBanner() void {
+    _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b[7mzmx: connection lost — waiting to reconnect...\x1b[27m\x1b8") catch {};
+}
+
+fn disableStandby(standby_ssh: *?StandbySsh, alloc: std.mem.Allocator) void {
+    if (standby_ssh.*) |*standby| {
+        standby.deinit(alloc, true);
+        standby_ssh.* = null;
+    }
+}
+
+fn finalizeSshActivation(
     alloc: std.mem.Allocator,
     transport_mode: *RemoteTransport,
-    standby_ssh: *?StandbySsh,
     reliable_send: *transport.ReliableSend,
     active_snapshot_id: *?u32,
     awaiting_ssh_snapshot: *bool,
@@ -1416,23 +1549,18 @@ fn performSshFallback(
     deferred_output_buf: *std.ArrayList(u8),
     pending_output_epoch: *?u32,
     resync_pending: *bool,
-    connect_debug: bool,
-    reason: []const u8,
     disconnected_since_ns: *?i64,
     was_disconnected: *bool,
     pending_ssh_detach: *bool,
-) !bool {
-    if (standby_ssh.* == null) return false;
-
-    switchToStandbySsh(alloc, transport_mode, standby_ssh) catch |err| {
-        connectDebug(connect_debug, "failed to switch to SSH fallback: {s}", .{@errorName(err)});
-        disableStandby(standby_ssh, alloc);
-        return false;
-    };
-
-    _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
-    _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: UDP unavailable — switched to SSH tunnel\r\n") catch {};
-    connectDebug(connect_debug, "switched to SSH fallback ({s})", .{reason});
+    connect_debug: bool,
+    reason: []const u8,
+    standby_ssh: ?StandbySsh,
+    success_line: []const u8,
+) !void {
+    clearReconnectBanner();
+    _ = posix.write(posix.STDOUT_FILENO, success_line) catch {};
+    connectDebug(connect_debug, "switched to SSH transport ({s})", .{reason});
+    logTransportState(connect_debug, "ssh", null, standby_ssh, reason);
 
     disconnected_since_ns.* = null;
     was_disconnected.* = false;
@@ -1458,14 +1586,337 @@ fn performSshFallback(
         const resumed_init = ipc.Init{ .rows = resumed_size.rows, .cols = resumed_size.cols, .snapshot_id = resumed_snapshot_id };
         try appendSshIpc(&transport_mode.ssh.write_buf, alloc, .Init, std.mem.asBytes(&resumed_init));
     }
+}
+
+fn attemptStandbySshFallback(
+    alloc: std.mem.Allocator,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?StandbySsh,
+    reliable_send: *transport.ReliableSend,
+    active_snapshot_id: *?u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    next_ssh_snapshot_id: *u32,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    pending_output_epoch: *?u32,
+    resync_pending: *bool,
+    connect_debug: bool,
+    reason: []const u8,
+    disconnected_since_ns: *?i64,
+    was_disconnected: *bool,
+    pending_ssh_detach: *bool,
+) !StandbyFallbackAttemptResult {
+    if (standby_ssh.* == null) return .unavailable;
+
+    switchToStandbySsh(alloc, transport_mode, standby_ssh) catch |err| {
+        const failure = classifyStandbyFallbackFailure(err);
+        connectDebug(connect_debug, "failed to switch to SSH fallback: {s} ({s})", .{ @errorName(err), describeStandbyFallbackFailure(failure) });
+        return .{ .failed = failure };
+    };
+
+    try finalizeSshActivation(
+        alloc,
+        transport_mode,
+        reliable_send,
+        active_snapshot_id,
+        awaiting_ssh_snapshot,
+        expected_ssh_snapshot_id,
+        next_ssh_snapshot_id,
+        stdout_buf,
+        deferred_output_buf,
+        pending_output_epoch,
+        resync_pending,
+        disconnected_since_ns,
+        was_disconnected,
+        pending_ssh_detach,
+        connect_debug,
+        reason,
+        standby_ssh.*, 
+        "\r\nzmx: UDP unavailable — switched to SSH tunnel\r\n",
+    );
+    return .switched;
+}
+
+fn resetUdpRecoveryState(
+    alloc: std.mem.Allocator,
+    peer: *udp_mod.Peer,
+    reliable_send: *transport.ReliableSend,
+    reliable_recv: *transport.RecvState,
+    reliable_inbox: *transport.ReliableInbox,
+    output_recv: *transport.OutputRecvState,
+    key: crypto.Key,
+) !void {
+    peer.* = udp_mod.Peer.init(key, .to_server);
+    reliable_send.clearPending();
+    reliable_recv.* = .{};
+    reliable_inbox.deinit();
+    reliable_inbox.* = try transport.ReliableInbox.init(alloc);
+    output_recv.* = .{};
+}
+
+fn attemptFreshSshRecovery(
+    alloc: std.mem.Allocator,
+    session: *RemoteSession,
+    options: RemoteAttachOptions,
+    socket_capability: udp_mod.SocketCapability,
+    udp_sock: *udp_mod.UdpSocket,
+    peer: *udp_mod.Peer,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?StandbySsh,
+    reliable_send: *transport.ReliableSend,
+    reliable_recv: *transport.RecvState,
+    reliable_inbox: *transport.ReliableInbox,
+    output_recv: *transport.OutputRecvState,
+    active_snapshot_id: *?u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    next_ssh_snapshot_id: *u32,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    pending_output_epoch: *?u32,
+    resync_pending: *bool,
+    connect_debug: bool,
+    disconnected_since_ns: *?i64,
+    was_disconnected: *bool,
+    pending_ssh_detach: *bool,
+    srflx_refresh: *const AsyncSrflxRefresh,
+) !bool {
+    if (options.nat_traversal != .auto) return false;
+
+    _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: standby SSH unavailable — trying a fresh SSH recovery path...\r\n") catch {};
+    connectDebug(connect_debug, "attempting fresh SSH recovery host={s} session={s}", .{ session.host, session.session_name });
+
+    var fresh_session = connectRemote(alloc, session.host, session.session_name, options) catch |err| {
+        connectDebug(connect_debug, "fresh SSH recovery bootstrap failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    defer fresh_session.deinit(alloc);
+
+    if (fresh_session.ssh == null) {
+        connectDebug(connect_debug, "fresh SSH recovery bootstrap produced no SSH control channel", .{});
+        return false;
+    }
+
+    var fresh_standby_opt: ?StandbySsh = try StandbySsh.initLine(alloc, fresh_session.ssh.?);
+    fresh_session.ssh = null;
+    errdefer if (fresh_standby_opt) |*standby| standby.deinit(alloc, true);
+    const switched = attemptStandbySshFallback(
+        alloc,
+        transport_mode,
+        &fresh_standby_opt,
+        reliable_send,
+        active_snapshot_id,
+        awaiting_ssh_snapshot,
+        expected_ssh_snapshot_id,
+        next_ssh_snapshot_id,
+        stdout_buf,
+        deferred_output_buf,
+        pending_output_epoch,
+        resync_pending,
+        connect_debug,
+        "fresh SSH recovery",
+        disconnected_since_ns,
+        was_disconnected,
+        pending_ssh_detach,
+    ) catch |err| {
+        connectDebug(connect_debug, "fresh SSH recovery activation failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    switch (switched) {
+        .switched => {},
+        .failed, .unavailable => {
+            if (fresh_standby_opt) |*standby| standby.deinit(alloc, true);
+            fresh_standby_opt = null;
+            return false;
+        },
+    }
+
+    disableStandby(standby_ssh, alloc);
+    try resetUdpRecoveryState(alloc, peer, reliable_send, reliable_recv, reliable_inbox, output_recv, fresh_session.key);
+    session.key = fresh_session.key;
+    session.port = fresh_session.port;
+    session.server_candidates.deinit(alloc);
+    session.server_candidates = fresh_session.server_candidates;
+    fresh_session.server_candidates = .empty;
+    try session.ssh_pids.appendSlice(alloc, fresh_session.ssh_pids.items);
+    fresh_session.ssh_pids.clearRetainingCapacity();
+
+    sendCurrentLocalCandidateRefresh(alloc, socket_capability, udp_sock, transport_mode, standby_ssh, srflx_refresh, connect_debug) catch |err| {
+        connectDebug(connect_debug, "failed to send refreshed local candidates after fresh SSH recovery: {s}", .{@errorName(err)});
+    };
     return true;
 }
 
-fn disableStandby(standby_ssh: *?StandbySsh, alloc: std.mem.Allocator) void {
-    if (standby_ssh.*) |*standby| {
-        standby.deinit(alloc, true);
-        standby_ssh.* = null;
+fn downgradeActiveSshTransport(
+    alloc: std.mem.Allocator,
+    transport_mode: *RemoteTransport,
+    sock: *udp_mod.UdpSocket,
+    peer: *udp_mod.Peer,
+    pending_udp_switch: *PendingUdpSwitch,
+    active_snapshot_id: *?u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    deferred_output_buf: *std.ArrayList(u8),
+    pending_output_epoch: *?u32,
+    resync_pending: *bool,
+    ssh_snapshot_restarts: *u8,
+    was_disconnected: *bool,
+    disconnected_since_ns: *?i64,
+    pending_ssh_detach: *bool,
+    pending_ssh_detach_ns: *?i64,
+    ssh_eof: *bool,
+    ssh_write_closed: *bool,
+    connect_debug: bool,
+    reason: []const u8,
+    now: i64,
+) void {
+    if (transport_mode.* != .ssh) return;
+    transport_mode.deinit(alloc);
+    transport_mode.* = .{ .udp = .{ .sock = sock, .peer = peer } };
+    pending_udp_switch.clear();
+    active_snapshot_id.* = null;
+    awaiting_ssh_snapshot.* = false;
+    expected_ssh_snapshot_id.* = null;
+    deferred_output_buf.clearRetainingCapacity();
+    pending_output_epoch.* = null;
+    resync_pending.* = false;
+    ssh_snapshot_restarts.* = 0;
+    pending_ssh_detach.* = false;
+    pending_ssh_detach_ns.* = null;
+    ssh_eof.* = false;
+    ssh_write_closed.* = false;
+    if (!was_disconnected.*) showReconnectBanner();
+    was_disconnected.* = true;
+    disconnected_since_ns.* = disconnected_since_ns.* orelse now;
+    peer.enterRecoveryMode(now);
+    connectDebug(connect_debug, "active SSH transport degraded back to UDP recovery: {s}", .{reason});
+    logTransportState(connect_debug, "udp", peer.addr, null, reason);
+}
+
+fn recoverAfterUdpLoss(
+    alloc: std.mem.Allocator,
+    session: *RemoteSession,
+    options: RemoteAttachOptions,
+    socket_capability: udp_mod.SocketCapability,
+    udp_sock: *udp_mod.UdpSocket,
+    peer: *udp_mod.Peer,
+    transport_mode: *RemoteTransport,
+    standby_ssh: *?StandbySsh,
+    reliable_send: *transport.ReliableSend,
+    reliable_recv: *transport.RecvState,
+    reliable_inbox: *transport.ReliableInbox,
+    output_recv: *transport.OutputRecvState,
+    active_snapshot_id: *?u32,
+    awaiting_ssh_snapshot: *bool,
+    expected_ssh_snapshot_id: *?u32,
+    next_ssh_snapshot_id: *u32,
+    stdout_buf: *std.ArrayList(u8),
+    deferred_output_buf: *std.ArrayList(u8),
+    pending_output_epoch: *?u32,
+    resync_pending: *bool,
+    connect_debug: bool,
+    reason: []const u8,
+    disconnected_since_ns: *?i64,
+    was_disconnected: *bool,
+    pending_ssh_detach: *bool,
+    ssh_reprobe: *CandidateReprobe,
+    srflx_refresh: *const AsyncSrflxRefresh,
+    recovery_state: *FallbackRecoveryState,
+    now: i64,
+) !bool {
+    if (standby_ssh.* != null and (recovery_state.next_standby_retry_ns == null or now >= recovery_state.next_standby_retry_ns.?)) {
+        switch (try attemptStandbySshFallback(
+            alloc,
+            transport_mode,
+            standby_ssh,
+            reliable_send,
+            active_snapshot_id,
+            awaiting_ssh_snapshot,
+            expected_ssh_snapshot_id,
+            next_ssh_snapshot_id,
+            stdout_buf,
+            deferred_output_buf,
+            pending_output_epoch,
+            resync_pending,
+            connect_debug,
+            reason,
+            disconnected_since_ns,
+            was_disconnected,
+            pending_ssh_detach,
+        )) {
+            .switched => {
+                recovery_state.clear();
+                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
+                return true;
+            },
+            .failed => |failure| {
+                const disposition = planStandbyFallbackFailure(standbyChannelKind(standby_ssh.*), failure, recovery_state.standby_retry_count);
+                if (disposition.keep_standby and disposition.retry_delay_ns != null) {
+                    recovery_state.standby_retry_count += 1;
+                    recovery_state.next_standby_retry_ns = now + disposition.retry_delay_ns.?;
+                    connectDebug(connect_debug, "standby SSH fallback retry {d}/{d} scheduled in {d}ms after {s}", .{
+                        recovery_state.standby_retry_count,
+                        max_standby_fallback_retries,
+                        @divFloor(disposition.retry_delay_ns.?, std.time.ns_per_ms),
+                        describeStandbyFallbackFailure(failure),
+                    });
+                    return false;
+                }
+
+                disableStandby(standby_ssh, alloc);
+                recovery_state.next_standby_retry_ns = null;
+                if (disposition.escalate_to_fresh_ssh) {
+                    recovery_state.next_fresh_ssh_attempt_ns = now;
+                    connectDebug(connect_debug, "escalating from standby SSH failure to fresh SSH recovery after {s}", .{describeStandbyFallbackFailure(failure)});
+                }
+            },
+            .unavailable => {},
+        }
     }
+
+    if (recovery_state.next_fresh_ssh_attempt_ns) |retry_ns| {
+        if (now < retry_ns) return false;
+    }
+
+    if (standby_ssh.* == null or recovery_state.next_fresh_ssh_attempt_ns != null) {
+        if (try attemptFreshSshRecovery(
+            alloc,
+            session,
+            options,
+            socket_capability,
+            udp_sock,
+            peer,
+            transport_mode,
+            standby_ssh,
+            reliable_send,
+            reliable_recv,
+            reliable_inbox,
+            output_recv,
+            active_snapshot_id,
+            awaiting_ssh_snapshot,
+            expected_ssh_snapshot_id,
+            next_ssh_snapshot_id,
+            stdout_buf,
+            deferred_output_buf,
+            pending_output_epoch,
+            resync_pending,
+            connect_debug,
+            disconnected_since_ns,
+            was_disconnected,
+            pending_ssh_detach,
+            srflx_refresh,
+        )) {
+            recovery_state.clear();
+            _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
+            return true;
+        }
+
+        recovery_state.scheduleFreshSshRetry(now);
+        connectDebug(connect_debug, "fresh SSH recovery retry scheduled in {d}ms", .{@divFloor(fresh_ssh_recovery_backoff_ns, std.time.ns_per_ms)});
+    }
+
+    return false;
 }
 
 fn takeActiveSshAsStandby(alloc: std.mem.Allocator, transport_mode: *RemoteTransport) !StandbySsh {
@@ -1767,6 +2218,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         session.ssh = null;
         try sendUse(standby_ssh.?.write_fd, "udp");
         connectDebug(options.connect_debug, "selected UDP transport with SSH standby", .{});
+        logTransportState(options.connect_debug, "udp", peer.addr, standby_ssh, "bootstrap_udp");
     } else if (decision == .ssh) {
         if (session.ssh == null) return error.MissingSshPipes;
         standby_ssh = try StandbySsh.initLine(alloc, session.ssh.?);
@@ -1774,6 +2226,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         try switchToStandbySsh(alloc, &transport_mode, &standby_ssh);
         _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: using SSH tunnel (no UDP connectivity)\r\n") catch {};
         connectDebug(options.connect_debug, "selected SSH transport", .{});
+        logTransportState(options.connect_debug, "ssh", peer.addr, standby_ssh, "bootstrap_ssh");
     }
     var was_disconnected = false;
     var disconnected_since_ns: ?i64 = null;
@@ -1797,6 +2250,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var current_output_epoch: u32 = 0;
     var pending_output_epoch: ?u32 = null;
     var pending_udp_switch: PendingUdpSwitch = .{};
+    var fallback_recovery_state: FallbackRecoveryState = .{};
 
     const size = getTerminalSize();
     const init_snapshot_id = switch (transport_mode) {
@@ -1866,11 +2320,19 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             const state = peer.updateState(now, config);
             if (state == .dead) {
                 if (!session_ended) {
-                    if (try performSshFallback(
+                    if (try recoverAfterUdpLoss(
                         alloc,
+                        &session,
+                        options,
+                        socket_capability,
+                        &udp_sock,
+                        &peer,
                         &transport_mode,
                         &standby_ssh,
                         &reliable_send,
+                        &reliable_recv,
+                        &reliable_inbox,
+                        &output_recv,
                         &active_snapshot_id,
                         &awaiting_ssh_snapshot,
                         &expected_ssh_snapshot_id,
@@ -1880,40 +2342,51 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &pending_output_epoch,
                         &resync_pending,
                         options.connect_debug,
-                        "dead UDP state",
+                        "dead_udp",
                         &disconnected_since_ns,
                         &was_disconnected,
                         &pending_ssh_detach,
+                        &ssh_reprobe,
+                        &async_srflx_refresh,
+                        &fallback_recovery_state,
+                        now,
                     )) {
                         pending_udp_switch.clear();
-                        _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
                         continue;
                     }
-
-                    _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: connection lost permanently\r\n") catch {};
-                    return;
                 }
             }
             if (state == .disconnected and !was_disconnected) {
-                _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b[7mzmx: connection lost — waiting to reconnect...\x1b[27m\x1b8") catch {};
+                showReconnectBanner();
                 was_disconnected = true;
                 sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
                 sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
                 disconnected_since_ns = now;
+                logTransportState(options.connect_debug, "udp", peer.addr, standby_ssh, "disconnected");
             } else if (state == .disconnected and disconnected_since_ns == null) {
                 disconnected_since_ns = now;
             } else if (state == .connected and was_disconnected) {
-                _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
+                clearReconnectBanner();
                 was_disconnected = false;
                 disconnected_since_ns = null;
+                fallback_recovery_state.clear();
+                logTransportState(options.connect_debug, "udp", peer.addr, standby_ssh, "reconnected");
             }
 
             if (state == .disconnected and shouldSwitchToStandbySsh(now, disconnected_since_ns, standby_ssh)) {
-                if (!(try performSshFallback(
+                if (try recoverAfterUdpLoss(
                     alloc,
+                    &session,
+                    options,
+                    socket_capability,
+                    &udp_sock,
+                    &peer,
                     &transport_mode,
                     &standby_ssh,
                     &reliable_send,
+                    &reliable_recv,
+                    &reliable_inbox,
+                    &output_recv,
                     &active_snapshot_id,
                     &awaiting_ssh_snapshot,
                     &expected_ssh_snapshot_id,
@@ -1923,16 +2396,18 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     &pending_output_epoch,
                     &resync_pending,
                     options.connect_debug,
-                    "disconnect timeout",
+                    "disconnect_timeout",
                     &disconnected_since_ns,
                     &was_disconnected,
                     &pending_ssh_detach,
-                ))) {
+                    &ssh_reprobe,
+                    &async_srflx_refresh,
+                    &fallback_recovery_state,
+                    now,
+                )) {
+                    pending_udp_switch.clear();
                     continue;
                 }
-                pending_udp_switch.clear();
-                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
-                continue;
             }
         } else if (transport_mode == .ssh) {
             if (!pending_udp_switch.active) {
@@ -2023,6 +2498,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             poll_timeout = @min(poll_timeout, srflx_refresh_ms);
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
+        if (transport_mode == .udp) {
+            if (fallback_recovery_state.next_standby_retry_ns) |retry_ns| {
+                poll_timeout = @min(poll_timeout, @divFloor(@max(@as(i64, 0), retry_ns - now), std.time.ns_per_ms));
+            }
+            if (fallback_recovery_state.next_fresh_ssh_attempt_ns) |retry_ns| {
+                poll_timeout = @min(poll_timeout, @divFloor(@max(@as(i64, 0), retry_ns - now), std.time.ns_per_ms));
+            }
+        }
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
             if (err == error.Interrupted) continue;
@@ -2076,12 +2559,22 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         if (transport_mode == .ssh) {
             const ssh_read_revents = poll_fds[transport_read_idx].revents;
             if (ssh_read_revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                if (!session_ended) {
+                    downgradeActiveSshTransport(alloc, &transport_mode, &udp_sock, &peer, &pending_udp_switch, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &deferred_output_buf, &pending_output_epoch, &resync_pending, &ssh_snapshot_restarts, &was_disconnected, &disconnected_since_ns, &pending_ssh_detach, &pending_ssh_detach_ns, &ssh_eof, &ssh_write_closed, options.connect_debug, "active_ssh_read_poll_error", now);
+                    fallback_recovery_state.next_fresh_ssh_attempt_ns = now;
+                    continue;
+                }
                 return;
             }
             ssh_read_hup = ssh_read_revents & posix.POLL.HUP != 0;
             if (ssh_write_idx) |idx| {
                 const ssh_write_revents = poll_fds[idx].revents;
                 if (ssh_write_revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                    if (!session_ended) {
+                        downgradeActiveSshTransport(alloc, &transport_mode, &udp_sock, &peer, &pending_udp_switch, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &deferred_output_buf, &pending_output_epoch, &resync_pending, &ssh_snapshot_restarts, &was_disconnected, &disconnected_since_ns, &pending_ssh_detach, &pending_ssh_detach_ns, &ssh_eof, &ssh_write_closed, options.connect_debug, "active_ssh_write_poll_error", now);
+                        fallback_recovery_state.next_fresh_ssh_attempt_ns = now;
+                        continue;
+                    }
                     return;
                 }
                 ssh_write_hup = ssh_write_revents & posix.POLL.HUP != 0;
@@ -2213,6 +2706,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         const decoded = try nat.decodeReprobeDatagram(&peer, &standby_reprobe, raw.data, raw.from, &decrypt_buf, false) orelse continue;
                         if (decoded.selected) {
                             connectDebug(options.connect_debug, "switched active UDP peer to refreshed candidate {f}", .{raw.from});
+                            logTransportState(options.connect_debug, "udp", raw.from, standby_ssh, "reprobe_selected");
                         }
 
                         const packet = transport.parsePacket(decoded.plaintext) catch continue;
@@ -2343,6 +2837,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                             while (true) {
                                 const n = s.read_buf.read(s.read_fd) catch |err| {
                                     if (err == error.WouldBlock) break;
+                                    if (!session_ended) {
+                                        downgradeActiveSshTransport(alloc, &transport_mode, &udp_sock, &peer, &pending_udp_switch, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &deferred_output_buf, &pending_output_epoch, &resync_pending, &ssh_snapshot_restarts, &was_disconnected, &disconnected_since_ns, &pending_ssh_detach, &pending_ssh_detach_ns, &ssh_eof, &ssh_write_closed, options.connect_debug, @errorName(err), now);
+                                        fallback_recovery_state.next_fresh_ssh_attempt_ns = now;
+                                        break :ssh_messages;
+                                    }
                                     return err;
                                 };
                                 if (n == 0) {
@@ -2391,6 +2890,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 const decoded = try nat.decodeReprobeDatagram(&peer, &ssh_reprobe, raw.data, raw.from, &decrypt_buf, true) orelse continue;
                 if (decoded.selected) {
                     connectDebug(options.connect_debug, "authenticated revived UDP path {f}", .{raw.from});
+                    logTransportState(options.connect_debug, "ssh", raw.from, standby_ssh, "revived_udp_authenticated");
                     if (!pending_udp_switch.active and transport_mode == .ssh and !ssh_write_closed) {
                         try queueUdpSwitchRequest(&transport_mode.ssh.write_buf, alloc, &pending_udp_switch, now);
                     }
@@ -2415,14 +2915,23 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             var init_buf: [64]u8 = undefined;
             const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&resumed_init), &init_buf);
             try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, now);
+            fallback_recovery_state.clear();
             connectDebug(options.connect_debug, "switched active transport back to UDP", .{});
+            logTransportState(options.connect_debug, "udp", peer.addr, standby_ssh, "udp_repromoted");
             continue;
         }
 
         if (ssh_write_idx) |idx| {
             if (poll_fds[idx].revents & posix.POLL.OUT != 0) {
                 if (transport_mode == .ssh) {
-                    try flushWriteBuffer(transport_mode.ssh.write_fd, &transport_mode.ssh.write_buf, alloc);
+                    flushWriteBuffer(transport_mode.ssh.write_fd, &transport_mode.ssh.write_buf, alloc) catch |err| {
+                        if (!session_ended) {
+                            downgradeActiveSshTransport(alloc, &transport_mode, &udp_sock, &peer, &pending_udp_switch, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &deferred_output_buf, &pending_output_epoch, &resync_pending, &ssh_snapshot_restarts, &was_disconnected, &disconnected_since_ns, &pending_ssh_detach, &pending_ssh_detach_ns, &ssh_eof, &ssh_write_closed, options.connect_debug, @errorName(err), now);
+                            fallback_recovery_state.next_fresh_ssh_attempt_ns = now;
+                            continue;
+                        }
+                        return err;
+                    };
                 }
             }
         }
@@ -2458,6 +2967,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         }
 
         if (ssh_eof and transport_mode == .ssh and stdout_buf.items.len == 0 and (ssh_write_closed or transport_mode.ssh.write_buf.items.len == 0)) {
+            if (!session_ended and !pending_ssh_detach) {
+                downgradeActiveSshTransport(alloc, &transport_mode, &udp_sock, &peer, &pending_udp_switch, &active_snapshot_id, &awaiting_ssh_snapshot, &expected_ssh_snapshot_id, &deferred_output_buf, &pending_output_epoch, &resync_pending, &ssh_snapshot_restarts, &was_disconnected, &disconnected_since_ns, &pending_ssh_detach, &pending_ssh_detach_ns, &ssh_eof, &ssh_write_closed, options.connect_debug, "active_ssh_eof", now);
+                fallback_recovery_state.next_fresh_ssh_attempt_ns = now;
+                continue;
+            }
             return;
         }
 
@@ -2520,6 +3034,48 @@ test "parseConnect2Line keeps explicit bootstrap port" {
     try std.testing.expectEqual(@as(u16, 60444), parsed.port);
 }
 
+const StandbyLineHarness = struct {
+    cmd_read_fd: i32,
+    ack_write_fd: ?i32,
+    standby: ?StandbySsh,
+
+    fn init() !StandbyLineHarness {
+        const cmd_pipe = try posix.pipe();
+        errdefer {
+            posix.close(cmd_pipe[0]);
+            posix.close(cmd_pipe[1]);
+        }
+
+        const ack_pipe = try posix.pipe();
+        errdefer {
+            posix.close(ack_pipe[0]);
+            posix.close(ack_pipe[1]);
+        }
+
+        return .{
+            .cmd_read_fd = cmd_pipe[0],
+            .ack_write_fd = ack_pipe[1],
+            .standby = .{
+                .read_fd = ack_pipe[0],
+                .write_fd = cmd_pipe[1],
+                .control = .{ .line = .empty },
+            },
+        };
+    }
+
+    fn closeAckWriter(self: *StandbyLineHarness) void {
+        const fd = self.ack_write_fd orelse return;
+        posix.close(fd);
+        self.ack_write_fd = null;
+    }
+
+    fn deinit(self: *StandbyLineHarness, alloc: std.mem.Allocator) void {
+        if (self.standby) |*standby| standby.deinit(alloc, true);
+        posix.close(self.cmd_read_fd);
+        if (self.ack_write_fd) |fd| posix.close(fd);
+    }
+};
+
 test "ssh standby fallback threshold" {
     const now: i64 = 20 * std.time.ns_per_s;
     const standby = StandbySsh{ .read_fd = 1, .write_fd = 2, .control = .{ .line = .empty } };
@@ -2528,6 +3084,167 @@ test "ssh standby fallback threshold" {
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 5 * std.time.ns_per_s, standby));
     try std.testing.expect(shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, standby));
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, null));
+}
+
+test "switchToStandbySsh times out when standby never acknowledges SSH activation" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var harness = try StandbyLineHarness.init();
+    defer harness.deinit(alloc);
+
+    var sock = try udp_mod.UdpSocket.bindEphemeral(posix.AF.INET);
+    defer sock.close();
+    var peer = udp_mod.Peer.init([_]u8{0} ** crypto.key_length, .to_server);
+    var transport_mode: RemoteTransport = .{ .udp = .{ .sock = &sock, .peer = &peer } };
+
+    try std.testing.expectError(
+        error.UseAckTimeout,
+        switchToStandbySsh(alloc, &transport_mode, &harness.standby),
+    );
+
+    var cmd_buf: [32]u8 = undefined;
+    const n = try posix.read(harness.cmd_read_fd, &cmd_buf);
+    try std.testing.expectEqualStrings("ZMX_USE ssh\n", cmd_buf[0..n]);
+    try std.testing.expect(harness.standby != null);
+}
+
+test "attemptStandbySshFallback reports ack timeout without consuming standby immediately" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var harness = try StandbyLineHarness.init();
+    defer harness.deinit(alloc);
+
+    var sock = try udp_mod.UdpSocket.bindEphemeral(posix.AF.INET);
+    defer sock.close();
+    var peer = udp_mod.Peer.init([_]u8{0} ** crypto.key_length, .to_server);
+    var transport_mode: RemoteTransport = .{ .udp = .{ .sock = &sock, .peer = &peer } };
+    var standby_ssh = harness.standby;
+    harness.standby = null;
+
+    var reliable_send = try transport.ReliableSend.init(alloc);
+    defer reliable_send.deinit();
+    var active_snapshot_id: ?u32 = null;
+    var awaiting_ssh_snapshot = false;
+    var expected_ssh_snapshot_id: ?u32 = null;
+    var next_ssh_snapshot_id: u32 = initial_ssh_snapshot_id;
+    var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
+    defer stdout_buf.deinit(alloc);
+    var deferred_output_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
+    defer deferred_output_buf.deinit(alloc);
+    var pending_output_epoch: ?u32 = null;
+    var resync_pending = false;
+    var disconnected_since_ns: ?i64 = 123;
+    var was_disconnected = true;
+    var pending_ssh_detach = false;
+
+    const result = try attemptStandbySshFallback(
+        alloc,
+        &transport_mode,
+        &standby_ssh,
+        &reliable_send,
+        &active_snapshot_id,
+        &awaiting_ssh_snapshot,
+        &expected_ssh_snapshot_id,
+        &next_ssh_snapshot_id,
+        &stdout_buf,
+        &deferred_output_buf,
+        &pending_output_epoch,
+        &resync_pending,
+        false,
+        "timeout",
+        &disconnected_since_ns,
+        &was_disconnected,
+        &pending_ssh_detach,
+    );
+    try std.testing.expect(result == .failed);
+    try std.testing.expect(result.failed == .ack_timeout);
+    try std.testing.expect(standby_ssh != null);
+}
+
+test "attemptStandbySshFallback reports EOF for a stale standby channel" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var harness = try StandbyLineHarness.init();
+    harness.closeAckWriter();
+    defer harness.deinit(alloc);
+
+    var sock = try udp_mod.UdpSocket.bindEphemeral(posix.AF.INET);
+    defer sock.close();
+    var peer = udp_mod.Peer.init([_]u8{0} ** crypto.key_length, .to_server);
+    var transport_mode: RemoteTransport = .{ .udp = .{ .sock = &sock, .peer = &peer } };
+    var standby_ssh = harness.standby;
+    harness.standby = null;
+
+    var reliable_send = try transport.ReliableSend.init(alloc);
+    defer reliable_send.deinit();
+    var active_snapshot_id: ?u32 = null;
+    var awaiting_ssh_snapshot = false;
+    var expected_ssh_snapshot_id: ?u32 = null;
+    var next_ssh_snapshot_id: u32 = initial_ssh_snapshot_id;
+    var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
+    defer stdout_buf.deinit(alloc);
+    var deferred_output_buf = try std.ArrayList(u8).initCapacity(alloc, 0);
+    defer deferred_output_buf.deinit(alloc);
+    var pending_output_epoch: ?u32 = null;
+    var resync_pending = false;
+    var disconnected_since_ns: ?i64 = 123;
+    var was_disconnected = true;
+    var pending_ssh_detach = false;
+
+    const result = try attemptStandbySshFallback(
+        alloc,
+        &transport_mode,
+        &standby_ssh,
+        &reliable_send,
+        &active_snapshot_id,
+        &awaiting_ssh_snapshot,
+        &expected_ssh_snapshot_id,
+        &next_ssh_snapshot_id,
+        &stdout_buf,
+        &deferred_output_buf,
+        &pending_output_epoch,
+        &resync_pending,
+        false,
+        "eof",
+        &disconnected_since_ns,
+        &was_disconnected,
+        &pending_ssh_detach,
+    );
+    try std.testing.expect(result == .failed);
+    try std.testing.expect(result.failed == .eof);
+    try std.testing.expect(standby_ssh != null);
+}
+
+test "framed ack timeout retries before escalating to fresh SSH recovery" {
+    const first = planStandbyFallbackFailure(.framed, .ack_timeout, 0);
+    try std.testing.expect(first.keep_standby);
+    try std.testing.expect(first.retry_delay_ns != null);
+    try std.testing.expect(!first.escalate_to_fresh_ssh);
+
+    const escalated = planStandbyFallbackFailure(.framed, .ack_timeout, max_standby_fallback_retries);
+    try std.testing.expect(!escalated.keep_standby);
+    try std.testing.expect(escalated.retry_delay_ns == null);
+    try std.testing.expect(escalated.escalate_to_fresh_ssh);
+}
+
+test "line ack timeout escalates directly to fresh SSH recovery" {
+    const disposition = planStandbyFallbackFailure(.line, .ack_timeout, 0);
+    try std.testing.expect(!disposition.keep_standby);
+    try std.testing.expect(disposition.retry_delay_ns == null);
+    try std.testing.expect(disposition.escalate_to_fresh_ssh);
+}
+
+test "EOF escalates directly to fresh SSH recovery" {
+    const disposition = planStandbyFallbackFailure(.line, .eof, 0);
+    try std.testing.expect(!disposition.keep_standby);
+    try std.testing.expect(disposition.retry_delay_ns == null);
+    try std.testing.expect(disposition.escalate_to_fresh_ssh);
 }
 
 test "pending UDP switch retries and times out cleanly" {
@@ -2708,8 +3425,8 @@ test "standby candidate reprobe filters reset and select refreshed path" {
 
     try std.testing.expect(try reprobe.start(alloc, .ipv4_only, &refreshed, 0));
     try std.testing.expectEqual(@as(usize, 2), reprobe.candidates.items.len);
-    try std.testing.expect(reprobe.candidates.items[0].ctype == .host);
-    try std.testing.expect(reprobe.candidates.items[1].ctype == .srflx);
+    try std.testing.expect(reprobe.candidates.items[0].ctype == .srflx);
+    try std.testing.expect(reprobe.candidates.items[1].ctype == .host);
     try std.testing.expectEqual(@as(i64, 0), reprobe.pollDelayMs(0).?);
 
     const first = reprobe.maybeNextProbeAddr(0).?;
