@@ -1045,6 +1045,15 @@ fn shouldSwitchToStandbySsh(now: i64, disconnected_since_ns: ?i64, standby_ssh: 
     return (now - since) >= ssh_fallback_after_disconnected_ns;
 }
 
+fn shouldAttemptSshRecovery(now: i64, disconnected_since_ns: ?i64, standby_ssh: ?StandbySsh, recovery_state: FallbackRecoveryState) bool {
+    const since = disconnected_since_ns orelse return false;
+    if (recovery_state.next_fresh_ssh_attempt_ns) |retry_ns| {
+        if (now >= retry_ns) return true;
+    }
+    if ((now - since) < ssh_fallback_after_disconnected_ns) return false;
+    return standby_ssh != null or recovery_state.next_fresh_ssh_attempt_ns != null or recovery_state.next_standby_retry_ns != null or standby_ssh == null;
+}
+
 fn shouldBufferSshOutput(active_snapshot_id: ?u32, awaiting_ssh_snapshot: bool) bool {
     return active_snapshot_id != null or awaiting_ssh_snapshot;
 }
@@ -2373,7 +2382,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 logTransportState(options.connect_debug, "udp", peer.addr, standby_ssh, "reconnected");
             }
 
-            if (state == .disconnected and shouldSwitchToStandbySsh(now, disconnected_since_ns, standby_ssh)) {
+            if (state == .disconnected and shouldAttemptSshRecovery(now, disconnected_since_ns, standby_ssh, fallback_recovery_state)) {
                 if (try recoverAfterUdpLoss(
                     alloc,
                     &session,
@@ -2396,7 +2405,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                     &pending_output_epoch,
                     &resync_pending,
                     options.connect_debug,
-                    "disconnect_timeout",
+                    if (standby_ssh != null) "disconnect_timeout" else "disconnect_timeout_no_standby",
                     &disconnected_since_ns,
                     &was_disconnected,
                     &pending_ssh_detach,
@@ -3084,6 +3093,13 @@ test "ssh standby fallback threshold" {
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 5 * std.time.ns_per_s, standby));
     try std.testing.expect(shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, standby));
     try std.testing.expect(!shouldSwitchToStandbySsh(now, now - 11 * std.time.ns_per_s, null));
+}
+
+test "disconnected timeout can trigger fresh SSH recovery even without standby" {
+    const now: i64 = 20 * std.time.ns_per_s;
+    try std.testing.expect(!shouldAttemptSshRecovery(now, null, null, .{}));
+    try std.testing.expect(!shouldAttemptSshRecovery(now, now - 5 * std.time.ns_per_s, null, .{}));
+    try std.testing.expect(shouldAttemptSshRecovery(now, now - 11 * std.time.ns_per_s, null, .{}));
 }
 
 test "switchToStandbySsh times out when standby never acknowledges SSH activation" {
