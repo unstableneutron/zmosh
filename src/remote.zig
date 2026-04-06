@@ -1710,6 +1710,11 @@ fn attemptFreshSshRecovery(
     var fresh_standby_opt: ?StandbySsh = try StandbySsh.initLine(alloc, fresh_session.ssh.?);
     fresh_session.ssh = null;
     errdefer if (fresh_standby_opt) |*standby| standby.deinit(alloc, true);
+
+    var fresh_local_candidates = try srflx_refresh.buildCandidateSet(alloc, udp_sock.bound_port, socket_capability);
+    defer fresh_local_candidates.deinit(alloc);
+    try sendCandidates(fresh_standby_opt.?.write_fd, alloc, fresh_local_candidates.items);
+
     const switched = attemptStandbySshFallback(
         alloc,
         transport_mode,
