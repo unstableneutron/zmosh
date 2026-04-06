@@ -1388,11 +1388,11 @@ fn handleSshMessage(
     }
 }
 
-fn waitForUseAck(fd: i32, alloc: std.mem.Allocator, mode: []const u8, buffered: *std.ArrayList(u8)) !void {
+fn waitForUseAck(fd: i32, alloc: std.mem.Allocator, mode: []const u8, buffered: *std.ArrayList(u8), timeout_ms: i64) !void {
     var expected_buf: [32]u8 = undefined;
     const expected = try std.fmt.bufPrint(&expected_buf, "ZMX_USE_OK {s}", .{mode});
 
-    const deadline_ms = @as(i64, @intCast(std.time.milliTimestamp())) + use_ack_timeout_ms;
+    const deadline_ms = @as(i64, @intCast(std.time.milliTimestamp())) + timeout_ms;
     while (true) {
         if (std.mem.indexOfScalar(u8, buffered.items, '\n')) |nl_idx| {
             const line = std.mem.trimRight(u8, buffered.items[0..nl_idx], "\r\n");
@@ -1437,8 +1437,9 @@ fn waitForTransportSwitchAckFramed(
     fd: i32,
     desired_mode: ipc.TransportMode,
     read_buf: *ipc.SocketBuffer,
+    timeout_ms: i64,
 ) !ipc.TransportSwitchAck {
-    const deadline_ms = @as(i64, @intCast(std.time.milliTimestamp())) + use_ack_timeout_ms;
+    const deadline_ms = @as(i64, @intCast(std.time.milliTimestamp())) + timeout_ms;
     while (true) {
         while (read_buf.next()) |msg| {
             if (msg.header.tag != .TransportSwitchAck) continue;
@@ -1503,12 +1504,13 @@ fn switchToStandbySsh(
     alloc: std.mem.Allocator,
     transport_mode: *RemoteTransport,
     standby_ssh: *?StandbySsh,
+    ack_timeout_ms: i64,
 ) !void {
     var standby = &(standby_ssh.* orelse return error.MissingSshPipes);
     switch (standby.control) {
         .line => |*buffer| {
             try sendUse(standby.write_fd, "ssh");
-            try waitForUseAck(standby.read_fd, alloc, "ssh", buffer);
+            try waitForUseAck(standby.read_fd, alloc, "ssh", buffer, ack_timeout_ms);
         },
         .framed => |*read_buf| {
             var req_buf: [8]u8 = undefined;
@@ -1518,7 +1520,7 @@ fn switchToStandbySsh(
                 .TransportSwitchRequest,
                 ipc.encodeTransportSwitchRequest(&req_buf, .ssh),
             );
-            _ = try waitForTransportSwitchAckFramed(standby.read_fd, .ssh, read_buf);
+            _ = try waitForTransportSwitchAckFramed(standby.read_fd, .ssh, read_buf, ack_timeout_ms);
         },
     }
 
@@ -1615,10 +1617,11 @@ fn attemptStandbySshFallback(
     disconnected_since_ns: *?i64,
     was_disconnected: *bool,
     pending_ssh_detach: *bool,
+    ack_timeout_ms: i64,
 ) !StandbyFallbackAttemptResult {
     if (standby_ssh.* == null) return .unavailable;
 
-    switchToStandbySsh(alloc, transport_mode, standby_ssh) catch |err| {
+    switchToStandbySsh(alloc, transport_mode, standby_ssh, ack_timeout_ms) catch |err| {
         const failure = classifyStandbyFallbackFailure(err);
         connectDebug(connect_debug, "failed to switch to SSH fallback: {s} ({s})", .{ @errorName(err), describeStandbyFallbackFailure(failure) });
         return .{ .failed = failure };
@@ -1733,6 +1736,7 @@ fn attemptFreshSshRecovery(
         disconnected_since_ns,
         was_disconnected,
         pending_ssh_detach,
+        @as(i64, @intCast(options.probe_timeout_ms)) + use_ack_timeout_ms,
     ) catch |err| {
         connectDebug(connect_debug, "fresh SSH recovery activation failed: {s}", .{@errorName(err)});
         return false;
@@ -1858,6 +1862,7 @@ fn recoverAfterUdpLoss(
             disconnected_since_ns,
             was_disconnected,
             pending_ssh_detach,
+            use_ack_timeout_ms,
         )) {
             .switched => {
                 recovery_state.clear();
@@ -2237,7 +2242,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         if (session.ssh == null) return error.MissingSshPipes;
         standby_ssh = try StandbySsh.initLine(alloc, session.ssh.?);
         session.ssh = null;
-        try switchToStandbySsh(alloc, &transport_mode, &standby_ssh);
+        try switchToStandbySsh(alloc, &transport_mode, &standby_ssh, use_ack_timeout_ms);
         _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: using SSH tunnel (no UDP connectivity)\r\n") catch {};
         connectDebug(options.connect_debug, "selected SSH transport", .{});
         logTransportState(options.connect_debug, "ssh", peer.addr, standby_ssh, "bootstrap_ssh");
@@ -3122,7 +3127,7 @@ test "switchToStandbySsh times out when standby never acknowledges SSH activatio
 
     try std.testing.expectError(
         error.UseAckTimeout,
-        switchToStandbySsh(alloc, &transport_mode, &harness.standby),
+        switchToStandbySsh(alloc, &transport_mode, &harness.standby, use_ack_timeout_ms),
     );
 
     var cmd_buf: [32]u8 = undefined;
@@ -3180,6 +3185,7 @@ test "attemptStandbySshFallback reports ack timeout without consuming standby im
         &disconnected_since_ns,
         &was_disconnected,
         &pending_ssh_detach,
+        use_ack_timeout_ms,
     );
     try std.testing.expect(result == .failed);
     try std.testing.expect(result.failed == .ack_timeout);
@@ -3236,6 +3242,7 @@ test "attemptStandbySshFallback reports EOF for a stale standby channel" {
         &disconnected_since_ns,
         &was_disconnected,
         &pending_ssh_detach,
+        use_ack_timeout_ms,
     );
     try std.testing.expect(result == .failed);
     try std.testing.expect(result.failed == .eof);
