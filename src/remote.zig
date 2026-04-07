@@ -24,6 +24,8 @@ const use_ack_timeout_ms: i32 = 2000;
 const standby_fallback_retry_backoff_ns = 300 * std.time.ns_per_ms;
 const max_standby_fallback_retries: u8 = 2;
 const fresh_ssh_recovery_backoff_ns = 1500 * std.time.ns_per_ms;
+const preferred_path_reprobe_interval_ns = 5 * std.time.ns_per_s;
+const ssh_reprobe_candidate_probe_burst: u8 = 2;
 const max_standby_buffer = 8 * 1024;
 const initial_ssh_snapshot_id: u32 = 0x8000_0000;
 const max_ssh_snapshot_restarts: u8 = 2;
@@ -1920,7 +1922,9 @@ fn recoverAfterUdpLoss(
         )) {
             .switched => {
                 recovery_state.clear();
-                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
+                const started = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
+                connectDebug(connect_debug, "armed ssh reprobe after {s} candidates={d} started={}", .{ reason, ssh_reprobe.candidates.items.len, started });
+                if (started) burstProbeCandidates(peer, udp_sock, reliable_recv, ssh_reprobe.candidates.items);
                 return true;
             },
             .failed => |failure| {
@@ -1981,7 +1985,9 @@ fn recoverAfterUdpLoss(
             srflx_refresh,
         )) {
             recovery_state.clear();
-            _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
+            const started = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
+            connectDebug(connect_debug, "armed ssh reprobe after fresh SSH recovery candidates={d} started={}", .{ ssh_reprobe.candidates.items.len, started });
+            if (started) burstProbeCandidates(peer, udp_sock, reliable_recv, ssh_reprobe.candidates.items);
             return true;
         }
 
@@ -2049,6 +2055,44 @@ fn sendCurrentLocalCandidateRefresh(
         countCandidatesByType(refreshed_candidates.items, .srflx),
     });
     try sendLocalCandidateRefresh(alloc, transport_mode, standby_ssh, refreshed_candidates.items);
+}
+
+fn maybeStartPreferredServerReprobe(
+    alloc: std.mem.Allocator,
+    socket_capability: udp_mod.SocketCapability,
+    server_candidates: []const nat.Candidate,
+    peer: *const udp_mod.Peer,
+    reprobe: *CandidateReprobe,
+    now: i64,
+    connect_debug: bool,
+    allow_tailscale: bool,
+    last_started_ns: *i64,
+) !void {
+    if (reprobe.isActive()) return;
+    if ((now - last_started_ns.*) < preferred_path_reprobe_interval_ns) return;
+    const current_addr = peer.addr orelse return;
+
+    var preferred = try std.ArrayList(nat.Candidate).initCapacity(alloc, server_candidates.len);
+    defer preferred.deinit(alloc);
+    try nat.replacePreferredCandidateSet(alloc, &preferred, socket_capability, server_candidates, current_addr, nat.max_candidates, allow_tailscale);
+    last_started_ns.* = now;
+    if (preferred.items.len == 0) return;
+
+    if (try reprobe.start(alloc, socket_capability, preferred.items, now, allow_tailscale)) {
+        connectDebug(connect_debug, "starting preferred server reprobe current={f} candidates={d}", .{ current_addr, reprobe.candidates.items.len });
+    }
+}
+
+fn burstProbeCandidates(peer: *udp_mod.Peer, sock: *udp_mod.UdpSocket, reliable_recv: *const transport.RecvState, candidates: []const nat.Candidate) void {
+    for (candidates) |candidate| {
+        var burst: u8 = 0;
+        while (burst < ssh_reprobe_candidate_probe_burst) : (burst += 1) {
+            sendProbeHeartbeatTo(peer, sock, candidate.addr, reliable_recv) catch |err| {
+                if (err == error.WouldBlock) break;
+                break;
+            };
+        }
+    }
 }
 
 fn handleAsyncSrflxDatagram(
@@ -2284,6 +2328,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     defer standby_reprobe.deinit(alloc);
     var ssh_reprobe: CandidateReprobe = .{};
     defer ssh_reprobe.deinit(alloc);
+    var last_preferred_server_reprobe_ns: i64 = 0;
     var network_monitor = netmon.NetworkMonitor.init(alloc);
     defer network_monitor.deinit();
     var async_srflx_refresh = try AsyncSrflxRefresh.init(alloc, socket_capability, options.stun_servers);
@@ -2380,6 +2425,20 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             defer retransmits.deinit(alloc);
             for (retransmits.items) |pkt| {
                 peer.send(&udp_sock, pkt) catch {};
+            }
+
+            if (standby_ssh != null) {
+                try maybeStartPreferredServerReprobe(
+                    alloc,
+                    socket_capability,
+                    session.server_candidates.items,
+                    &peer,
+                    &standby_reprobe,
+                    now,
+                    options.connect_debug,
+                    options.allow_tailscale,
+                    &last_preferred_server_reprobe_ns,
+                );
             }
 
             if (standby_reprobe.maybeNextProbeAddr(now)) |addr| {
@@ -2489,6 +2548,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         } else if (transport_mode == .ssh) {
             if (!pending_udp_switch.active) {
                 if (ssh_reprobe.maybeNextProbeAddr(now)) |addr| {
+                    log.debug("ssh reprobe probe target={f}", .{addr});
+                    connectDebug(options.connect_debug, "ssh reprobe probe target={f}", .{addr});
                     sendProbeHeartbeatTo(&peer, &udp_sock, addr, &reliable_recv) catch |err| {
                         if (err != error.WouldBlock) return err;
                     };
@@ -2982,6 +3043,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
             standby_ssh = promoted_standby;
             standby_reprobe.clear();
             transport_mode = .{ .udp = .{ .sock = &udp_sock, .peer = &peer } };
+            peer.exitRecoveryMode();
+            last_preferred_server_reprobe_ns = @intCast(std.time.nanoTimestamp());
             ssh_eof = false;
             ssh_write_closed = false;
             pending_ssh_detach = false;

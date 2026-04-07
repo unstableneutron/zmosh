@@ -21,6 +21,17 @@ fn copySockaddrToAddress(src_addr: posix.sockaddr.storage, addr_len: posix.sockl
     return addr;
 }
 
+fn isAddressEqual(a: std.net.Address, b: std.net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+    if (a.getPort() != b.getPort()) return false;
+
+    return switch (a.any.family) {
+        posix.AF.INET => a.in.sa.addr == b.in.sa.addr,
+        posix.AF.INET6 => std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr),
+        else => false,
+    };
+}
+
 fn mapUdpSendErrno(err: posix.E) ?posix.SendToError {
     return switch (err) {
         .ACCES => error.AccessDenied,
@@ -333,7 +344,7 @@ pub const Peer = struct {
             raw,
             buf,
         ) catch |err| {
-            log.debug("decrypt failed: {s}", .{@errorName(err)});
+            log.debug("decrypt failed from={f}: {s}", .{ from, @errorName(err) });
             return null;
         };
 
@@ -345,36 +356,44 @@ pub const Peer = struct {
             self.has_received_first = true;
             self.recv_bitmap = 0;
             self.last_recv_time = now;
-        } else if (decoded.seq > self.max_recv_seq) {
-            const shift = decoded.seq - self.max_recv_seq;
-            if (shift >= replay_window_size) {
-                self.recv_bitmap = 0;
-            } else {
-                self.recv_bitmap <<= @intCast(shift);
-                self.recv_bitmap |= @as(u128, 1) << @intCast(shift - 1);
-            }
-            self.addr = from;
-            self.max_recv_seq = decoded.seq;
-            self.last_recv_time = now;
-        } else if (decoded.seq == self.max_recv_seq) {
-            log.debug("duplicate current-max seq={d}", .{decoded.seq});
-            return null;
         } else {
-            const diff = self.max_recv_seq - decoded.seq;
-            if (diff >= replay_window_size) {
-                log.debug("old seq={d} max={d} (outside window)", .{ decoded.seq, self.max_recv_seq });
+            const current_addr = self.addr orelse from;
+            if (!isAddressEqual(current_addr, from) and !self.recovery_mode) {
+                log.debug("ignoring authenticated packet from alternate addr={f} while stable on {f}", .{ from, current_addr });
                 return null;
             }
 
-            const bit_idx: u7 = @intCast(diff - 1);
-            const bit = @as(u128, 1) << bit_idx;
-            if (self.recv_bitmap & bit != 0) {
-                log.debug("duplicate seq={d}", .{decoded.seq});
+            if (decoded.seq > self.max_recv_seq) {
+                const shift = decoded.seq - self.max_recv_seq;
+                if (shift >= replay_window_size) {
+                    self.recv_bitmap = 0;
+                } else {
+                    self.recv_bitmap <<= @intCast(shift);
+                    self.recv_bitmap |= @as(u128, 1) << @intCast(shift - 1);
+                }
+                self.addr = from;
+                self.max_recv_seq = decoded.seq;
+                self.last_recv_time = now;
+            } else if (decoded.seq == self.max_recv_seq) {
+                log.debug("duplicate current-max seq={d}", .{decoded.seq});
                 return null;
-            }
+            } else {
+                const diff = self.max_recv_seq - decoded.seq;
+                if (diff >= replay_window_size) {
+                    log.debug("old seq={d} max={d} (outside window)", .{ decoded.seq, self.max_recv_seq });
+                    return null;
+                }
 
-            self.recv_bitmap |= bit;
-            self.last_recv_time = now;
+                const bit_idx: u7 = @intCast(diff - 1);
+                const bit = @as(u128, 1) << bit_idx;
+                if (self.recv_bitmap & bit != 0) {
+                    log.debug("duplicate seq={d}", .{decoded.seq});
+                    return null;
+                }
+
+                self.recv_bitmap |= bit;
+                self.last_recv_time = now;
+            }
         }
 
         if (self.state == .disconnected) {
@@ -409,6 +428,11 @@ pub const Peer = struct {
     pub fn enterRecoveryMode(self: *Peer, now: i64) void {
         self.recovery_mode = true;
         self.recovery_deadline_ns = now + 2 * std.time.ns_per_s;
+    }
+
+    pub fn exitRecoveryMode(self: *Peer) void {
+        self.recovery_mode = false;
+        self.recovery_deadline_ns = 0;
     }
 
     /// Update peer state based on time since last recv.
@@ -655,6 +679,8 @@ test "Replay window: roaming only updates on advancing seq" {
     _ = try peer.recv(&sock_recv, &rb1);
     const port_a = peer.addr.?.getPort();
 
+    peer.enterRecoveryMode(nanoNow());
+
     var buf2: [128]u8 = undefined;
     try sock_b.sendTo(try crypto.encodeDatagram(key, .to_server, 8, "b", &buf2), target);
     try testPollReady(sock_recv.fd);
@@ -766,7 +792,7 @@ test "Replay window: large jump forward clears bitmap" {
     try std.testing.expect(peer.max_recv_seq == 500);
 }
 
-test "Roaming: verify addr updates on authentic packet" {
+test "Roaming ignores alternate address outside recovery mode" {
     const key = crypto.generateKey();
     var peer = Peer.init(key, .to_client);
 
@@ -786,6 +812,38 @@ test "Roaming: verify addr updates on authentic packet" {
     var rb1: [4096]u8 = undefined;
     _ = try peer.recv(&sock_recv, &rb1);
     const port_a = peer.addr.?.getPort();
+
+    var buf2: [128]u8 = undefined;
+    try sock_b.sendTo(try crypto.encodeDatagram(key, .to_server, 2, "from_b", &buf2), target);
+    try testPollReady(sock_recv.fd);
+
+    var rb2: [4096]u8 = undefined;
+    try std.testing.expect((try peer.recv(&sock_recv, &rb2)) == null);
+    try std.testing.expectEqual(port_a, peer.addr.?.getPort());
+}
+
+test "Roaming updates address during recovery mode" {
+    const key = crypto.generateKey();
+    var peer = Peer.init(key, .to_client);
+
+    var sock_recv = try testBindIp4(60950, 60960);
+    defer sock_recv.close();
+    var sock_a = try testBindIp4(60960, 60970);
+    defer sock_a.close();
+    var sock_b = try testBindIp4(60970, 60980);
+    defer sock_b.close();
+
+    const target = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, sock_recv.bound_port);
+
+    var buf1: [128]u8 = undefined;
+    try sock_a.sendTo(try crypto.encodeDatagram(key, .to_server, 1, "from_a", &buf1), target);
+    try testPollReady(sock_recv.fd);
+
+    var rb1: [4096]u8 = undefined;
+    _ = try peer.recv(&sock_recv, &rb1);
+    const port_a = peer.addr.?.getPort();
+
+    peer.enterRecoveryMode(nanoNow());
 
     var buf2: [128]u8 = undefined;
     try sock_b.sendTo(try crypto.encodeDatagram(key, .to_server, 2, "from_b", &buf2), target);

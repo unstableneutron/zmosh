@@ -550,7 +550,7 @@ pub fn gatherHostCandidates(
     return out;
 }
 
-fn candidatePriority(candidate: Candidate) u8 {
+pub fn candidatePriority(candidate: Candidate) u8 {
     return switch (candidate.ctype) {
         .host => switch (candidate.addr.any.family) {
             posix.AF.INET6 => if (isTailscaleAddress(candidate.addr)) 4 else if (isIp6UniqueLocal(candidate.addr.in6.sa.addr)) 3 else 0,
@@ -563,6 +563,10 @@ fn candidatePriority(candidate: Candidate) u8 {
             else => 4,
         },
     };
+}
+
+pub fn hostAddressPriority(addr: std.net.Address) u8 {
+    return candidatePriority(.{ .ctype = .host, .addr = addr, .source = "active" });
 }
 
 pub fn sortCandidatesByPriority(candidates: []Candidate) void {
@@ -599,6 +603,27 @@ pub fn replaceCandidateSet(
     for (candidates) |candidate| {
         if (!shouldUseCandidateWithPolicy(socket_capability, candidate.addr, allow_tailscale)) continue;
         if (!isCandidateAddressUsable(candidate.addr)) continue;
+        try appendUniqueCandidate(out, alloc, candidate);
+    }
+    sortAndTruncateCandidates(out, max_candidates_limit);
+}
+
+pub fn replacePreferredCandidateSet(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(Candidate),
+    socket_capability: udp.SocketCapability,
+    candidates: []const Candidate,
+    current_addr: std.net.Address,
+    max_candidates_limit: usize,
+    allow_tailscale: bool,
+) !void {
+    out.clearRetainingCapacity();
+    const current_priority = hostAddressPriority(current_addr);
+    for (candidates) |candidate| {
+        if (!shouldUseCandidateWithPolicy(socket_capability, candidate.addr, allow_tailscale)) continue;
+        if (!isCandidateAddressUsable(candidate.addr)) continue;
+        if (isAddressEqual(candidate.addr, current_addr)) continue;
+        if (candidatePriority(candidate) >= current_priority) continue;
         try appendUniqueCandidate(out, alloc, candidate);
     }
     sortAndTruncateCandidates(out, max_candidates_limit);
@@ -784,13 +809,27 @@ pub fn decodeReprobeDatagram(
     }
 
     const prev_addr = peer.addr;
-    const plaintext = try peer.decodeAndUpdate(raw, from, buf) orelse return null;
+    const prev_recovery_mode = peer.recovery_mode;
+    const prev_recovery_deadline_ns = peer.recovery_deadline_ns;
+    if (prev_addr) |addr| {
+        if (!isAddressEqual(addr, from)) {
+            peer.enterRecoveryMode(@intCast(std.time.nanoTimestamp()));
+        }
+    }
+
+    const plaintext = try peer.decodeAndUpdate(raw, from, buf) orelse {
+        peer.recovery_mode = prev_recovery_mode;
+        peer.recovery_deadline_ns = prev_recovery_deadline_ns;
+        return null;
+    };
     const selected = if (allow_peer_reflexive)
         reprobe.onAuthenticatedRecvPeerReflexive(from)
     else
         reprobe.onAuthenticatedRecv(from);
     if (!selected) {
         peer.addr = prev_addr;
+        peer.recovery_mode = prev_recovery_mode;
+        peer.recovery_deadline_ns = prev_recovery_deadline_ns;
     }
 
     return .{ .plaintext = plaintext, .selected = selected };
@@ -1050,6 +1089,26 @@ test "candidate sorting prefers public hosts over tailscale hosts" {
     try std.testing.expect(isAddressEqual(candidates[0].addr, std.net.Address.initIp4(.{ 103, 152, 50, 82 }, 60000)));
     try std.testing.expect(isTailscaleAddress(candidates[1].addr));
     try std.testing.expect(isTailscaleAddress(candidates[2].addr));
+}
+
+test "replaceCandidateSet can filter only better candidates than current path" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const current = std.net.Address.initIp4(.{ 100, 80, 191, 54 }, 60000);
+    const candidates = [_]Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 103, 152, 50, 82 }, 60000), .source = "ifaddr" },
+        .{ .ctype = .host, .addr = current, .source = "ifaddr" },
+        .{ .ctype = .host, .addr = std.net.Address.initIp6(.{ 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0x8a, 0x01, 0xbf, 0x36 }, 60000, 0, 0), .source = "ifaddr" },
+    };
+
+    var out = try std.ArrayList(Candidate).initCapacity(alloc, candidates.len);
+    defer out.deinit(alloc);
+
+    try replacePreferredCandidateSet(alloc, &out, .ipv4_only, &candidates, current, max_candidates, true);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expect(isAddressEqual(out.items[0].addr, std.net.Address.initIp4(.{ 103, 152, 50, 82 }, 60000)));
 }
 
 

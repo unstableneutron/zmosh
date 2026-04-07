@@ -20,6 +20,7 @@ const ssh_udp_probe_authorization_ns = 5 * std.time.ns_per_s;
 const shutdown_drain_ns = 2 * std.time.ns_per_s;
 const default_probe_timeout_ms: u32 = 3000;
 const standby_candidate_probe_burst: u8 = 2;
+const preferred_path_reprobe_interval_ns = 5 * std.time.ns_per_s;
 
 pub const ServeOptions = struct {
     allow_tailscale: bool = false,
@@ -654,7 +655,9 @@ pub const Gateway = struct {
     srflx_mappings: std.ArrayList(?std.net.Address),
     portmap_client: ?portmap.Client,
     ssh_udp_probe_authenticated_ns: ?i64,
+    client_candidates: std.ArrayList(nat.Candidate),
     candidate_reprobe: nat.CandidateReprobe,
+    last_preferred_client_reprobe_ns: i64,
     connect_debug: bool,
     allow_tailscale: bool,
 
@@ -718,6 +721,8 @@ pub const Gateway = struct {
 
         var initial_srflx_mappings = try std.ArrayList(nat.ServerReflexiveMapping).initCapacity(alloc, stun_servers.items.len);
         defer initial_srflx_mappings.deinit(alloc);
+        var client_candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, nat.max_candidates);
+        errdefer client_candidates.deinit(alloc);
 
         if (bootstrap_v2) {
             var local_candidates = try gatherLocalCandidates(
@@ -756,9 +761,7 @@ pub const Gateway = struct {
             var parsed_remote_candidates = try parseCandidatesLine(alloc, candidates_line);
             defer parsed_remote_candidates.deinit(alloc);
 
-            var remote_candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, parsed_remote_candidates.items.len);
-            defer remote_candidates.deinit(alloc);
-            try nat.replaceCandidateSet(alloc, &remote_candidates, socket_capability, parsed_remote_candidates.items, nat.max_candidates, options.allow_tailscale);
+            try nat.replaceCandidateSet(alloc, &client_candidates, socket_capability, parsed_remote_candidates.items, nat.max_candidates, options.allow_tailscale);
 
             var probe_recv = transport.RecvState{};
             if (try probeCandidates(
@@ -766,7 +769,7 @@ pub const Gateway = struct {
                 &udp_sock,
                 &peer,
                 socket_capability,
-                remote_candidates.items,
+                client_candidates.items,
                 &probe_recv,
                 probe_timeout_ns,
                 initial_stun_rtt_stats.conservativeNs(),
@@ -857,7 +860,9 @@ pub const Gateway = struct {
             .srflx_mappings = srflx_mappings,
             .portmap_client = portmap_client,
             .ssh_udp_probe_authenticated_ns = null,
+            .client_candidates = client_candidates,
             .candidate_reprobe = .{},
+            .last_preferred_client_reprobe_ns = 0,
             .connect_debug = connect_debug,
             .allow_tailscale = options.allow_tailscale,
         };
@@ -922,6 +927,7 @@ pub const Gateway = struct {
                 };
             }
             try self.servicePortmap(now);
+            try self.maybeStartPreferredClientReprobe(now);
 
             // Build poll fds
             var poll_fds: [4]posix.pollfd = undefined;
@@ -1178,14 +1184,32 @@ pub const Gateway = struct {
         return standby;
     }
 
+    fn maybeStartPreferredClientReprobe(self: *Gateway, now: i64) !void {
+        if (self.transport != .udp or self.standby_ssh == null) return;
+        if (self.candidate_reprobe.isActive()) return;
+        if ((now - self.last_preferred_client_reprobe_ns) < preferred_path_reprobe_interval_ns) return;
+        const current_addr = self.peer.addr orelse return;
+
+        var preferred = try std.ArrayList(nat.Candidate).initCapacity(self.alloc, self.client_candidates.items.len);
+        defer preferred.deinit(self.alloc);
+        try nat.replacePreferredCandidateSet(self.alloc, &preferred, self.socket_capability, self.client_candidates.items, current_addr, nat.max_candidates, self.allow_tailscale);
+        self.last_preferred_client_reprobe_ns = now;
+        if (preferred.items.len == 0) return;
+
+        if (try startGatewayCandidateReprobe(&self.candidate_reprobe, self.alloc, self.socket_capability, preferred.items, now, false, self.allow_tailscale)) {
+            connectDebug(self.connect_debug, "starting preferred client reprobe current={f} candidates={d}", .{ current_addr, self.candidate_reprobe.candidates.items.len });
+        }
+    }
+
     fn handleStandbyCandidateRefresh(self: *Gateway, candidates: []const nat.Candidate, now: i64) !void {
+        try nat.replaceCandidateSet(self.alloc, &self.client_candidates, self.socket_capability, candidates, nat.max_candidates, self.allow_tailscale);
         self.peer.enterRecoveryMode(now);
 
         const started = try startGatewayCandidateReprobe(
             &self.candidate_reprobe,
             self.alloc,
             self.socket_capability,
-            candidates,
+            self.client_candidates.items,
             now,
             self.transport == .ssh,
             self.allow_tailscale,
@@ -1389,6 +1413,7 @@ pub const Gateway = struct {
         self.last_resync_request_ns = 0;
         self.ssh_udp_probe_authenticated_ns = null;
         self.candidate_reprobe.clear();
+        self.peer.enterRecoveryMode(@intCast(std.time.nanoTimestamp()));
 
         var pending_replay = try self.reliable_send.collectPendingReliableFrames(self.alloc);
         defer pending_replay.deinit(self.alloc);
@@ -1667,6 +1692,8 @@ pub const Gateway = struct {
                 const standby = try self.takeActiveSshToStandby();
                 self.standby_ssh = standby;
                 self.transport = .udp;
+                self.peer.exitRecoveryMode();
+                self.last_preferred_client_reprobe_ns = now;
                 self.ssh_baseline_snapshot_id = null;
                 self.ssh_baseline_pending = false;
                 self.last_resync_request_ns = 0;
@@ -2189,6 +2216,7 @@ pub const Gateway = struct {
         self.stun_servers.deinit(self.alloc);
         self.srflx_mappings.deinit(self.alloc);
         if (self.portmap_client) |*client| client.deinit();
+        self.client_candidates.deinit(self.alloc);
         self.candidate_reprobe.deinit(self.alloc);
     }
 };
