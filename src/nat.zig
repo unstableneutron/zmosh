@@ -553,8 +553,8 @@ pub fn gatherHostCandidates(
 fn candidatePriority(candidate: Candidate) u8 {
     return switch (candidate.ctype) {
         .host => switch (candidate.addr.any.family) {
-            posix.AF.INET6 => if (isIp6UniqueLocal(candidate.addr.in6.sa.addr)) 3 else 0,
-            posix.AF.INET => 3,
+            posix.AF.INET6 => if (isTailscaleAddress(candidate.addr)) 4 else if (isIp6UniqueLocal(candidate.addr.in6.sa.addr)) 3 else 0,
+            posix.AF.INET => if (isTailscaleAddress(candidate.addr)) 4 else 3,
             else => 5,
         },
         .srflx => switch (candidate.addr.any.family) {
@@ -1037,6 +1037,19 @@ test "tailscale addresses are filtered by default and allowed only when opted in
     try std.testing.expect(shouldUseCandidateWithPolicy(.dual_stack, ts_v4, true));
     try std.testing.expect(shouldUseCandidateWithPolicy(.dual_stack, ts_v6, true));
     try std.testing.expect(shouldUseCandidateWithPolicy(.dual_stack, pub_v4, false));
+}
+
+test "candidate sorting prefers public hosts over tailscale hosts" {
+    var candidates = [_]Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 100, 80, 191, 54 }, 60000), .source = "ifaddr" },
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 103, 152, 50, 82 }, 60000), .source = "ifaddr" },
+        .{ .ctype = .host, .addr = std.net.Address.initIp6(.{ 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0x8a, 0x01, 0xbf, 0x36 }, 60000, 0, 0), .source = "ifaddr" },
+    };
+
+    sortCandidatesByPriority(&candidates);
+    try std.testing.expect(isAddressEqual(candidates[0].addr, std.net.Address.initIp4(.{ 103, 152, 50, 82 }, 60000)));
+    try std.testing.expect(isTailscaleAddress(candidates[1].addr));
+    try std.testing.expect(isTailscaleAddress(candidates[2].addr));
 }
 
 
