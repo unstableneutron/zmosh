@@ -399,6 +399,29 @@ pub fn shouldUseCandidate(socket_capability: udp.SocketCapability, addr: std.net
     };
 }
 
+pub fn isTailscaleAddress(addr: std.net.Address) bool {
+    return switch (addr.any.family) {
+        posix.AF.INET => blk: {
+            const addr_u32 = std.mem.bigToNative(u32, addr.in.sa.addr);
+            const ip = [4]u8{
+                @truncate(addr_u32 >> 24),
+                @truncate(addr_u32 >> 16),
+                @truncate(addr_u32 >> 8),
+                @truncate(addr_u32),
+            };
+            break :blk ip[0] == 100 and ip[1] >= 64 and ip[1] <= 127;
+        },
+        posix.AF.INET6 => std.mem.eql(u8, addr.in6.sa.addr[0..6], &[_]u8{ 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0 }),
+        else => false,
+    };
+}
+
+pub fn shouldUseCandidateWithPolicy(socket_capability: udp.SocketCapability, addr: std.net.Address, allow_tailscale: bool) bool {
+    if (!shouldUseCandidate(socket_capability, addr)) return false;
+    if (!allow_tailscale and isTailscaleAddress(addr)) return false;
+    return true;
+}
+
 fn shouldIgnoreInterface(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "docker") or
         std.mem.startsWith(u8, name, "br-") or
@@ -470,6 +493,7 @@ pub fn gatherHostCandidates(
     local_port: u16,
     socket_capability: udp.SocketCapability,
     max_candidates_limit: usize,
+    allow_tailscale: bool,
 ) !std.ArrayList(Candidate) {
     var out = try std.ArrayList(Candidate).initCapacity(alloc, 8);
 
@@ -488,7 +512,7 @@ pub fn gatherHostCandidates(
 
         const fam: u16 = ifa.ifa_addr.*.sa_family;
         if (fam == posix.AF.INET) {
-            if (!shouldUseCandidate(socket_capability, std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0))) continue;
+            if (!shouldUseCandidateWithPolicy(socket_capability, std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0), allow_tailscale)) continue;
 
             const in_ptr: *const c.struct_sockaddr_in = @ptrCast(@alignCast(ifa.ifa_addr));
             const addr_u32 = std.mem.bigToNative(u32, in_ptr.sin_addr.s_addr);
@@ -499,6 +523,7 @@ pub fn gatherHostCandidates(
                 @truncate(addr_u32),
             };
             if (!isIp4CandidateUsable(ip)) continue;
+            if (!allow_tailscale and ip[0] == 100 and ip[1] >= 64 and ip[1] <= 127) continue;
 
             try appendUniqueCandidate(&out, alloc, .{
                 .ctype = .host,
@@ -506,11 +531,12 @@ pub fn gatherHostCandidates(
                 .source = "ifaddr",
             });
         } else if (fam == posix.AF.INET6) {
-            if (!shouldUseCandidate(socket_capability, std.net.Address.initIp6(.{0} ** 16, 0, 0, 0))) continue;
+            if (!shouldUseCandidateWithPolicy(socket_capability, std.net.Address.initIp6(.{0} ** 16, 0, 0, 0), allow_tailscale)) continue;
 
             const in6_ptr: *const c.struct_sockaddr_in6 = @ptrCast(@alignCast(ifa.ifa_addr));
             const ip: [16]u8 = @as(*const [16]u8, @ptrCast(&in6_ptr.sin6_addr)).*;
             if (!isIp6CandidateUsable(ip)) continue;
+            if (!allow_tailscale and std.mem.eql(u8, ip[0..6], &[_]u8{ 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0 })) continue;
 
             try appendUniqueCandidate(&out, alloc, .{
                 .ctype = .host,
@@ -567,10 +593,11 @@ pub fn replaceCandidateSet(
     socket_capability: udp.SocketCapability,
     candidates: []const Candidate,
     max_candidates_limit: usize,
+    allow_tailscale: bool,
 ) !void {
     out.clearRetainingCapacity();
     for (candidates) |candidate| {
-        if (!shouldUseCandidate(socket_capability, candidate.addr)) continue;
+        if (!shouldUseCandidateWithPolicy(socket_capability, candidate.addr, allow_tailscale)) continue;
         if (!isCandidateAddressUsable(candidate.addr)) continue;
         try appendUniqueCandidate(out, alloc, candidate);
     }
@@ -655,8 +682,9 @@ pub const CandidateReprobe = struct {
         socket_capability: udp.SocketCapability,
         refreshed_candidates: []const Candidate,
         now: i64,
+        allow_tailscale: bool,
     ) !bool {
-        return self.startWithMode(alloc, socket_capability, refreshed_candidates, now, false);
+        return self.startWithMode(alloc, socket_capability, refreshed_candidates, now, false, allow_tailscale);
     }
 
     pub fn startPersistent(
@@ -665,8 +693,9 @@ pub const CandidateReprobe = struct {
         socket_capability: udp.SocketCapability,
         refreshed_candidates: []const Candidate,
         now: i64,
+        allow_tailscale: bool,
     ) !bool {
-        return self.startWithMode(alloc, socket_capability, refreshed_candidates, now, true);
+        return self.startWithMode(alloc, socket_capability, refreshed_candidates, now, true, allow_tailscale);
     }
 
     fn startWithMode(
@@ -676,8 +705,9 @@ pub const CandidateReprobe = struct {
         refreshed_candidates: []const Candidate,
         now: i64,
         persistent: bool,
+        allow_tailscale: bool,
     ) !bool {
-        try replaceCandidateSet(alloc, &self.candidates, socket_capability, refreshed_candidates, max_candidates);
+        try replaceCandidateSet(alloc, &self.candidates, socket_capability, refreshed_candidates, max_candidates, allow_tailscale);
         self.probe.reset(self.candidates.items);
         self.next_probe_ns = now;
         self.persistent = persistent;
@@ -982,7 +1012,7 @@ test "replaceCandidateSet honors socket capability" {
         .{ .ctype = .host, .addr = std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 60001, 0, 0), .source = "host-v6" },
     };
 
-    try replaceCandidateSet(alloc, &out, .ipv6_only, &candidates, max_candidates);
+    try replaceCandidateSet(alloc, &out, .ipv6_only, &candidates, max_candidates, true);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqual(@as(u16, posix.AF.INET6), out.items[0].addr.any.family);
 }
@@ -991,8 +1021,24 @@ test "interface family filtering keeps utun overlays" {
     try std.testing.expect(!shouldIgnoreInterface("utun4"));
     try std.testing.expect(shouldIgnoreInterface("docker0"));
     try std.testing.expect(shouldIgnoreInterface("bridge100"));
-    try std.testing.expect(isCandidateAddressUsable(std.net.Address.initIp4(.{ 100, 70, 1, 2 }, 41641)));
 }
+
+test "tailscale addresses are filtered by default and allowed only when opted in" {
+    const ts_v4 = std.net.Address.initIp4(.{ 100, 70, 1, 2 }, 41641);
+    const ts_v6 = std.net.Address.initIp6(.{ 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 41641, 0, 0);
+    const pub_v4 = std.net.Address.initIp4(.{ 203, 0, 113, 10 }, 60000);
+
+    try std.testing.expect(isTailscaleAddress(ts_v4));
+    try std.testing.expect(isTailscaleAddress(ts_v6));
+    try std.testing.expect(!isTailscaleAddress(pub_v4));
+
+    try std.testing.expect(!shouldUseCandidateWithPolicy(.dual_stack, ts_v4, false));
+    try std.testing.expect(!shouldUseCandidateWithPolicy(.dual_stack, ts_v6, false));
+    try std.testing.expect(shouldUseCandidateWithPolicy(.dual_stack, ts_v4, true));
+    try std.testing.expect(shouldUseCandidateWithPolicy(.dual_stack, ts_v6, true));
+    try std.testing.expect(shouldUseCandidateWithPolicy(.dual_stack, pub_v4, false));
+}
+
 
 test "candidate payload json round trip" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -1060,7 +1106,7 @@ test "decode reprobe datagram preserves peer address until selection" {
     const candidates = [_]Candidate{
         .{ .ctype = .srflx, .addr = selected_addr, .source = "stun" },
     };
-    try std.testing.expect(try reprobe.start(alloc, .ipv4_only, &candidates, 0));
+    try std.testing.expect(try reprobe.start(alloc, .ipv4_only, &candidates, 0, true));
 
     var first_buf: [64]u8 = undefined;
     const first_raw = try crypto.encodeDatagram(key, .to_client, 0, "first", &first_buf);

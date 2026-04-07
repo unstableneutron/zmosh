@@ -21,6 +21,10 @@ const shutdown_drain_ns = 2 * std.time.ns_per_s;
 const default_probe_timeout_ms: u32 = 3000;
 const standby_candidate_probe_burst: u8 = 2;
 
+pub const ServeOptions = struct {
+    allow_tailscale: bool = false,
+};
+
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
@@ -136,6 +140,19 @@ fn clampProbeTimeoutMs(ms: u32) u32 {
 fn connectDebug(enabled: bool, comptime fmt: []const u8, args: anytype) void {
     if (!enabled) return;
     std.debug.print("zmx serve debug: " ++ fmt ++ "\n", args);
+}
+
+fn shouldIgnoreStunKeepaliveError(err: anyerror) bool {
+    return switch (err) {
+        error.WouldBlock,
+        error.NetworkUnreachable,
+        error.UnreachableAddress,
+        error.AddressFamilyNotSupported,
+        error.ConnectionRefused,
+        error.NetworkSubsystemFailed,
+        => true,
+        else => false,
+    };
 }
 
 fn standbyStateLabel(standby_ssh: ?StandbySsh) []const u8 {
@@ -447,8 +464,9 @@ fn gatherLocalCandidates(
     stun_rtt_stats: *nat.TimingStats,
     responsive_stun_servers: *usize,
     initial_srflx_mappings: ?*std.ArrayList(nat.ServerReflexiveMapping),
+    allow_tailscale: bool,
 ) !std.ArrayList(nat.Candidate) {
-    var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_capability, nat.max_candidates);
+    var out = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_capability, nat.max_candidates, allow_tailscale);
     errdefer out.deinit(alloc);
 
     var srflx = try nat.gatherServerReflexiveCandidates(alloc, sock, stun_servers, nat.max_candidates);
@@ -507,11 +525,12 @@ fn startGatewayCandidateReprobe(
     candidates: []const nat.Candidate,
     now: i64,
     persistent: bool,
+    allow_tailscale: bool,
 ) !bool {
     return if (persistent)
-        reprobe.startPersistent(alloc, socket_capability, candidates, now)
+        reprobe.startPersistent(alloc, socket_capability, candidates, now, allow_tailscale)
     else
-        reprobe.start(alloc, socket_capability, candidates, now);
+        reprobe.start(alloc, socket_capability, candidates, now, allow_tailscale);
 }
 
 fn probeCandidates(
@@ -637,11 +656,13 @@ pub const Gateway = struct {
     ssh_udp_probe_authenticated_ns: ?i64,
     candidate_reprobe: nat.CandidateReprobe,
     connect_debug: bool,
+    allow_tailscale: bool,
 
     pub fn init(
         alloc: std.mem.Allocator,
         session_name: []const u8,
         config: udp.Config,
+        options: ServeOptions,
     ) !Gateway {
         const socket_dir = try resolveSocketDir(alloc);
         defer alloc.free(socket_dir);
@@ -688,10 +709,11 @@ pub const Gateway = struct {
             null;
         errdefer if (portmap_client) |*client| client.deinit();
 
-        connectDebug(connect_debug, "bootstrap_v2={} probe_timeout_ms={d} stun_servers={d}", .{
+        connectDebug(connect_debug, "bootstrap_v2={} probe_timeout_ms={d} stun_servers={d} allow_tailscale={}", .{
             bootstrap_v2,
             @divFloor(probe_timeout_ns, std.time.ns_per_ms),
             stun_servers.items.len,
+            options.allow_tailscale,
         });
 
         var initial_srflx_mappings = try std.ArrayList(nat.ServerReflexiveMapping).initCapacity(alloc, stun_servers.items.len);
@@ -706,6 +728,7 @@ pub const Gateway = struct {
                 &initial_stun_rtt_stats,
                 &responsive_stun_servers,
                 &initial_srflx_mappings,
+                options.allow_tailscale,
             );
             defer local_candidates.deinit(alloc);
             if (portmap_client) |*client| {
@@ -730,8 +753,12 @@ pub const Gateway = struct {
 
             const candidates_line = try readBufferedLine(posix.STDIN_FILENO, alloc, &bootstrap_read_buf, max_control_line);
             defer alloc.free(candidates_line);
-            var remote_candidates = try parseCandidatesLine(alloc, candidates_line);
+            var parsed_remote_candidates = try parseCandidatesLine(alloc, candidates_line);
+            defer parsed_remote_candidates.deinit(alloc);
+
+            var remote_candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, parsed_remote_candidates.items.len);
             defer remote_candidates.deinit(alloc);
+            try nat.replaceCandidateSet(alloc, &remote_candidates, socket_capability, parsed_remote_candidates.items, nat.max_candidates, options.allow_tailscale);
 
             var probe_recv = transport.RecvState{};
             if (try probeCandidates(
@@ -832,6 +859,7 @@ pub const Gateway = struct {
             .ssh_udp_probe_authenticated_ns = null,
             .candidate_reprobe = .{},
             .connect_debug = connect_debug,
+            .allow_tailscale = options.allow_tailscale,
         };
     }
 
@@ -886,11 +914,7 @@ pub const Gateway = struct {
                 }
             }
 
-            if (self.stun_servers.items.len > 0 and (now - self.last_stun_keepalive_ns) >= stun_keepalive_ns) {
-                self.sendStunKeepalive(now) catch |err| {
-                    if (err != error.WouldBlock) return err;
-                };
-            }
+            try self.serviceStunKeepalive(now);
 
             if (self.stun_state) |*stun_state| {
                 stun_state.maybeRetry(&self.udp_sock, now) catch |err| {
@@ -1031,8 +1055,21 @@ pub const Gateway = struct {
         self.last_stun_keepalive_ns = now;
     }
 
+    fn serviceStunKeepalive(self: *Gateway, now: i64) !void {
+        if (self.stun_servers.items.len == 0) return;
+        if ((now - self.last_stun_keepalive_ns) < stun_keepalive_ns) return;
+
+        self.sendStunKeepalive(now) catch |err| {
+            if (!shouldIgnoreStunKeepaliveError(err)) return err;
+            log.debug("ignoring STUN keepalive send failure: {s}", .{@errorName(err)});
+            self.stun_state = null;
+            self.last_stun_keepalive_ns = now;
+            return;
+        };
+    }
+
     fn buildCurrentCandidateSet(self: *Gateway) !std.ArrayList(nat.Candidate) {
-        var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_capability, nat.max_candidates);
+        var refreshed = try nat.gatherHostCandidates(self.alloc, self.udp_sock.bound_port, self.socket_capability, nat.max_candidates, self.allow_tailscale);
         errdefer refreshed.deinit(self.alloc);
 
         try appendCurrentSrflxCandidates(&refreshed, self.alloc, self.srflx_mappings.items);
@@ -1151,6 +1188,7 @@ pub const Gateway = struct {
             candidates,
             now,
             self.transport == .ssh,
+            self.allow_tailscale,
         );
         if (!started) {
             connectDebug(self.connect_debug, "ignored candidate refresh with no usable client addresses", .{});
@@ -1386,11 +1424,7 @@ pub const Gateway = struct {
             if (!isFreshSshUdpProbeAuthorization(self.ssh_udp_probe_authenticated_ns, now)) {
                 self.ssh_udp_probe_authenticated_ns = null;
             }
-            if (self.stun_servers.items.len > 0 and (now - self.last_stun_keepalive_ns) >= stun_keepalive_ns) {
-                self.sendStunKeepalive(now) catch |err| {
-                    if (err != error.WouldBlock) return err;
-                };
-            }
+            try self.serviceStunKeepalive(now);
             if (self.stun_state) |*stun_state| {
                 stun_state.maybeRetry(&self.udp_sock, now) catch |err| {
                     if (err != error.WouldBlock) return err;
@@ -2160,8 +2194,8 @@ pub const Gateway = struct {
 };
 
 /// Entry point for `zmx serve <session>`.
-pub fn serveMain(alloc: std.mem.Allocator, session_name: []const u8) !void {
-    var gw = try Gateway.init(alloc, session_name, .{});
+pub fn serveMain(alloc: std.mem.Allocator, session_name: []const u8, options: ServeOptions) !void {
+    var gw = try Gateway.init(alloc, session_name, .{}, options);
     defer gw.deinit();
     try gw.run();
 }
@@ -2281,8 +2315,15 @@ test "srflx mapping slots only refresh on material set changes" {
     };
 
     try std.testing.expect(!updateSrflxMappingSlot(&slots, 1, std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60000)));
-    try std.testing.expect(!updateSrflxMappingSlot(&slots, 1, std.net.Address.initIp4(.{ 198, 51, 100, 21 }, 60000)));
+    try std.testing.expect(updateSrflxMappingSlot(&slots, 1, std.net.Address.initIp4(.{ 198, 51, 100, 21 }, 60000)));
     try std.testing.expect(updateSrflxMappingSlot(&slots, 0, std.net.Address.initIp4(.{ 198, 51, 100, 22 }, 60000)));
+}
+
+test "STUN keepalive transient network errors are ignored" {
+    try std.testing.expect(shouldIgnoreStunKeepaliveError(error.WouldBlock));
+    try std.testing.expect(shouldIgnoreStunKeepaliveError(error.NetworkUnreachable));
+    try std.testing.expect(shouldIgnoreStunKeepaliveError(error.UnreachableAddress));
+    try std.testing.expect(!shouldIgnoreStunKeepaliveError(error.AccessDenied));
 }
 
 test "udp re-promotion reserves a fresh baseline snapshot" {
@@ -2331,13 +2372,13 @@ test "gateway candidate reprobe mode follows transport intent" {
         .{ .ctype = .srflx, .addr = std.net.Address.initIp4(.{ 198, 51, 100, 20 }, 60001), .source = "stun" },
     };
 
-    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, .ipv4_only, &candidates, 55, false));
+    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, .ipv4_only, &candidates, 55, false, true));
     try std.testing.expect(!reprobe.persistent);
     try std.testing.expectEqual(@as(i64, 55), reprobe.next_probe_ns);
     try std.testing.expect(reprobe.maybeNextProbeAddr(55) != null);
 
     reprobe.clear();
-    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, .ipv4_only, &candidates, 77, true));
+    try std.testing.expect(try startGatewayCandidateReprobe(&reprobe, alloc, .ipv4_only, &candidates, 77, true, true));
     try std.testing.expect(reprobe.persistent);
     try std.testing.expectEqual(@as(i64, 77), reprobe.next_probe_ns);
 }

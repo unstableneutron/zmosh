@@ -466,6 +466,17 @@ pub fn main() !void {
                     return error.InvalidArgument;
                 };
                 remote_flags_used = true;
+            } else if (std.mem.eql(u8, arg, "--allow-tailscale") or std.mem.startsWith(u8, arg, "--allow-tailscale=")) {
+                const value = if (std.mem.startsWith(u8, arg, "--allow-tailscale=")) arg["--allow-tailscale=".len..] else "true";
+                if (std.mem.eql(u8, value, "true")) {
+                    remote_opts.allow_tailscale = true;
+                } else if (std.mem.eql(u8, value, "false")) {
+                    remote_opts.allow_tailscale = false;
+                } else {
+                    std.log.err("invalid --allow-tailscale value: {s} (expected true|false)", .{value});
+                    return error.InvalidArgument;
+                }
+                remote_flags_used = true;
             } else if (session_name.len == 0) {
                 session_name = arg;
             } else {
@@ -482,7 +493,7 @@ pub fn main() !void {
 
         // Remote attach via encrypted UDP
         if (remote_host) |host| {
-            const session = remote.connectRemote(alloc, host, sesh, remote_opts) catch |err| {
+            const session = remote.connectRemote(alloc, host, sesh, remote_opts, command_args.items) catch |err| {
                 std.log.err("remote connect failed: {s}", .{@errorName(err)});
                 return;
             };
@@ -520,9 +531,34 @@ pub fn main() !void {
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon);
     } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
-        const session_name = args.next() orelse "";
+        var session_name: []const u8 = "";
+        var allow_tailscale = false;
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(alloc);
+        var parsing_flags = true;
+        while (args.next()) |arg| {
+            if (session_name.len == 0) {
+                session_name = arg;
+            } else if (parsing_flags and (std.mem.eql(u8, arg, "--allow-tailscale") or std.mem.startsWith(u8, arg, "--allow-tailscale="))) {
+                const value = if (std.mem.startsWith(u8, arg, "--allow-tailscale=")) arg["--allow-tailscale=".len..] else "true";
+                if (std.mem.eql(u8, value, "true")) {
+                    allow_tailscale = true;
+                } else if (std.mem.eql(u8, value, "false")) {
+                    allow_tailscale = false;
+                } else {
+                    std.log.err("invalid --allow-tailscale value: {s} (expected true|false)", .{value});
+                    return error.InvalidArgument;
+                }
+            } else {
+                parsing_flags = false;
+                try command_args.append(alloc, arg);
+            }
+        }
         const sesh = try getSeshName(alloc, session_name);
         defer alloc.free(sesh);
+
+        var command: ?[][]const u8 = null;
+        if (command_args.items.len > 0) command = command_args.items;
 
         // Ensure the session daemon exists (create if needed), same as attach
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -536,7 +572,7 @@ pub fn main() !void {
             .session_name = sesh,
             .socket_path = undefined,
             .pid = undefined,
-            .command = null,
+            .command = command,
             .cwd = cwd,
             .created_at = @intCast(std.time.nanoTimestamp()),
         };
@@ -544,7 +580,7 @@ pub fn main() !void {
         const result = try ensureSession(&daemon);
         if (result.is_daemon) return; // we are the forked daemon child
 
-        return serve_mod.serveMain(alloc, sesh);
+        return serve_mod.serveMain(alloc, sesh, .{ .allow_tailscale = allow_tailscale });
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
 
@@ -641,9 +677,11 @@ fn help() !void {
         \\      --nat-traversal=auto|off   Remote attach NAT traversal mode (default: auto)
         \\      --stun-server <host:port>  Remote attach STUN server (repeatable)
         \\      --probe-timeout-ms <ms>    Remote attach hole-punch timeout (default: 3000)
+        \\      --allow-tailscale[=bool]   Allow NAT traversal over Tailscale addresses (default: false)
         \\      --connect-debug            Print remote connectivity debug logs
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
-        \\  [s]erve <name>                 Start UDP gateway for remote access
+        \\  [s]erve <name> [command...]    Start UDP gateway for remote access
+        \\      --allow-tailscale[=bool]   Allow NAT traversal over Tailscale addresses (default: false)
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist [--short]               List active sessions
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)

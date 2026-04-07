@@ -62,6 +62,7 @@ pub const RemoteAttachOptions = struct {
     stun_servers: []const []const u8 = &.{},
     probe_timeout_ms: u32 = default_probe_timeout_ms,
     connect_debug: bool = false,
+    allow_tailscale: bool = false,
 };
 
 pub const RemoteSession = struct {
@@ -343,8 +344,9 @@ fn replaceCandidateSet(
     out: *std.ArrayList(nat.Candidate),
     socket_capability: udp_mod.SocketCapability,
     candidates: []const nat.Candidate,
+    allow_tailscale: bool,
 ) !void {
-    try nat.replaceCandidateSet(alloc, out, socket_capability, candidates, nat.max_candidates);
+    try nat.replaceCandidateSet(alloc, out, socket_capability, candidates, nat.max_candidates, allow_tailscale);
 }
 
 const CandidateReprobe = nat.CandidateReprobe;
@@ -444,8 +446,9 @@ const AsyncSrflxRefresh = struct {
         alloc: std.mem.Allocator,
         bound_port: u16,
         socket_capability: udp_mod.SocketCapability,
+        allow_tailscale: bool,
     ) !std.ArrayList(nat.Candidate) {
-        var candidates = try nat.gatherHostCandidates(alloc, bound_port, socket_capability, nat.max_candidates);
+        var candidates = try nat.gatherHostCandidates(alloc, bound_port, socket_capability, nat.max_candidates, allow_tailscale);
         errdefer candidates.deinit(alloc);
 
         for (self.mappings.items) |maybe_addr| {
@@ -471,6 +474,7 @@ fn handleUdpStandbyControlMessages(
     peer: *udp_mod.Peer,
     now: i64,
     connect_debug: bool,
+    allow_tailscale: bool,
 ) !void {
     while (true) {
         const nl_idx = std.mem.indexOfScalar(u8, standby_buffer.items, '\n') orelse break;
@@ -484,8 +488,8 @@ fn handleUdpStandbyControlMessages(
             };
             defer candidates.deinit(alloc);
 
-            try replaceCandidateSet(alloc, server_candidates, socket_capability, candidates.items);
-            if (try reprobe.start(alloc, socket_capability, server_candidates.items, now)) {
+            try replaceCandidateSet(alloc, server_candidates, socket_capability, candidates.items, allow_tailscale);
+            if (try reprobe.start(alloc, socket_capability, server_candidates.items, now, allow_tailscale)) {
                 peer.enterRecoveryMode(now);
                 connectDebug(connect_debug, "received refreshed server candidates over standby SSH ({d})", .{reprobe.candidates.items.len});
             } else {
@@ -508,6 +512,97 @@ fn resolveHostAddress(alloc: std.mem.Allocator, host: []const u8, port: u16) !st
     };
 }
 
+fn buildRemoteServeCommand(
+    alloc: std.mem.Allocator,
+    session: []const u8,
+    options: RemoteAttachOptions,
+    command_args: []const []const u8,
+    term: []const u8,
+    colorterm: ?[]const u8,
+) ![]u8 {
+    const session_q = try shellQuoteAlloc(alloc, session);
+    defer alloc.free(session_q);
+
+    var serve_cmd = try std.ArrayList(u8).initCapacity(alloc, 128);
+    defer serve_cmd.deinit(alloc);
+
+    try serve_cmd.appendSlice(alloc, "zmosh serve ");
+    try serve_cmd.appendSlice(alloc, session_q);
+    if (options.allow_tailscale) {
+        try serve_cmd.appendSlice(alloc, " --allow-tailscale");
+    }
+    for (command_args) |arg| {
+        const arg_q = try shellQuoteAlloc(alloc, arg);
+        defer alloc.free(arg_q);
+        try serve_cmd.append(alloc, ' ');
+        try serve_cmd.appendSlice(alloc, arg_q);
+    }
+    const probe_timeout_ms = clampProbeTimeoutMs(options.probe_timeout_ms);
+    const term_q = try shellQuoteAlloc(alloc, term);
+    defer alloc.free(term_q);
+
+    const stun_servers_joined = if (options.stun_servers.len > 0)
+        try std.mem.join(alloc, ",", options.stun_servers)
+    else
+        null;
+    defer if (stun_servers_joined) |joined| alloc.free(joined);
+
+    const stun_servers_q = if (stun_servers_joined) |joined|
+        try shellQuoteAlloc(alloc, joined)
+    else
+        null;
+    defer if (stun_servers_q) |quoted| alloc.free(quoted);
+
+    const bootstrap_env = if (options.nat_traversal == .auto) "ZMX_BOOTSTRAP=2 " else "ZMX_BOOTSTRAP=0 ";
+    const debug_env = if (options.connect_debug) "ZMX_CONNECT_DEBUG=1 " else "";
+    const probe_env = if (options.nat_traversal == .auto and probe_timeout_ms != default_probe_timeout_ms)
+        try std.fmt.allocPrint(alloc, "ZMX_PROBE_TIMEOUT_MS={d} ", .{probe_timeout_ms})
+    else
+        null;
+    defer if (probe_env) |v| alloc.free(v);
+
+    const stun_env = if (options.nat_traversal == .auto and stun_servers_q != null)
+        try std.fmt.allocPrint(alloc, "ZMX_STUN_SERVERS={s} ", .{stun_servers_q.?})
+    else
+        null;
+    defer if (stun_env) |v| alloc.free(v);
+
+    const probe_env_s = probe_env orelse "";
+    const stun_env_s = stun_env orelse "";
+
+    return if (colorterm) |ct| blk: {
+        const ct_q = try shellQuoteAlloc(alloc, ct);
+        defer alloc.free(ct_q);
+        break :blk try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}{s}{s}TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" {s}",
+            .{ bootstrap_env, debug_env, probe_env_s, stun_env_s, term_q, ct_q, serve_cmd.items },
+        );
+    } else try std.fmt.allocPrint(
+        alloc,
+        "{s}{s}{s}{s}TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" {s}",
+        .{ bootstrap_env, debug_env, probe_env_s, stun_env_s, term_q, serve_cmd.items },
+    );
+}
+
+fn selectFallbackAddress(
+    alloc: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    server_candidates: []const nat.Candidate,
+    allow_tailscale: bool,
+) !std.net.Address {
+    for (server_candidates) |candidate| {
+        if (!nat.shouldUseCandidateWithPolicy(.dual_stack, candidate.addr, allow_tailscale)) continue;
+        if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
+        return candidate.addr;
+    }
+
+    const resolved = try resolveHostAddress(alloc, host, port);
+    if (!allow_tailscale and nat.isTailscaleAddress(resolved)) return error.TailscaleNotAllowed;
+    return resolved;
+}
+
 fn gatherLocalCandidates(
     alloc: std.mem.Allocator,
     sock: *udp_mod.UdpSocket,
@@ -515,8 +610,9 @@ fn gatherLocalCandidates(
     stun_servers: []const []const u8,
     stun_rtt_stats: *nat.TimingStats,
     responsive_stun_servers: *usize,
+    allow_tailscale: bool,
 ) !std.ArrayList(nat.Candidate) {
-    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_capability, nat.max_candidates);
+    var candidates = try nat.gatherHostCandidates(alloc, sock.bound_port, socket_capability, nat.max_candidates, allow_tailscale);
     errdefer candidates.deinit(alloc);
 
     var stun_addrs = try nat.resolveStunServers(alloc, socket_capability, stun_servers);
@@ -598,6 +694,7 @@ fn probeAndSelectTransport(
         options.stun_servers,
         &local_stun_rtt_stats,
         &responsive_stun_servers,
+        options.allow_tailscale,
     );
     defer local_candidates.deinit(alloc);
 
@@ -615,15 +712,17 @@ fn probeAndSelectTransport(
     defer remote_candidates.deinit(alloc);
 
     for (session.server_candidates.items) |candidate| {
-        if (!nat.shouldUseCandidate(udp_sock.capability, candidate.addr)) continue;
+        if (!nat.shouldUseCandidateWithPolicy(udp_sock.capability, candidate.addr, options.allow_tailscale)) continue;
         if (!nat.isCandidateAddressUsable(candidate.addr)) continue;
         try appendUniqueCandidate(&remote_candidates, alloc, candidate, nat.max_candidates);
     }
-    try appendUniqueCandidate(&remote_candidates, alloc, .{
-        .ctype = .host,
-        .addr = fallback_addr,
-        .source = "ssh_host",
-    }, nat.max_candidates);
+    if (nat.shouldUseCandidateWithPolicy(udp_sock.capability, fallback_addr, options.allow_tailscale) and nat.isCandidateAddressUsable(fallback_addr)) {
+        try appendUniqueCandidate(&remote_candidates, alloc, .{
+            .ctype = .host,
+            .addr = fallback_addr,
+            .source = "ssh_host",
+        }, nat.max_candidates);
+    }
 
     nat.sortAndTruncateCandidates(&remote_candidates, nat.max_candidates);
     if (remote_candidates.items.len == 0) {
@@ -697,65 +796,20 @@ fn probeAndSelectTransport(
 /// Bootstrap a remote session via SSH: ssh <host> zmosh serve <session>
 /// Prepends common user bin dirs to PATH since SSH non-interactive sessions
 /// often have a minimal PATH that excludes ~/.local/bin, ~/bin, etc.
-pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8, options: RemoteAttachOptions) !RemoteSession {
+pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []const u8, options: RemoteAttachOptions, command_args: []const []const u8) !RemoteSession {
     if (!isValidSessionName(session)) return error.InvalidSessionName;
 
     const probe_timeout_ms = clampProbeTimeoutMs(options.probe_timeout_ms);
     const term = posix.getenv("TERM") orelse "xterm-256color";
     const colorterm = posix.getenv("COLORTERM");
-    const term_q = try shellQuoteAlloc(alloc, term);
-    defer alloc.free(term_q);
-    const session_q = try shellQuoteAlloc(alloc, session);
-    defer alloc.free(session_q);
-
-    const stun_servers_joined = if (options.stun_servers.len > 0)
-        try std.mem.join(alloc, ",", options.stun_servers)
-    else
-        null;
-    defer if (stun_servers_joined) |joined| alloc.free(joined);
-
-    const stun_servers_q = if (stun_servers_joined) |joined|
-        try shellQuoteAlloc(alloc, joined)
-    else
-        null;
-    defer if (stun_servers_q) |quoted| alloc.free(quoted);
-
-    const bootstrap_env = if (options.nat_traversal == .auto) "ZMX_BOOTSTRAP=2 " else "ZMX_BOOTSTRAP=0 ";
-    const debug_env = if (options.connect_debug) "ZMX_CONNECT_DEBUG=1 " else "";
-    const probe_env = if (options.nat_traversal == .auto and probe_timeout_ms != default_probe_timeout_ms)
-        try std.fmt.allocPrint(alloc, "ZMX_PROBE_TIMEOUT_MS={d} ", .{probe_timeout_ms})
-    else
-        null;
-    defer if (probe_env) |v| alloc.free(v);
-
-    const stun_env = if (options.nat_traversal == .auto and stun_servers_q != null)
-        try std.fmt.allocPrint(alloc, "ZMX_STUN_SERVERS={s} ", .{stun_servers_q.?})
-    else
-        null;
-    defer if (stun_env) |v| alloc.free(v);
-
-    const probe_env_s = probe_env orelse "";
-    const stun_env_s = stun_env orelse "";
-
-    const remote_cmd = if (colorterm) |ct| blk: {
-        const ct_q = try shellQuoteAlloc(alloc, ct);
-        defer alloc.free(ct_q);
-        break :blk try std.fmt.allocPrint(
-            alloc,
-            "{s}{s}{s}{s}TERM={s} COLORTERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-            .{ bootstrap_env, debug_env, probe_env_s, stun_env_s, term_q, ct_q, session_q },
-        );
-    } else try std.fmt.allocPrint(
-        alloc,
-        "{s}{s}{s}{s}TERM={s} PATH=\"$PATH:/opt/homebrew/bin:$HOME/bin:$HOME/.local/bin\" zmosh serve {s}",
-        .{ bootstrap_env, debug_env, probe_env_s, stun_env_s, term_q, session_q },
-    );
+    const remote_cmd = try buildRemoteServeCommand(alloc, session, options, command_args, term, colorterm);
     defer alloc.free(remote_cmd);
 
-    connectDebug(options.connect_debug, "bootstrap mode={s} probe_timeout_ms={d} stun_servers={d}", .{
+    connectDebug(options.connect_debug, "bootstrap mode={s} probe_timeout_ms={d} stun_servers={d} allow_tailscale={}", .{
         if (options.nat_traversal == .auto) "auto" else "off",
         probe_timeout_ms,
         options.stun_servers.len,
+        options.allow_tailscale,
     });
 
     const argv = [_][]const u8{ "ssh", host, "--", remote_cmd };
@@ -1699,7 +1753,7 @@ fn attemptFreshSshRecovery(
     _ = posix.write(posix.STDOUT_FILENO, "\r\nzmx: standby SSH unavailable — trying a fresh SSH recovery path...\r\n") catch {};
     connectDebug(connect_debug, "attempting fresh SSH recovery host={s} session={s}", .{ session.host, session.session_name });
 
-    var fresh_session = connectRemote(alloc, session.host, session.session_name, options) catch |err| {
+    var fresh_session = connectRemote(alloc, session.host, session.session_name, options, &.{}) catch |err| {
         connectDebug(connect_debug, "fresh SSH recovery bootstrap failed: {s}", .{@errorName(err)});
         return false;
     };
@@ -1714,7 +1768,7 @@ fn attemptFreshSshRecovery(
     fresh_session.ssh = null;
     errdefer if (fresh_standby_opt) |*standby| standby.deinit(alloc, true);
 
-    var fresh_local_candidates = try srflx_refresh.buildCandidateSet(alloc, udp_sock.bound_port, socket_capability);
+    var fresh_local_candidates = try srflx_refresh.buildCandidateSet(alloc, udp_sock.bound_port, socket_capability, options.allow_tailscale);
     defer fresh_local_candidates.deinit(alloc);
     try sendCandidates(fresh_standby_opt.?.write_fd, alloc, fresh_local_candidates.items);
 
@@ -1760,7 +1814,7 @@ fn attemptFreshSshRecovery(
     try session.ssh_pids.appendSlice(alloc, fresh_session.ssh_pids.items);
     fresh_session.ssh_pids.clearRetainingCapacity();
 
-    sendCurrentLocalCandidateRefresh(alloc, socket_capability, udp_sock, transport_mode, standby_ssh, srflx_refresh, connect_debug) catch |err| {
+    sendCurrentLocalCandidateRefresh(alloc, socket_capability, udp_sock, transport_mode, standby_ssh, srflx_refresh, connect_debug, options.allow_tailscale) catch |err| {
         connectDebug(connect_debug, "failed to send refreshed local candidates after fresh SSH recovery: {s}", .{@errorName(err)});
     };
     return true;
@@ -1866,7 +1920,7 @@ fn recoverAfterUdpLoss(
         )) {
             .switched => {
                 recovery_state.clear();
-                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
+                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
                 return true;
             },
             .failed => |failure| {
@@ -1927,7 +1981,7 @@ fn recoverAfterUdpLoss(
             srflx_refresh,
         )) {
             recovery_state.clear();
-            _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
+            _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
             return true;
         }
 
@@ -1985,8 +2039,9 @@ fn sendCurrentLocalCandidateRefresh(
     standby_ssh: *?StandbySsh,
     srflx_refresh: *const AsyncSrflxRefresh,
     connect_debug: bool,
+    allow_tailscale: bool,
 ) !void {
-    var refreshed_candidates = try srflx_refresh.buildCandidateSet(alloc, sock.bound_port, socket_capability);
+    var refreshed_candidates = try srflx_refresh.buildCandidateSet(alloc, sock.bound_port, socket_capability, allow_tailscale);
     defer refreshed_candidates.deinit(alloc);
 
     connectDebug(connect_debug, "refreshed local candidates host={d} srflx={d}", .{
@@ -2006,12 +2061,13 @@ fn handleAsyncSrflxDatagram(
     from: std.net.Address,
     data: []const u8,
     connect_debug: bool,
+    allow_tailscale: bool,
 ) !bool {
     return switch (srflx_refresh.handleDatagram(from, data)) {
         .ignored => false,
         .handled => true,
         .changed => blk: {
-            sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug) catch |err| {
+            sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug, allow_tailscale) catch |err| {
                 connectDebug(connect_debug, "failed to send refreshed local candidates after async srflx update: {s}", .{@errorName(err)});
             };
             break :blk true;
@@ -2128,6 +2184,7 @@ fn handleClientNetworkChange(
     ack_dirty: *bool,
     connect_debug: bool,
     now: i64,
+    allow_tailscale: bool,
 ) void {
     connectDebug(connect_debug, "local network change detected", .{});
     peer.enterRecoveryMode(now);
@@ -2140,7 +2197,7 @@ fn handleClientNetworkChange(
         connectDebug(connect_debug, "refreshing server-reflexive candidates asynchronously via {d} STUN servers", .{srflx_refresh.stun_servers.items.len});
     }
 
-    sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug) catch |err| {
+    sendCurrentLocalCandidateRefresh(alloc, socket_capability, sock, transport_mode, standby_ssh, srflx_refresh, connect_debug, allow_tailscale) catch |err| {
         connectDebug(connect_debug, "failed to send refreshed local candidates after network change: {s}", .{@errorName(err)});
     };
 
@@ -2168,7 +2225,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
     var session = session_in;
     defer session.deinit(alloc);
 
-    const fallback_addr = try resolveHostAddress(alloc, session.host, session.port);
+    const fallback_addr = try selectFallbackAddress(alloc, session.host, session.port, session.server_candidates.items, options.allow_tailscale);
+    connectDebug(options.connect_debug, "selected UDP fallback address={f}", .{fallback_addr});
 
     var udp_sock = try udp_mod.UdpSocket.bindEphemeral(fallback_addr.any.family);
     const socket_capability = udp_sock.capability;
@@ -2285,7 +2343,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
         },
         .ssh => |*s| {
             try appendSshIpc(&s.write_buf, alloc, .Init, std.mem.asBytes(&init));
-            _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, last_ack_send_ns);
+            _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, last_ack_send_ns, options.allow_tailscale);
         },
     }
 
@@ -2549,6 +2607,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &ack_dirty,
                         options.connect_debug,
                         netmon_now,
+                        options.allow_tailscale,
                     );
                 },
                 .ssh => {
@@ -2565,9 +2624,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         &ack_dirty,
                         options.connect_debug,
                         netmon_now,
+                        options.allow_tailscale,
                     );
                     pending_udp_switch.clear();
-                    _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, netmon_now);
+                    _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, netmon_now, options.allow_tailscale);
                 },
             }
         }
@@ -2632,7 +2692,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         }
 
                         if (standby_ssh != null) {
-                            try handleUdpStandbyControlMessages(alloc, buffer, &session.server_candidates, socket_capability, &standby_reprobe, &peer, now, options.connect_debug);
+                            try handleUdpStandbyControlMessages(alloc, buffer, &session.server_candidates, socket_capability, &standby_reprobe, &peer, now, options.connect_debug, options.allow_tailscale);
                         }
                     },
                     .framed => |*read_buf| {
@@ -2652,8 +2712,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                     if (msg.header.tag != .CandidateRefresh) continue;
                                     var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                     defer candidates.deinit(alloc);
-                                    try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items);
-                                    if (try standby_reprobe.start(alloc, socket_capability, session.server_candidates.items, now)) {
+                                    try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items, options.allow_tailscale);
+                                    if (try standby_reprobe.start(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale)) {
                                         peer.enterRecoveryMode(now);
                                         connectDebug(options.connect_debug, "received refreshed server candidates over framed standby SSH ({d})", .{standby_reprobe.candidates.items.len});
                                     }
@@ -2717,7 +2777,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                         var raw_buf: [9000]u8 = undefined;
                         const raw = try udp_sock.recvRaw(&raw_buf) orelse break;
 
-                        if (try handleAsyncSrflxDatagram(alloc, socket_capability, &udp_sock, &transport_mode, &standby_ssh, &async_srflx_refresh, raw.from, raw.data, options.connect_debug)) {
+                        if (try handleAsyncSrflxDatagram(alloc, socket_capability, &udp_sock, &transport_mode, &standby_ssh, &async_srflx_refresh, raw.from, raw.data, options.connect_debug, options.allow_tailscale)) {
                             continue;
                         }
 
@@ -2834,8 +2894,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                             if (msg.header.tag == .CandidateRefresh) {
                                 var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                 defer candidates.deinit(alloc);
-                                try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items);
-                                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
+                                try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items, options.allow_tailscale);
+                                _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
                                 connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                 continue;
                             }
@@ -2872,8 +2932,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                                     if (msg.header.tag == .CandidateRefresh) {
                                         var candidates = nat.parseCandidatesPayloadJson(alloc, msg.payload) catch continue;
                                         defer candidates.deinit(alloc);
-                                        try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items);
-                                        _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now);
+                                        try replaceCandidateSet(alloc, &session.server_candidates, socket_capability, candidates.items, options.allow_tailscale);
+                                        _ = try ssh_reprobe.startPersistent(alloc, socket_capability, session.server_candidates.items, now, options.allow_tailscale);
                                         connectDebug(options.connect_debug, "received refreshed server candidates over active SSH ({d})", .{session.server_candidates.items.len});
                                         continue;
                                     }
@@ -2901,7 +2961,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session_in: RemoteSession, options
                 var raw_buf: [9000]u8 = undefined;
                 const raw = try udp_sock.recvRaw(&raw_buf) orelse break;
 
-                if (try handleAsyncSrflxDatagram(alloc, socket_capability, &udp_sock, &transport_mode, &standby_ssh, &async_srflx_refresh, raw.from, raw.data, options.connect_debug)) {
+                if (try handleAsyncSrflxDatagram(alloc, socket_capability, &udp_sock, &transport_mode, &standby_ssh, &async_srflx_refresh, raw.from, raw.data, options.connect_debug, options.allow_tailscale)) {
                     continue;
                 }
 
@@ -3051,6 +3111,39 @@ test "parseConnect2Line keeps explicit bootstrap port" {
     defer parsed.candidates.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 60444), parsed.port);
+}
+
+test "remote serve bootstrap command forwards command args and allow-tailscale" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const options = RemoteAttachOptions{
+        .nat_traversal = .auto,
+        .connect_debug = true,
+        .allow_tailscale = true,
+    };
+    const command_args = [_][]const u8{ "sh", "-lc", "printf hi" };
+
+    const cmd = try buildRemoteServeCommand(alloc, "nat-check", options, &command_args, "xterm-256color", "truecolor");
+    defer alloc.free(cmd);
+
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "zmosh serve 'nat-check' --allow-tailscale") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "'sh' '-lc' 'printf hi'") != null);
+}
+
+test "fallback address prefers advertised server candidate before resolving host alias" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const candidates = [_]nat.Candidate{
+        .{ .ctype = .host, .addr = std.net.Address.initIp4(.{ 203, 0, 113, 10 }, 60000), .source = "ifaddr" },
+    };
+
+    const addr = try selectFallbackAddress(alloc, "not-a-real-host-alias.invalid", 60000, &candidates, false);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), addr.any.family);
+    try std.testing.expectEqual(@as(u16, 60000), addr.getPort());
 }
 
 const StandbyLineHarness = struct {
@@ -3451,7 +3544,7 @@ test "standby candidate reprobe filters reset and select refreshed path" {
     var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
 
-    try std.testing.expect(try reprobe.start(alloc, .ipv4_only, &refreshed, 0));
+    try std.testing.expect(try reprobe.start(alloc, .ipv4_only, &refreshed, 0, true));
     try std.testing.expectEqual(@as(usize, 2), reprobe.candidates.items.len);
     try std.testing.expect(reprobe.candidates.items[0].ctype == .srflx);
     try std.testing.expect(reprobe.candidates.items[1].ctype == .host);
@@ -3478,7 +3571,7 @@ test "ssh candidate reprobe persists across probe cycles" {
     var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
 
-    try std.testing.expect(try reprobe.startPersistent(alloc, .ipv4_only, &refreshed, 0));
+    try std.testing.expect(try reprobe.startPersistent(alloc, .ipv4_only, &refreshed, 0, true));
 
     var probe_now: i64 = 0;
     var sends: usize = 0;
@@ -3505,7 +3598,7 @@ test "ssh candidate reprobe accepts authenticated peer-reflexive path" {
     var reprobe: CandidateReprobe = .{};
     defer reprobe.deinit(alloc);
 
-    try std.testing.expect(try reprobe.startPersistent(alloc, .ipv4_only, &refreshed, 0));
+    try std.testing.expect(try reprobe.startPersistent(alloc, .ipv4_only, &refreshed, 0, true));
     _ = reprobe.maybeNextProbeAddr(0).?;
 
     const peer_reflexive = std.net.Address.initIp4(.{ 203, 0, 113, 44 }, 62044);
@@ -3531,7 +3624,7 @@ test "standby UDP control messages start refreshed reprobes" {
     var server_candidates = try std.ArrayList(nat.Candidate).initCapacity(alloc, 1);
     defer server_candidates.deinit(alloc);
 
-    try handleUdpStandbyControlMessages(alloc, &standby_buffer, &server_candidates, .ipv4_only, &reprobe, &peer, 123, false);
+    try handleUdpStandbyControlMessages(alloc, &standby_buffer, &server_candidates, .ipv4_only, &reprobe, &peer, 123, false, true);
     try std.testing.expectEqual(@as(usize, 0), standby_buffer.items.len);
     try std.testing.expectEqual(@as(usize, 1), reprobe.candidates.items.len);
     try std.testing.expectEqual(@as(usize, 1), server_candidates.items.len);
@@ -3572,7 +3665,7 @@ test "async srflx refresh updates local candidates after a STUN response" {
     try std.testing.expect(try refresh.start(alloc, &sock));
     try std.testing.expectEqual(@as(usize, 1), refresh.states.items.len);
 
-    var initial = try refresh.buildCandidateSet(alloc, sock.bound_port, .ipv4_only);
+    var initial = try refresh.buildCandidateSet(alloc, sock.bound_port, .ipv4_only, true);
     defer initial.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), countCandidatesByType(initial.items, .srflx));
 
@@ -3583,7 +3676,7 @@ test "async srflx refresh updates local candidates after a STUN response" {
 
     try std.testing.expect(refresh.handleDatagram(state.server_addr, &msg) == .changed);
 
-    var updated = try refresh.buildCandidateSet(alloc, sock.bound_port, .ipv4_only);
+    var updated = try refresh.buildCandidateSet(alloc, sock.bound_port, .ipv4_only, true);
     defer updated.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), countCandidatesByType(updated.items, .srflx));
 
@@ -3624,7 +3717,7 @@ test "async srflx refresh send failures disable standby without aborting UDP" {
     const state = &refresh.states.items[0];
     const msg = buildSrflxSuccessResponse(state, .{ 203, 0, 113, 9 }, 54322);
 
-    try std.testing.expect(try handleAsyncSrflxDatagram(alloc, .ipv4_only, &sock, &transport_mode, &standby_ssh, &refresh, state.server_addr, &msg, false));
+    try std.testing.expect(try handleAsyncSrflxDatagram(alloc, .ipv4_only, &sock, &transport_mode, &standby_ssh, &refresh, state.server_addr, &msg, false, true));
     try std.testing.expect(standby_ssh == null);
     switch (transport_mode) {
         .udp => {},
