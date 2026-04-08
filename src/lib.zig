@@ -212,7 +212,11 @@ export fn zmosh_connect(
         set_status(status, .err_socket);
         return null;
     };
-    var udp_sock = udp_mod.UdpSocket{ .fd = sock_fd, .bound_port = 0 };
+    var udp_sock = udp_mod.UdpSocket{
+        .fd = sock_fd,
+        .bound_port = 0,
+        .capability = if (addr.any.family == posix.AF.INET6) .ipv6_only else .ipv4_only,
+    };
 
     // Init peer
     var peer = udp_mod.Peer.init(key, .to_server);
